@@ -1,0 +1,50 @@
+seed: 42
+
+# Environment — FullTask-UAVSwarm-Direct-v0
+# obs=23  action=4  state=115 (5 agents x 23)
+env:
+  num_envs: 256
+  device: cuda:0
+  centralized_critic: true
+
+# Model architectures
+models:
+  policy:
+    hidden_sizes: [256, 256, 128]
+    activation: relu
+    clip_actions: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+
+  critic:
+    # Input: centralized state (115 dims = 5 agents x 23 obs)
+    hidden_sizes: [512, 512, 256]
+    activation: relu
+
+# MAPPO algorithm
+algorithm:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_loss_coef: 1.0
+  entropy_coef: 0.01
+  n_epochs: 5             # Reduced for test
+  batch_size: 64             # Mini-batch size — 128 gradient steps/epoch (8192/64)
+  frames_per_batch: 8192     # Rollout: 256 envs x 32 steps
+  max_grad_norm: 1.0
+
+  normalize_observations: true
+  normalize_advantages: true
+  normalize_values: true
+
+# Training run
+training:
+  total_frames: 65536    # 8 iterations with frames_per_batch=8192
+  checkpoint_interval: 8   # Save at end of run
+  log_interval: 100
+  eval_interval: 5000
+
+  experiment_directory: "fulltask_shared_mappo"
+  experiment_name: "mappo_uav_swarm"

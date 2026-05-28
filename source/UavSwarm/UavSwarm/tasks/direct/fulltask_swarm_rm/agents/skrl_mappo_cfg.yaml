@@ -1,0 +1,85 @@
+seed: 42
+
+
+# Models are instantiated using skrl's model instantiator utility
+# https://skrl.readthedocs.io/en/latest/api/utils/model_instantiators.html
+models:
+  separate: True  # ✅ Important for MARL - separate models per agent
+  policy:  # see gaussian_model parameters
+    class: GaussianMixin
+    clip_actions: True  # ✅ Changed to True - prevents extreme actions
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0  # ✅ Start with moderate exploration
+    network:
+      - name: policy_net
+        input: OBSERVATIONS
+        layers: [128, 128]  # ✅ Deeper network for complex RM state reasoning
+        activations: relu
+    output: ACTIONS
+  value:  # see deterministic_model parameters
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: critic_net
+        input: OBSERVATIONS  # ✅ Use global state for value function
+        layers: [256, 256, 128]  # ✅ Match policy network depth
+        activations: relu
+    output: ONE
+
+
+# Rollout memory
+# https://skrl.readthedocs.io/en/latest/api/memories/random.html
+memory:
+  class: RandomMemory
+  memory_size: -1  # automatically determined (same as agent:rollouts)
+
+
+# MAPPO agent configuration (field names are from MAPPO_DEFAULT_CONFIG)
+# https://skrl.readthedocs.io/en/latest/api/multi_agents/mappo.html
+agent:
+  class: MAPPO
+  rollouts: 128  # ✅ Increased from 16 - more data per update for stable curriculum learning
+  learning_epochs: 10  # ✅ Increased from 8 - better policy refinement per batch
+  mini_batches: 32  # ✅ Increased from 1 - more gradient updates per epoch
+  discount_factor: 0.99
+  lambda: 0.95  # GAE lambda for advantage estimation
+  learning_rate: 5.0e-05
+  learning_rate_scheduler: KLAdaptiveLR
+  learning_rate_scheduler_kwargs:
+    kl_threshold: 0.008  # ✅ Slightly increased from 0.008 - allows larger policy updates
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  shared_state_preprocessor: RunningStandardScaler  # ✅ Important for MARL coordination
+  shared_state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 0.5  # ✅ Reduced from 1.0 - prevent gradient explosions with RM state transitions
+  ratio_clip: 0.2
+  value_clip: 0.2
+  clip_predicted_values: True
+  entropy_loss_scale: 0.01  # ✅ Increased from 0.0 - encourage exploration of RM states
+  value_loss_scale: 1.0  # ✅ Reduced from 2.0 - balance policy and value learning
+  kl_threshold: 0.0
+
+# Sequential trainer
+# https://skrl.readthed0.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: False
+  # logging and checkpoint
+  experiment:
+    directory: "new_stage5_model_continue2"  # ✅ Updated directory name for curriculum learning
+    experiment_name: ""
+    write_interval: 5000 #5000  # ✅ Changed from auto - log every 500 steps
+    checkpoint_interval: 5000  # ✅ Changed from auto - save every 5000 steps
+
+
+# Sequential trainer
+# https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
+trainer:
+  class: SequentialTrainer
+  timesteps: 500000  # ✅ Increased from 30000 - curriculum learning needs more time
+  environment_info: log
