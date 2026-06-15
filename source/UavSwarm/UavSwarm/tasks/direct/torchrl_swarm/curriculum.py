@@ -15,25 +15,29 @@ import torch
 def set_stage1_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
     """Set hover goals - grid-based start positions with goals directly above.
 
-    Places drones in a grid formation and assigns each a goal position
-    directly above its start at a random height within the configured range.
+    Spawns drones at stage1_spawn_height_range (1.5–2.5 m by default) so that
+    a random descending policy has several seconds of margin before hitting the
+    min_flight_height termination floor (0.1 m). Goal height is spawn + a random
+    delta from stage1_goal_height_delta_range, keeping task difficulty consistent
+    regardless of where the drone spawns.
     """
     num_reset_envs = len(env_ids)
+    cfg_c = env.cfg.curriculum
 
-    # Create grid of start positions
     grid_size = int(torch.ceil(torch.sqrt(torch.tensor(env.num_drones, dtype=torch.float32))))
     spacing = torch.zeros(1, device=env.device).uniform_(
-        env.cfg.curriculum.spawn_grid_spacing_range[0],
-        env.cfg.curriculum.spawn_grid_spacing_range[1],
+        cfg_c.spawn_grid_spacing_range[0],
+        cfg_c.spawn_grid_spacing_range[1],
     )
+
+    spawn_lo, spawn_hi = cfg_c.stage1_spawn_height_range
+    delta_lo, delta_hi = cfg_c.stage1_goal_height_delta_range
 
     for env_idx in range(num_reset_envs):
         perm = torch.randperm(env.num_drones, device=env.device)
 
-        start_heights = torch.zeros(env.num_drones, device=env.device).uniform_(0.6, 1.0)
-        min_height = env.cfg.curriculum.goal_height_range[0]
-        max_height = env.cfg.curriculum.goal_height_range[1]
-        goal_heights = torch.zeros(env.num_drones, device=env.device).uniform_(min_height, max_height)
+        start_heights = torch.zeros(env.num_drones, device=env.device).uniform_(spawn_lo, spawn_hi)
+        goal_deltas = torch.zeros(env.num_drones, device=env.device).uniform_(delta_lo, delta_hi)
 
         for j, rob in enumerate(env._robots):
             env_id_single = env_ids[env_idx].unsqueeze(0)
@@ -57,7 +61,7 @@ def set_stage1_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
             xy_noise = torch.zeros(2, device=env.device).uniform_(-0.05, 0.05)
             env._desired_pos_w[env_id_single, j, 0] = default_root_state[0, 0] + xy_noise[0]
             env._desired_pos_w[env_id_single, j, 1] = default_root_state[0, 1] + xy_noise[1]
-            env._desired_pos_w[env_id_single, j, 2] = goal_heights[j]
+            env._desired_pos_w[env_id_single, j, 2] = start_heights[j] + goal_deltas[j]
 
 
 def set_stage2_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
@@ -80,7 +84,8 @@ def set_stage2_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
     max_height = env.cfg.curriculum.goal_height_range[1]
 
     z_spacing = env.cfg.curriculum.stage2_zdist_xy_plane
-    base_height = min_height
+    spawn_lo, spawn_hi = env.cfg.curriculum.stage2_spawn_height_range
+    base_height = torch.zeros(1, device=env.device).uniform_(spawn_lo, spawn_hi).item()
 
     for env_idx in range(num_reset_envs):
         perm = torch.randperm(env.num_drones, device=env.device)
@@ -164,7 +169,8 @@ def set_stage3_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
         env_id_single = env_ids[env_idx].unsqueeze(0)
 
         perm = torch.randperm(env.num_drones, device=env.device)
-        base_height = torch.zeros(1, device=env.device).uniform_(min_height, max_height).item()
+        spawn_lo, spawn_hi = env.cfg.curriculum.stage3_spawn_height_range
+        base_height = torch.zeros(1, device=env.device).uniform_(spawn_lo, spawn_hi).item()
 
         for j, rob in enumerate(env._robots):
             agent_lane = perm[j].item()
@@ -225,8 +231,8 @@ def set_stage4_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
     num_reset_envs = len(env_ids)
 
     spawn_heights = torch.zeros(num_reset_envs, device=env.device).uniform_(
-        env.cfg.curriculum.goal_height_range[0],
-        env.cfg.curriculum.goal_height_range[1],
+        env.cfg.curriculum.stage4_spawn_height_range[0],
+        env.cfg.curriculum.stage4_spawn_height_range[1],
     )
 
     formation_positions = get_inverted_v_formation(env, env_ids, env_origins, spawn_heights)
@@ -260,7 +266,10 @@ def set_stage4_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
         sin_theta = torch.sin(torch.tensor(rotation_angle, device=env.device))
 
         formation_center = formation_positions[env_idx].mean(dim=0)
-        swarm_goal_height = spawn_heights[env_idx] + torch.zeros(1, device=env.device).uniform_(-0.5, 0.5).item()
+        # Small random altitude delta so all drones in the formation share one goal z.
+        # Previously this was "spawn_h + noise" which double-counted spawn height
+        # (start_pos[2] already equals spawn_h), pushing goal_z to 2×spawn_h.
+        goal_z_delta = torch.zeros(1, device=env.device).uniform_(-0.5, 0.5).item()
 
         for j in range(env.num_drones):
             start_pos = formation_positions[env_idx, j]
@@ -271,7 +280,7 @@ def set_stage4_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
 
             goal_x = formation_center[0] + translation_x + rotated_x
             goal_y = formation_center[1] + translation_y + rotated_y
-            goal_z = start_pos[2] + swarm_goal_height
+            goal_z = start_pos[2] + goal_z_delta
 
             env._desired_pos_w[env_id_single, j, 0] = goal_x
             env._desired_pos_w[env_id_single, j, 1] = goal_y
@@ -291,8 +300,8 @@ def set_stage5_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
     y_offset = env.cfg.curriculum.stage5_obsy_offset
 
     spawn_heights = torch.zeros(num_reset_envs, device=env.device).uniform_(
-        env.cfg.curriculum.goal_height_range[0],
-        env.cfg.curriculum.goal_height_range[1],
+        env.cfg.curriculum.stage5_spawn_height_range[0],
+        env.cfg.curriculum.stage5_spawn_height_range[1],
     )
 
     dist_y_from_spawn_swarm = torch.zeros(num_reset_envs, device=env.device).uniform_(0.8, 1.5)

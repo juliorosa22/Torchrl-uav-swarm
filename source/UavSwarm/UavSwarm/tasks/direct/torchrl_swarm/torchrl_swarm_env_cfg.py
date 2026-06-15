@@ -17,6 +17,8 @@ from isaaclab_assets import CRAZYFLIE_CFG
 from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
 from isaaclab.utils import configclass
 
+from .controller import ControllerCfg
+
 
 class UavSwarmEnvWindow(BaseEnvWindow):
     """Window manager for the UAV Swarm environment."""
@@ -69,6 +71,21 @@ class CurriculumCfg:
     goal_height_range: tuple = (1.5, 6.0)
     max_obstacle_distance: float = 10.0
     obstacles_size: tuple = (0.15, 0.8, 8.0)
+
+    # Stage 1 hover parameters
+    # Spawn high enough that a random descending policy has several seconds of
+    # margin before hitting min_flight_height (0.1m). Goal is offset above spawn
+    # so difficulty is consistent regardless of spawn height.
+    stage1_spawn_height_range: tuple = (1.5, 2.5)
+    stage1_goal_height_delta_range: tuple = (0.5, 2.0)
+
+    # Stage 2–5 spawn height ranges
+    # All use (lo, hi) analogous to Stage 1: minimum raised above 1.5 m so
+    # a random policy has ≥1 s of descent margin before min_flight_height=0.1 m.
+    stage2_spawn_height_range: tuple = (2.0, 4.0)
+    stage3_spawn_height_range: tuple = (2.0, 5.0)
+    stage4_spawn_height_range: tuple = (2.0, 4.5)
+    stage5_spawn_height_range: tuple = (2.0, 5.0)
 
     def get_episode_length(self) -> float:
         """Return episode length based on active stage."""
@@ -165,17 +182,18 @@ class BaseSwarmEnvCfg(DirectMARLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
     reward_cfg: RewardMachineCfg = RewardMachineCfg()
     swarm_cfg: SwarmParameterCfg = SwarmParameterCfg()
+    controller: ControllerCfg = ControllerCfg()
 
     # Observation / action / state dimensions
-    # Base: 3+3+3+3+1+3+3 = 19, FullTask adds 4 RM one-hot = 23
-    single_observation_space: int = 23
+    # Base: 3+3+3+3+1+3+3+3+3+3 = 28, FullTask adds 4 RM one-hot = 32
+    single_observation_space: int = 32
     single_action_space: int = 4
-    state_space: int = 115  # num_agents * single_observation_space
+    state_space: int = 160  # num_agents * single_observation_space
 
     # Agent specs (computed at class-def time; configclass deep-copies per instance)
     possible_agents: list = [f"robot_{i}" for i in range(num_agents)]
     action_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)}
-    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(23,)) for i in range(num_agents)}
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(32,)) for i in range(num_agents)}
 
     # Debug visualization
     debug_vis = True
@@ -224,19 +242,19 @@ class BaseSwarmEnvCfg(DirectMARLEnvCfg):
 
 @configclass
 class FullTaskUAVSwarmEnvCfg(BaseSwarmEnvCfg):
-    """FullTask variant: includes RM state one-hot in observations (23-dim)."""
+    """FullTask variant: includes RM state one-hot in observations (32-dim)."""
 
     include_rm_in_obs: bool = True
-    single_observation_space: int = 23
-    state_space: int = 115
-    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(23,)) for i in range(5)}
+    single_observation_space: int = 32
+    state_space: int = 160
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(32,)) for i in range(5)}
 
 
 @configclass
 class BaselineUAVSwarmEnvCfg(BaseSwarmEnvCfg):
-    """Baseline variant: no RM state in observations (19-dim)."""
+    """Baseline variant: no RM state in observations (28-dim)."""
 
     include_rm_in_obs: bool = False
-    single_observation_space: int = 19
-    state_space: int = 95
-    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(19,)) for i in range(5)}
+    single_observation_space: int = 28
+    state_space: int = 140
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
