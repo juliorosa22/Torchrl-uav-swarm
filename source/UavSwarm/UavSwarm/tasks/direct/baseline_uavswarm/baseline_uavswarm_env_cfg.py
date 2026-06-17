@@ -199,18 +199,18 @@ class BaselineUAVSwarmEnvCfg(DirectMARLEnvCfg):
 
     
     #------ENV Spaces dimensions
-    # 12 base + 1 obstacle distance + 3 neighbor relative velocity + 3 neighbor relative position + 4 RM state (one-hot) = 23
-    single_observation_space = 19 #23 no RM states for baseline  
+    # 3+3+3+3+1+3+3+3+3+3 = 28 (no RM states for baseline)
+    single_observation_space = 28
     # Policy- Action dimensions
     single_action_space = 4  # thrust + 3 moments per drone
-    
+
     #Critic- Observation dimensions
-    state_space = num_agents * single_observation_space  
-    
+    state_space = num_agents * single_observation_space
+
     # Required for DirectMARLEnvCfg - using robot names as keys
     possible_agents = [f"robot_{i}" for i in range(num_agents)]
     action_spaces = {f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)}
-    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(19,)) for i in range(num_agents)}
+    observation_spaces = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(num_agents)}
    
     
     # ----- UI -----
