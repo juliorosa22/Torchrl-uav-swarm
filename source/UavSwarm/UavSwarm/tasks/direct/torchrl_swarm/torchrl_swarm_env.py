@@ -14,6 +14,7 @@ from isaaclab.envs import DirectMARLEnv
 from isaaclab.utils.math import subtract_frame_transforms
 
 from .torchrl_swarm_env_cfg import BaseSwarmEnvCfg, FullTaskUAVSwarmEnvCfg, BaselineUAVSwarmEnvCfg
+from .controller import apply_controller
 from .metrics import EpisodeMetrics
 from .formation import compute_swarm_centroid, get_inverted_v_formation
 from .sensing import ensure_cache_populated
@@ -38,8 +39,9 @@ from .debug_viz import set_debug_vis_impl, debug_vis_callback
 class BaseSwarmEnv(DirectMARLEnv):
     """Direct-style MARL environment with N Crazyflies per env.
 
-    Actions: per-drone [thrust, mx, my, mz] -> shape (num_agents, 4)
-    Observations: per-drone (base 19 dims + optional 4-dim RM one-hot)
+    Actions: per-drone [vx_b, vy_b, vz_b, yaw_rate] in [-1,1] (geometric/pd_velocity)
+             or [thrust, mx, my, mz] in [-1,1] (direct). Controlled by cfg.controller.type.
+    Observations: 28-dim (Baseline) or 32-dim (FullTask, +4 RM one-hot)
     Rewards: energy-based with RM state-aware weighting + safety penalties
     """
 
@@ -75,8 +77,11 @@ class BaseSwarmEnv(DirectMARLEnv):
 
         # Cache buffers
         self._cached_obstacle_dists = torch.zeros(self.num_drones, self.num_envs, device=self.device)
+        self._cached_obstacle_dir_b = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
         self._cached_neighbor_rel_pos_b = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
         self._cached_neighbor_rel_vel_b = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
+        self._cached_mean_neighbor_pos_b = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
+        self._cached_mean_neighbor_vel_b = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
         self._prev_distances = torch.zeros(self.num_drones, self.num_envs, device=self.device)
         self._prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         self._cache_valid = False
@@ -166,10 +171,7 @@ class BaseSwarmEnv(DirectMARLEnv):
         actions_tensor = torch.stack(actions_list, dim=1)
         self._actions = actions_tensor.clone().clamp(-1.0, 1.0)
 
-        for j in range(self.num_drones):
-            thrust_cmd = (self._actions[:, j, 0] + 1.0) / 2.0
-            self._thrust[:, j, 0, 2] = self.cfg.thrust_to_weight * self._robot_weights[j] * thrust_cmd
-            self._moment[:, j, 0, :] = self.cfg.moment_scale * self._actions[:, j, 1:]
+        self._thrust, self._moment = apply_controller(self, self._actions)
 
     def _apply_action(self):
         """Apply forces and torques to each robot."""
@@ -389,17 +391,20 @@ def _build_obs_tensor(
     ).float()  # (num_drones, num_envs, 4)
 
     components = [
-        all_lin_vels,                                # 3
-        all_ang_vels,                                # 3
-        all_gravities,                               # 3
-        desired_pos_b,                               # 3
-        env._cached_obstacle_dists.unsqueeze(-1),    # 1
-        env._cached_neighbor_rel_vel_b,              # 3
-        env._cached_neighbor_rel_pos_b,              # 3
+        all_lin_vels,                                # 3   [0:3]
+        all_ang_vels,                                # 3   [3:6]
+        all_gravities,                               # 3   [6:9]
+        desired_pos_b,                               # 3   [9:12]
+        env._cached_obstacle_dists.unsqueeze(-1),    # 1   [12]
+        env._cached_obstacle_dir_b,                  # 3   [13:16]
+        env._cached_neighbor_rel_pos_b,              # 3   [16:19]
+        env._cached_neighbor_rel_vel_b,              # 3   [19:22]
+        env._cached_mean_neighbor_pos_b,             # 3   [22:25]
+        env._cached_mean_neighbor_vel_b,             # 3   [25:28]
     ]
 
     if env.cfg.include_rm_in_obs:
-        components.append(rm_state_onehot)            # 4
+        components.append(rm_state_onehot)            # 4   [28:32]
 
     return torch.cat(components, dim=-1)
 
