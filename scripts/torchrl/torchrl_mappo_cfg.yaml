@@ -1,16 +1,39 @@
 seed: 42
 
-# Environment — FullTask-UAVSwarm-Direct-v0
-# obs=23  action=4  state=115 (5 agents x 23)
+# Environment
+# Baseline-TorchRL-UAVSwarm-Direct-v0: obs=28  action=4  state=140 (5 agents x 28)
+# FullTask-TorchRL-UAVSwarm-Direct-v0: obs=32  action=4  state=160 (5 agents x 32)
+#
+# GPU memory budget (6 GB card):
+#   Isaac Sim PhysX scales ~linearly with num_envs * num_drones.
+#   256 envs x 5 drones = 1280 articulations ≈ 5.0 GB  → leaves ~800 MB for PyTorch (OOM)
+#    64 envs x 5 drones =  320 articulations ≈ 1.2 GB  → leaves ~4.6 GB for PyTorch (safe)
+#   GAE critic peak: (frames_per_batch/num_envs) * num_envs * n_agents * hidden[0] * 4 bytes
+#     = 128 * 64 * 5 * 256 * 4 ≈ 84 MB  (well within budget)
 env:
-  num_envs: 256
+  num_envs: 64
   device: cuda:0
   centralized_critic: true
+
+# Low-level controller (applied inside the env, not the policy)
+# type: geometric | pd_velocity | direct
+# geometric: SE(3) controller — policy outputs [vx_b, vy_b, vz_b, yaw_rate] in [-1,1]
+# direct:    original raw force/torque mapping (backward compat)
+controller:
+  type: geometric
+  max_lin_vel_cmd: 1.5    # m/s per axis
+  max_yaw_rate_cmd: 1.0   # rad/s
+  Kv: 2.0                 # outer-loop velocity P-gain
+  # Inner-loop gains are sized for Crazyflie: moment_scale=0.01 Nm, max eR≈pi/2.
+  # KR * (pi/2) ≈ 0.003 Nm — proportional across full attitude range.
+  # KOmega * 20 rad/s ≈ 0.01 Nm — proportional across max angular rate.
+  KR: 0.002               # inner-loop attitude P-gain
+  KOmega: 0.0005          # inner-loop angular velocity D-gain
 
 # Model architectures
 models:
   policy:
-    hidden_sizes: [256, 256, 128]
+    hidden_sizes: [128, 64]
     activation: relu
     clip_actions: true
     min_log_std: -20.0
@@ -18,8 +41,9 @@ models:
     initial_log_std: 0.0
 
   critic:
-    # Input: centralized state (115 dims = 5 agents x 23 obs)
-    hidden_sizes: [512, 512, 256]
+    # Input: centralized state — 140 dims (Baseline) or 160 dims (FullTask)
+    # 140→128 first projection avoids bottleneck; aligns with MAPPO paper's [64,64] scale.
+    hidden_sizes: [128, 64]
     activation: relu
 
 # MAPPO algorithm
@@ -30,9 +54,11 @@ algorithm:
   clip_epsilon: 0.2
   value_loss_coef: 1.0
   entropy_coef: 0.01
-  n_epochs: 5             # Reduced for test
-  batch_size: 64             # Mini-batch size — 128 gradient steps/epoch (8192/64)
-  frames_per_batch: 8192     # Rollout: 256 envs x 32 steps
+  n_epochs: 5
+  batch_size: 512
+  frames_per_batch: 8192     # 64 envs x 128 steps per rollout (~2.5 s sim time)
+                             # buffer after flatten: 8192 * 5 agents = 40960 transitions
+                             # GAE critic peak: 40960 * 256 hidden * 4 bytes ≈ 42 MB
   max_grad_norm: 1.0
 
   normalize_observations: true
@@ -41,10 +67,10 @@ algorithm:
 
 # Training run
 training:
-  total_frames: 65536    # 8 iterations with frames_per_batch=8192
-  checkpoint_interval: 8   # Save at end of run
+  total_frames: 5000000      # ~610 iterations at 8192 frames/batch (64 envs x 128 steps)
+  checkpoint_interval: 50    # save every 50 iterations
   log_interval: 100
   eval_interval: 5000
 
-  experiment_directory: "fulltask_shared_mappo"
+  experiment_directory: "fulltask_geometric_mappo"
   experiment_name: "mappo_uav_swarm"

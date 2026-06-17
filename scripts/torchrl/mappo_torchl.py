@@ -1,6 +1,7 @@
 import torch
 import time
 import os
+import math
 from typing import Optional
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
@@ -100,18 +101,27 @@ class MAPPO:
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         # --- collector ---
+        # reset_at_each_iter=False: episodes run to their natural termination across
+        # multiple collection calls. True would hard-cap every episode at
+        # frames_per_batch/num_envs steps, preventing the policy from ever seeing
+        # states beyond the first few seconds of an episode.
         self.collector = SyncDataCollector(
             env,
             policy,
             frames_per_batch=frames_per_batch,
             total_frames=-1,
             device=self.device,
-            reset_at_each_iter=True,
+            reset_at_each_iter=False,
         )
+
+        # After _flatten_agents the buffer holds T * num_envs * n_agents transitions,
+        # not just frames_per_batch. Sizing at frames_per_batch alone would silently
+        # discard (n_agents - 1)/n_agents ≈ 80% of each rollout.
+        self._buffer_size = frames_per_batch * n_agents
 
         # --- replay buffer ---
         self.buffer = ReplayBuffer(
-            storage=LazyTensorStorage(max_size=frames_per_batch),
+            storage=LazyTensorStorage(max_size=self._buffer_size),
             batch_size=batch_size,
         )
 
@@ -174,7 +184,7 @@ class MAPPO:
             num_updates = 0
 
             for _ in range(self.n_epochs):
-                for _ in range(self.collector.frames_per_batch // self.batch_size):
+                for _ in range(self._buffer_size // self.batch_size):
                     mini_batch = self.buffer.sample().to(self.device)
                     loss_vals = self.loss_module(mini_batch)
                     loss = (
@@ -245,9 +255,19 @@ class MAPPO:
             self.writer.add_scalar("Diagnostics/entropy", avg_entropy, collected_frames)
             self.writer.add_scalar("Diagnostics/grad_norm", avg_grad_norm, collected_frames)
 
+            # Action channel statistics — track per-dim mean/std to confirm the policy
+            # is exploring the full velocity command range (dims 0-2: vx/vy/vz, dim 3: yaw_rate).
+            if "action" in rollout_flat.keys():
+                actions = rollout_flat["action"]  # (total, action_dim)
+                labels = ["action_ch0", "action_ch1", "action_ch2", "action_ch3"]
+                for idx, label in enumerate(labels):
+                    if idx < actions.shape[-1]:
+                        self.writer.add_scalar(f"Actions/{label}_mean", actions[..., idx].mean().item(), collected_frames)
+                        self.writer.add_scalar(f"Actions/{label}_std", actions[..., idx].std().item(), collected_frames)
+
             pbar.set_postfix({
-                "reward": f"{self.last_avg_reward:.2f}",
-                "loss": f"{avg_obj + avg_critic + avg_ent:.4f}",
+                "reward": f"{self.last_avg_reward:.2f}" if math.isfinite(self.last_avg_reward) else "nan!",
+                "loss": f"{avg_obj + avg_critic + avg_ent:.4f}" if math.isfinite(avg_obj) else "nan!",
                 "kl": f"{avg_kl:.4f}",
                 "clip": f"{avg_clip_frac:.2f}",
                 "ev": f"{avg_ev:.3f}",

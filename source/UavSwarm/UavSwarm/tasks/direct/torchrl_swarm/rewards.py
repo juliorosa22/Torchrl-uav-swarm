@@ -209,6 +209,9 @@ def get_rewards(env) -> dict[str, torch.Tensor]:
 
     reward = mean_reward_per_env + collision + jerk_penalty + lin_vel_penalty + ang_vel_penalty
 
+    # Guard against NaN/Inf that can occur when physics diverges (drone tumbling after collision).
+    reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=-COLLISION_PENALTY)
+
     # 10. LOGGING
     # Diagnostic decomposition: compute what each component contributes.
     # The actual reward is multiplicative, so we approximate additive components

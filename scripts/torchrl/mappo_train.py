@@ -23,7 +23,7 @@ import os
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Shared-weight MAPPO training with TorchRL.")
-parser.add_argument("--task", type=str, default="FullTask-UAVSwarm-Direct-v0")
+parser.add_argument("--task", type=str, default="FullTask-TorchRL-UAVSwarm-Direct-v0")
 parser.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg.yaml")
 parser.add_argument("--num_envs", type=int, default=None)
 parser.add_argument("--seed", type=int, default=None)
@@ -33,6 +33,12 @@ parser.add_argument("--video", action="store_true", default=False)
 parser.add_argument("--video_length", type=int, default=200)
 parser.add_argument("--video_interval", type=int, default=2000)
 parser.add_argument("--max_iterations", type=int, default=None)
+parser.add_argument(
+    "--controller", type=str, default="geometric",
+    choices=["geometric", "pd_velocity", "direct"],
+    help="Low-level controller: geometric=SE(3) (default), pd_velocity=approx PD, direct=original force/torque.",
+)
+parser.add_argument("--stage", type=int, default=None, help="Curriculum stage 1-5. Overrides config.")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -112,6 +118,20 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     torch.manual_seed(config["seed"])
     env_cfg.seed = config["seed"]
 
+    # --- controller and curriculum overrides ---
+    # Apply YAML gains first, then CLI type takes final precedence.
+    if not hasattr(env_cfg, "controller"):
+        raise AttributeError(
+            f"env_cfg ({type(env_cfg).__name__}) has no 'controller' attribute. "
+            "Use a TorchRL task: 'FullTask-TorchRL-UAVSwarm-Direct-v0' or 'Baseline-TorchRL-UAVSwarm-Direct-v0'."
+        )
+    if "controller" in config:
+        for k, v in config["controller"].items():
+            setattr(env_cfg.controller, k, v)
+    env_cfg.controller.type = args_cli.controller
+    if args_cli.stage is not None:
+        env_cfg.curriculum.active_stage = args_cli.stage
+
     device = torch.device(config["env"]["device"])
 
     # --- log dir ---
@@ -129,6 +149,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"  Shared-Weight MAPPO — TorchRL")
     print(f"{'='*80}")
     print(f"  Task:       {args_cli.task}")
+    print(f"  Controller: {env_cfg.controller.type}  (max_vel={env_cfg.controller.max_lin_vel_cmd} m/s)")
+    print(f"  Stage:      {env_cfg.curriculum.active_stage}")
     print(f"  Device:     {device}")
     print(f"  Seed:       {config['seed']}")
     print(f"  Envs:       {env_cfg.scene.num_envs}")
