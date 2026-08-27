@@ -88,19 +88,30 @@ cmd_run() {
     check_local_sync
     sync_remote
 
-    local timestamp remote_log
+    local timestamp remote_log runner_script
     timestamp=$(date +%Y%m%d_%H%M%S)
     remote_log="${REMOTE_LOG_DIR}/${job_name}_${timestamp}.log"
+    runner_script="${REMOTE_REPO}/.remote_jobs/${job_name}_run.sh"
 
-    # -u: unbuffered stdout (Isaac Sim force-closes without flushing otherwise). Output
-    # is teed to a log file so log/follow work without depending on tmux pane capture,
-    # while the tmux session itself still allows a true live attach.
-    ssh "$REMOTE_HOST" "
-        mkdir -p '${REMOTE_LOG_DIR}'
-        cd '${REMOTE_REPO}'
-        tmux new-session -d -s '${session}' \
-            \"${REMOTE_PY} -u $* 2>&1 | tee '${remote_log}'\"
-    "
+    # Build the command as a *file* on the remote rather than one big quoted string --
+    # embedding "$@" via $* (or any single-string reconstruction) loses per-argument
+    # quoting, and tmux's `new-session -d -s NAME "STRING"` re-parses STRING through a
+    # nested shell anyway, so any shell metacharacter inside an argument (quotes,
+    # semicolons, brackets -- e.g. in a `-c "..."` snippet) breaks silently. printf %q
+    # safely escapes each argument for exactly one shell re-parse (the script itself),
+    # and tmux only ever has to run a plain `bash <path>` -- no nested quoting at all.
+    local py_cmd
+    py_cmd=$(printf '%q ' "$REMOTE_PY" -u "$@")
+    local script_content
+    script_content=$(cat <<SCRIPT
+#!/usr/bin/env bash
+cd $(printf '%q' "$REMOTE_REPO")
+${py_cmd}2>&1 | tee $(printf '%q' "$remote_log")
+SCRIPT
+)
+    ssh "$REMOTE_HOST" "mkdir -p '${REMOTE_LOG_DIR}' '${REMOTE_REPO}/.remote_jobs'"
+    printf '%s\n' "$script_content" | ssh "$REMOTE_HOST" "cat > '${runner_script}' && chmod +x '${runner_script}'"
+    ssh "$REMOTE_HOST" "tmux new-session -d -s '${session}' 'bash ${runner_script}'"
     echo "[remote_run] Launched '${job_name}' in tmux session '${session}' on ${REMOTE_HOST}."
     echo "  Log:            ${remote_log}"
     echo "  Check progress: scripts/remote_run.sh log ${job_name}"
