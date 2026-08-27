@@ -242,8 +242,15 @@ class BaseSwarmEnv(DirectMARLEnv):
 
         self._metrics.reset(env_ids)
         self._cache_valid = False
-        self._last_terminated[env_ids] = False
-        self._last_timed_out[env_ids] = False
+        # NOTE: do NOT clear _last_terminated/_last_timed_out here. get_dones() aliases them
+        # directly to the `died`/`time_out` tensors it also puts in terminated_dict/time_out_dict
+        # (env._last_terminated = died, not a copy) -- those are the exact tensors env.step()
+        # returns to the caller, and _reset_idx runs *before* that return. An in-place
+        # `self._last_terminated[env_ids] = False` here used to zero out the done signal the
+        # RL trainer was about to receive, for every env that just reset -- silently breaking
+        # episode-boundary detection (GAE bootstrapping, and any extras["log"] consumer)
+        # network-wide. No manual clearing is needed: get_dones() reassigns fresh tensors to
+        # both buffers on the very next call regardless.
 
         for rob in self._robots:
             rob.reset(env_ids)
