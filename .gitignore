@@ -69,3 +69,9 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+
+# Claude Code (assistant config/instructions/session data -- not project source)
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
