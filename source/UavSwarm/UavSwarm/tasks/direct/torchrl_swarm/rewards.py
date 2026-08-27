@@ -55,6 +55,12 @@ ANG_VEL_PENALTY_SCALE = 0.0025
 # this one only penalizes violating min_safe_distance while converging to an assigned slot).
 K_FORM_SAFETY = 5.0
 
+# Logging-only near-collision threshold (~2x a Crazyflie's rotor-to-rotor span, ~0.15m):
+# distinct from min_safe_distance (1.0m), which is a soft reward-shaping target, not a
+# physically-motivated contact threshold. Does not affect termination or the reward --
+# see get_formation_rewards()'s agent_collision metric.
+AGENT_COLLISION_DISTANCE = 0.15
+
 
 def get_rewards(env) -> dict[str, torch.Tensor]:
     """Energy-based reward with distance delta, velocity alignment, and RM state shaping.
@@ -330,9 +336,15 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
     target_pairwise = torch.cdist(env._desired_pos_w, env._desired_pos_w)  # (num_envs, D, D)
     off_diag = ~torch.eye(env.num_drones, dtype=torch.bool, device=env.device)
     shape_error = (actual_pairwise - target_pairwise).abs()
+    off_diag_actual = actual_pairwise.masked_select(off_diag.unsqueeze(0)).view(env.num_envs, -1)
     formation_shape_error = shape_error.masked_select(off_diag.unsqueeze(0)).view(
         env.num_envs, -1
     ).mean(dim=1)
+
+    # Logging-only true pairwise inter-agent collision check (distinct from the nearest-
+    # neighbor-only soft safety penalty above, and from the altitude-bound `collision` var
+    # in this function -- see AGENT_COLLISION_DISTANCE). Does not affect reward/termination.
+    agent_collision = (off_diag_actual < AGENT_COLLISION_DISTANCE).any(dim=1).float()
 
     env._metrics.update(
         distance_to_goal=distances.mean(dim=0),
@@ -341,6 +353,7 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
         dist_component=mean_reward_per_env,
         formation=formation_error,
         swarm_cohesion=formation_shape_error,
+        agent_collision=agent_collision,
     )
 
     return {f"robot_{i}": reward for i in range(env.num_drones)}

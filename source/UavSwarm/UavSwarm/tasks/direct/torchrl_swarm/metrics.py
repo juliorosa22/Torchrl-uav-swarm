@@ -29,6 +29,11 @@ class EpisodeMetrics:
               i.e. how well the swarm's *shape* matches the target formation's shape,
               independent of translation/progress toward it (see get_formation_rewards()).
               Zero (unpopulated) for stages that don't call update(swarm_cohesion=...).
+
+        Safety metric (stage 6, logging-only):
+            - agent_collision: fraction of the episode during which any pair of agents was
+              within AGENT_COLLISION_DISTANCE of each other (true pairwise check, not just
+              nearest-neighbor). Does not affect reward or termination -- purely observational.
     """
     # Basic metrics
     lin_vel: torch.Tensor
@@ -45,6 +50,7 @@ class EpisodeMetrics:
     # Formation metrics (optional for stages 4-5)
     formation: torch.Tensor
     swarm_cohesion: torch.Tensor = None
+    agent_collision: torch.Tensor = None
 
     @classmethod
     def create(cls, num_envs: int, device: str) -> "EpisodeMetrics":
@@ -68,6 +74,7 @@ class EpisodeMetrics:
             coop_component=torch.zeros(num_envs, dtype=torch.float, device=device),
             formation=torch.zeros(num_envs, dtype=torch.float, device=device),
             swarm_cohesion=torch.zeros(num_envs, dtype=torch.float, device=device),
+            agent_collision=torch.zeros(num_envs, dtype=torch.float, device=device),
         )
 
     def reset(self, env_ids: torch.Tensor) -> None:
@@ -88,6 +95,8 @@ class EpisodeMetrics:
 
         if self.swarm_cohesion is not None:
             self.swarm_cohesion[env_ids] = 0.0
+        if self.agent_collision is not None:
+            self.agent_collision[env_ids] = 0.0
 
     def to_log_dict(
         self,
@@ -151,6 +160,11 @@ class EpisodeMetrics:
                 torch.mean(self.swarm_cohesion[env_ids]) / max_episode_length
             ).item()
 
+        if self.agent_collision is not None:
+            log_dict[f"{prefix}/agent_collision_rate"] = (
+                torch.mean(self.agent_collision[env_ids]) / max_episode_length
+            ).item()
+
         return log_dict
 
     def update(
@@ -165,6 +179,7 @@ class EpisodeMetrics:
         coop_component: torch.Tensor = None,
         formation: torch.Tensor = None,
         swarm_cohesion: torch.Tensor = None,
+        agent_collision: torch.Tensor = None,
     ) -> None:
         """Accumulate metrics (in-place addition).
 
@@ -192,6 +207,8 @@ class EpisodeMetrics:
             self.formation += formation
         if swarm_cohesion is not None and self.swarm_cohesion is not None:
             self.swarm_cohesion += swarm_cohesion
+        if agent_collision is not None and self.agent_collision is not None:
+            self.agent_collision += agent_collision
 
     def get_mean(self, metric_name: str, env_ids: torch.Tensor = None) -> float:
         """Get mean value of a specific metric.
