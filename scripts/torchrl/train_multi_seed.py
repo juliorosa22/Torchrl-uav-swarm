@@ -21,14 +21,17 @@ Each seed's run lands in its own experiment subdirectory
 (<experiment_directory>_seed<N>) so aggregate_results.py can glob them back together.
 
 Usage:
+  # Real run, on the lab GPU (see torchrl_mappo_cfg_remote.yaml, sized for its 16GB):
   python scripts/torchrl/train_multi_seed.py \\
       --task Formation-TorchRL-UAVSwarm-Direct-v0 \\
+      --config scripts/torchrl/torchrl_mappo_cfg_remote.yaml \\
       --experiment_directory formation_scalability \\
-      --num_seeds 5 --base_seed 0 \\
-      --max_iterations 2000 --headless
+      --num_seeds 5 --base_seed 0 --headless
 
   # any other scripts/torchrl/mappo_train.py flag (--num_envs, --controller,
-  # --stage, --video, ...) is passed through unchanged to every seed's run.
+  # --stage, --video, --max_iterations, ...) is passed through unchanged to every
+  # seed's run. --config defaults to torchrl_mappo_cfg_local.yaml (6GB laptop GPU)
+  # if omitted -- pass the remote profile explicitly for the real run.
 
   python scripts/torchrl/aggregate_results.py \\
       --experiment_glob "logs/torchrl/formation_scalability_seed*"

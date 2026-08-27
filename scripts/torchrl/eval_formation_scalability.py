@@ -37,7 +37,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Zero-shot scalability eval for the formation-assignment task.")
 parser.add_argument("--task", type=str, default="Formation-TorchRL-UAVSwarm-Direct-v0")
-parser.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg.yaml")
+parser.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg_local.yaml")
 parser.add_argument("--checkpoint", type=str, required=True, help="Path to a MAPPO policy checkpoint (.pt).")
 parser.add_argument(
     "--num_agents", type=int, default=5,

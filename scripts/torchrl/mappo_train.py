@@ -24,7 +24,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Shared-weight MAPPO training with TorchRL.")
 parser.add_argument("--task", type=str, default="FullTask-TorchRL-UAVSwarm-Direct-v0")
-parser.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg.yaml")
+parser.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg_local.yaml")
 parser.add_argument("--num_envs", type=int, default=None)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--checkpoint", type=str, default=None)

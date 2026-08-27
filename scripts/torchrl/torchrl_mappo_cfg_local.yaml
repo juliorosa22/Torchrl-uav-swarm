@@ -1,0 +1,95 @@
+# LOCAL profile -- quick validation/smoke-test runs on the 6GB laptop GPU. Safe default
+# for `--config` (see mappo_train.py) so an accidental bare invocation never tries to
+# allocate the remote profile's larger num_envs on this card. For the real long training
+# run on the 16GB lab GPU, use torchrl_mappo_cfg_remote.yaml instead (via remote_run.sh).
+seed: 42
+
+# Environment
+# Baseline-TorchRL-UAVSwarm-Direct-v0: obs=28  action=4  state=140 (5 agents x 28)
+# FullTask-TorchRL-UAVSwarm-Direct-v0: obs=32  action=4  state=160 (5 agents x 32)
+#
+# GPU memory budget (6 GB card):
+#   Isaac Sim PhysX scales ~linearly with num_envs * num_drones.
+#   256 envs x 5 drones = 1280 articulations ≈ 5.0 GB  → leaves ~800 MB for PyTorch (OOM)
+#    64 envs x 5 drones =  320 articulations ≈ 1.2 GB  → leaves ~4.6 GB for PyTorch (safe)
+#   GAE critic peak: (frames_per_batch/num_envs) * num_envs * n_agents * hidden[0] * 4 bytes
+#     = 128 * 64 * 5 * 256 * 4 ≈ 84 MB  (well within budget)
+env:
+  num_envs: 64
+  device: cuda:0
+  centralized_critic: true
+
+# Low-level controller (applied inside the env, not the policy)
+# type: geometric | pd_velocity | direct
+# geometric: SE(3) controller — policy outputs [vx_b, vy_b, vz_b, yaw_rate] in [-1,1]
+# direct:    original raw force/torque mapping (backward compat)
+controller:
+  type: geometric
+  max_lin_vel_cmd: 1.5    # m/s per axis
+  max_yaw_rate_cmd: 1.0   # rad/s
+  Kv: 2.0                 # outer-loop velocity P-gain
+  # Inner-loop gains are sized for Crazyflie: moment_scale=0.01 Nm, max eR≈pi/2.
+  # KR * (pi/2) ≈ 0.003 Nm — proportional across full attitude range.
+  # KOmega * 20 rad/s ≈ 0.01 Nm — proportional across max angular rate.
+  KR: 0.002               # inner-loop attitude P-gain
+  KOmega: 0.0005          # inner-loop angular velocity D-gain
+
+# Model architectures
+models:
+  policy:
+    hidden_sizes: [128, 64]
+    activation: relu
+    clip_actions: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+
+  critic:
+    # Input: centralized state — 140 dims (Baseline) or 160 dims (FullTask)
+    # 140→128 first projection avoids bottleneck; aligns with MAPPO paper's [64,64] scale.
+    hidden_sizes: [128, 64]
+    activation: relu
+
+# MAPPO algorithm
+algorithm:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_loss_coef: 1.0
+  entropy_coef: 0.01
+  n_epochs: 5
+  batch_size: 512
+  frames_per_batch: 8192     # 64 envs x 128 steps per rollout (~2.5 s sim time)
+                             # buffer after flatten: 8192 * 5 agents = 40960 transitions
+                             # GAE critic peak: 40960 * 256 hidden * 4 bytes ≈ 42 MB
+  max_grad_norm: 1.0
+
+  # Batch-level advantage normalization (ClipPPOLoss's normalize_advantage kwarg).
+  normalize_advantages: true
+  # Reward normalization (running discounted-return std, OpenAI Baselines/CleanRL-style),
+  # applied in MAPPO._normalize_rewards_inplace before GAE runs. This is what actually
+  # implements the intent behind "normalize values" here -- it stabilizes the critic's
+  # target scale without needing a separate raw/normalized critic-output split (PopArt),
+  # since GAE bootstraps on the same normalized reward scale throughout. Confirmed
+  # necessary: without it, Loss/Value grew ~1000x (2.4k -> 2.27M) over 100 iterations.
+  normalize_rewards: true
+  # NOTE: observation normalization (a running mean/std on the 28-dim obs vector, which mixes
+  # velocities, position deltas up to ~15m, and fixed-value sentinels on quite different
+  # scales) is NOT implemented anywhere in this pipeline. It's a separate, independent
+  # stabilizer from the two above -- worth adding later if training still looks unstable
+  # after reward normalization, but out of scope for the current fix.
+
+# Training run
+training:
+  total_frames: 5000000      # ~610 iterations at 8192 frames/batch (64 envs x 128 steps)
+  checkpoint_interval: 50    # save every 50 iterations
+  # log_interval/eval_interval are currently unused -- no code reads them (logging happens
+  # every iteration unconditionally; there's no periodic eval-during-training loop yet).
+  log_interval: 100
+  eval_interval: 5000
+
+  # Base folder under logs/torchrl/ shared by every run of this experiment; each run gets
+  # its own timestamped subdir inside it (see mappo_train.py). Override with
+  # --experiment_directory; task-agnostic by design since this value doesn't change per task.
+  experiment_directory: "mappo_uav_swarm"

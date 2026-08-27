@@ -20,19 +20,22 @@
 #                                                             killing the job)
 #   scripts/remote_run.sh kill <job_name>                    Kill a running job
 #
-# Examples:
+# Examples (--config points at torchrl_mappo_cfg_remote.yaml, sized for the lab GPU's
+# 16GB -- the local default profile's num_envs would be needlessly small here):
 #   scripts/remote_run.sh run formation_train -- \
 #       scripts/torchrl/mappo_train.py --task Formation-TorchRL-UAVSwarm-Direct-v0 \
+#       --config scripts/torchrl/torchrl_mappo_cfg_remote.yaml \
 #       --experiment_directory formation_scalability --headless
 #
 #   scripts/remote_run.sh run formation_sweep -- \
 #       scripts/torchrl/train_multi_seed.py --task Formation-TorchRL-UAVSwarm-Direct-v0 \
+#       --config scripts/torchrl/torchrl_mappo_cfg_remote.yaml \
 #       --experiment_directory formation_scalability --num_seeds 5 --headless
 
 set -euo pipefail
 
 usage() {
-    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 }
 

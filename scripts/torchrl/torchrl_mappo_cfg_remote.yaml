@@ -1,21 +1,31 @@
+# REMOTE profile -- long training/eval runs on the lab GPU (RTX A4000, 16GB) via
+# remote_run.sh. Only the hardware-scaling parameters differ from
+# torchrl_mappo_cfg_local.yaml (num_envs, frames_per_batch, batch_size,
+# checkpoint_interval); controller/model/algorithm hyperparameters are identical so
+# results stay comparable between a local smoke test and the real run. Not the safe
+# default for --config -- pass this explicitly (num_envs=256 would be too much for the
+# 6GB laptop GPU).
 seed: 42
 
 # Environment
 # Baseline-TorchRL-UAVSwarm-Direct-v0: obs=28  action=4  state=140 (5 agents x 28)
 # FullTask-TorchRL-UAVSwarm-Direct-v0: obs=32  action=4  state=160 (5 agents x 32)
 #
-# GPU memory budget (6 GB card):
-#   Isaac Sim PhysX scales ~linearly with num_envs * num_drones.
-#   256 envs x 5 drones = 1280 articulations ≈ 5.0 GB  → leaves ~800 MB for PyTorch (OOM)
-#    64 envs x 5 drones =  320 articulations ≈ 1.2 GB  → leaves ~4.6 GB for PyTorch (safe)
+# GPU memory budget (16 GB card):
+#   Isaac Sim PhysX scales ~linearly with num_envs * num_drones (same rate as the local
+#   profile's own comment: 256 envs x 5 drones = 1280 articulations ~ 5.0 GB PhysX).
+#   That leaves ~11 GB for PyTorch -- was flagged OOM-risk on the 6GB local card at this
+#   same num_envs, but comfortable headroom here. Not pushed further than 256 without a
+#   fresh validation pass (see torchrl_mappo_cfg_local.yaml's num_envs=64 comment for the
+#   same linear-scaling math this extrapolates from).
 #   GAE critic peak: (frames_per_batch/num_envs) * num_envs * n_agents * hidden[0] * 4 bytes
-#     = 128 * 64 * 5 * 256 * 4 ≈ 84 MB  (well within budget)
+#     = 128 * 256 * 5 * 256 * 4 ≈ 167 MB (well within budget)
 env:
-  num_envs: 64
+  num_envs: 256
   device: cuda:0
   centralized_critic: true
 
-# Low-level controller (applied inside the env, not the policy)
+# Low-level controller (applied inside the env, not the policy) -- identical to local.
 # type: geometric | pd_velocity | direct
 # geometric: SE(3) controller — policy outputs [vx_b, vy_b, vz_b, yaw_rate] in [-1,1]
 # direct:    original raw force/torque mapping (backward compat)
@@ -30,7 +40,8 @@ controller:
   KR: 0.002               # inner-loop attitude P-gain
   KOmega: 0.0005          # inner-loop angular velocity D-gain
 
-# Model architectures
+# Model architectures -- identical to local (network size is not a hardware-scaling knob
+# here; changing it would change what's being trained, not just how fast).
 models:
   policy:
     hidden_sizes: [128, 64]
@@ -55,10 +66,13 @@ algorithm:
   value_loss_coef: 1.0
   entropy_coef: 0.01
   n_epochs: 5
-  batch_size: 512
-  frames_per_batch: 8192     # 64 envs x 128 steps per rollout (~2.5 s sim time)
-                             # buffer after flatten: 8192 * 5 agents = 40960 transitions
-                             # GAE critic peak: 40960 * 256 hidden * 4 bytes ≈ 42 MB
+  # 4x local's 512, matching the 4x rollout data volume so the number of minibatches per
+  # epoch stays the same (163840 transitions / 2048 = 80, same as local's 40960/512=80)
+  # -- same number of gradient steps per epoch, just more parallel envs feeding each one.
+  batch_size: 2048
+  frames_per_batch: 32768   # 256 envs x 128 steps per rollout (~2.5s sim time, same
+                             # per-env horizon as local's 64 envs x 128 steps)
+                             # buffer after flatten: 32768 * 5 agents = 163840 transitions
   max_grad_norm: 1.0
 
   # Batch-level advantage normalization (ClipPPOLoss's normalize_advantage kwarg).
@@ -78,8 +92,14 @@ algorithm:
 
 # Training run
 training:
-  total_frames: 5000000      # ~610 iterations at 8192 frames/batch (64 envs x 128 steps)
-  checkpoint_interval: 50    # save every 50 iterations
+  total_frames: 5000000      # same target as local; ~153 iterations at 32768 frames/batch
+                              # (vs local's ~610 iterations at 8192/batch for the same total)
+  # 12 iterations * 32768 frames/batch ≈ 393k frames between checkpoints, matching local's
+  # 50 * 8192 = 409.6k-frame checkpoint spacing (kept in frame-space, not iteration count,
+  # since an iteration means 4x more frames here).
+  checkpoint_interval: 12
+  # log_interval/eval_interval are currently unused -- no code reads them (logging happens
+  # every iteration unconditionally; there's no periodic eval-during-training loop yet).
   log_interval: 100
   eval_interval: 5000
 
