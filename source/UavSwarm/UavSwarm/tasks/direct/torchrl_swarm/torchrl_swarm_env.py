@@ -210,19 +210,23 @@ class BaseSwarmEnv(DirectMARLEnv):
             prefix="Episode_Reward",
         )
 
-        log_dict["Episode_Termination/died"] = torch.count_nonzero(self._last_terminated[env_ids]).item()
-        log_dict["Episode_Termination/time_out"] = torch.count_nonzero(self._last_timed_out[env_ids]).item()
+        # Rates (fraction of the envs resetting this call), not raw counts -- comparable
+        # across calls regardless of how many envs happened to reset together, and directly
+        # comparable to eval_formation_scalability.py's success_rate/collision_rate.
+        n_reset = max(len(env_ids), 1)
+        log_dict["Episode_Termination/died"] = torch.count_nonzero(self._last_terminated[env_ids]).item() / n_reset
+        log_dict["Episode_Termination/time_out"] = torch.count_nonzero(self._last_timed_out[env_ids]).item() / n_reset
 
         if hasattr(self, '_termination_reasons'):
             log_dict["Episode_Termination/collision"] = torch.count_nonzero(
                 self._termination_reasons['collision'][env_ids]
-            ).item()
+            ).item() / n_reset
             log_dict["Episode_Termination/out_of_bounds"] = torch.count_nonzero(
                 self._termination_reasons['out_of_bounds'][env_ids]
-            ).item()
+            ).item() / n_reset
             log_dict["Episode_Termination/goal_reached"] = torch.count_nonzero(
                 self._termination_reasons['goal_reached'][env_ids]
-            ).item()
+            ).item() / n_reset
 
         log_dict["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
         log_dict["Metrics/curriculum_stage"] = self.curriculum_stage

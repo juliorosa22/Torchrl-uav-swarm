@@ -316,7 +316,10 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
     reward = mean_reward_per_env + collision + jerk_penalty
     reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=-COLLISION_PENALTY)
 
-    # 7. LOGGING -- formation error = mean per-agent distance to assigned slot
+    # 7. LOGGING -- formation error = mean per-agent distance to assigned slot.
+    # (swarm_cohesion is a dead EpisodeMetrics field -- never initialized in
+    # EpisodeMetrics.create(), so update() silently no-ops on it everywhere in this
+    # codebase, not just here; not passed below to avoid implying it does something.)
     formation_error = distances.mean(dim=0)
 
     env._metrics.update(
@@ -325,7 +328,6 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
         mean_reward=reward,
         dist_component=mean_reward_per_env,
         formation=formation_error,
-        swarm_cohesion=formation_error,
     )
 
     return {f"robot_{i}": reward for i in range(env.num_drones)}

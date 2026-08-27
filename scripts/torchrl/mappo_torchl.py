@@ -255,6 +255,19 @@ class MAPPO:
             self.writer.add_scalar("Diagnostics/entropy", avg_entropy, collected_frames)
             self.writer.add_scalar("Diagnostics/grad_norm", avg_grad_norm, collected_frames)
 
+            # Task-level episode metrics (success rate, formation error, collision rate, ...)
+            # computed by the env's own _reset_idx and drained from the wrapper. Averaged
+            # across every episode that ended during this rollout window.
+            episode_logs = self.env.drain_episode_logs()
+            success_rate = None
+            if episode_logs:
+                keys = set().union(*(d.keys() for d in episode_logs))
+                for key in keys:
+                    vals = [d[key] for d in episode_logs if key in d]
+                    self.writer.add_scalar(key, sum(vals) / len(vals), collected_frames)
+                    if key == "Episode_Termination/goal_reached":
+                        success_rate = sum(vals) / len(vals)
+
             # Action channel statistics — track per-dim mean/std to confirm the policy
             # is exploring the full velocity command range (dims 0-2: vx/vy/vz, dim 3: yaw_rate).
             if "action" in rollout_flat.keys():
@@ -265,13 +278,16 @@ class MAPPO:
                         self.writer.add_scalar(f"Actions/{label}_mean", actions[..., idx].mean().item(), collected_frames)
                         self.writer.add_scalar(f"Actions/{label}_std", actions[..., idx].std().item(), collected_frames)
 
-            pbar.set_postfix({
+            postfix = {
                 "reward": f"{self.last_avg_reward:.2f}" if math.isfinite(self.last_avg_reward) else "nan!",
                 "loss": f"{avg_obj + avg_critic + avg_ent:.4f}" if math.isfinite(avg_obj) else "nan!",
                 "kl": f"{avg_kl:.4f}",
                 "clip": f"{avg_clip_frac:.2f}",
                 "ev": f"{avg_ev:.3f}",
-            })
+            }
+            if success_rate is not None:
+                postfix["succ"] = f"{success_rate:.2f}"
+            pbar.set_postfix(postfix)
 
         pbar.close()
         self.save_checkpoint(collected_frames)

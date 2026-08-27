@@ -76,6 +76,12 @@ class IsaacLabTorchRLWrapper(EnvBase):
         self._make_specs()
         self._print_info(device, num_envs)
 
+        # Per-episode metrics the underlying env computes in _reset_idx (success rate,
+        # formation error, collision rate, ...) and stores in extras["log"] -- SyncDataCollector
+        # only sees the TensorDict from _step, so we capture them here and let the trainer
+        # drain/average them once per rollout instead of losing them entirely.
+        self.episode_logs: list[dict] = []
+
     # -- properties for the trainer to discover keys ---------------------------
     @property
     def reward_key(self):
@@ -240,7 +246,20 @@ class IsaacLabTorchRLWrapper(EnvBase):
         td["terminated"] = terminated
         td["truncated"] = truncated
 
+        # extras["log"] is only freshly populated on a step where the env's own
+        # _reset_idx ran (i.e. some env just terminated/truncated) -- gate on done so we
+        # don't re-append the same stale dict on every subsequent step.
+        if done.any():
+            log = self.unwrapped_env.extras.get("log")
+            if log:
+                self.episode_logs.append(log)
+
         return td
+
+    def drain_episode_logs(self) -> list[dict]:
+        """Pop and clear all episode-end log dicts accumulated since the last drain."""
+        logs, self.episode_logs = self.episode_logs, []
+        return logs
 
     def _set_seed(self, seed: Optional[int]):
         if seed is not None:
