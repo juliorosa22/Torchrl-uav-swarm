@@ -72,5 +72,7 @@ training:
   log_interval: 100
   eval_interval: 5000
 
-  experiment_directory: "fulltask_geometric_mappo"
-  experiment_name: "mappo_uav_swarm"
+  # Base folder under logs/torchrl/ shared by every run of this experiment; each run gets
+  # its own timestamped subdir inside it (see mappo_train.py). Override with
+  # --experiment_directory; task-agnostic by design since this value doesn't change per task.
+  experiment_directory: "mappo_uav_swarm"

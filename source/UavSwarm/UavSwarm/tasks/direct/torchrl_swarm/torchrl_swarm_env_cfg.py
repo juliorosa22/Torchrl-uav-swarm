@@ -43,6 +43,7 @@ class CurriculumCfg:
     stage3_episode_length_s: float = 240.0
     stage4_episode_length_s: float = 300.0
     stage5_episode_length_s: float = 300.0
+    stage6_episode_length_s: float = 180.0
 
     # Stage 2 parameters
     stage2_goal_distance: float = 6.0
@@ -87,6 +88,15 @@ class CurriculumCfg:
     stage4_spawn_height_range: tuple = (2.0, 4.5)
     stage5_spawn_height_range: tuple = (2.0, 5.0)
 
+    # Stage 6 parameters (formation-assignment scalability task)
+    # Scatter spacing is deliberately wider than spawn_grid_spacing_range so drones start
+    # meaningfully far from their eventual slot -- otherwise the assignment problem is
+    # trivial and there's nothing for the Hungarian solve (or the policy) to do.
+    stage6_scatter_spacing_range: tuple = (1.5, 3.0)
+    stage6_spawn_height_range: tuple = (2.0, 4.5)
+    # Target formation altitude, independent of scattered spawn heights.
+    stage6_target_height_range: tuple = (1.5, 3.0)
+
     def get_episode_length(self) -> float:
         """Return episode length based on active stage."""
         stage_lengths = {
@@ -95,9 +105,10 @@ class CurriculumCfg:
             3: self.stage3_episode_length_s,
             4: self.stage4_episode_length_s,
             5: self.stage5_episode_length_s,
+            6: self.stage6_episode_length_s,
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-5.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-6.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -258,3 +269,20 @@ class BaselineUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     single_observation_space: int = 28
     state_space: int = 140
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
+
+
+@configclass
+class FormationUAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """Formation-assignment scalability task: RM-free (baseline arm), single focused
+    task -- scatter-spawn then converge to a Hungarian-assigned V-formation slot.
+
+    Uses curriculum stage 6 purely as an internal dispatch value into the shared
+    BaseSwarmEnv workflow; it is not part of the sequential 1-5 curriculum.
+    """
+
+    include_rm_in_obs: bool = False
+    single_observation_space: int = 28
+    state_space: int = 140
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=6)

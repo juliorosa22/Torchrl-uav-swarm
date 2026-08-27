@@ -39,6 +39,11 @@ parser.add_argument(
     help="Low-level controller: geometric=SE(3) (default), pd_velocity=approx PD, direct=original force/torque.",
 )
 parser.add_argument("--stage", type=int, default=None, help="Curriculum stage 1-5. Overrides config.")
+parser.add_argument(
+    "--experiment_directory", type=str, default=None,
+    help="Base folder under logs/torchrl/ shared by every run of this experiment; each run "
+         "still gets its own timestamped subdir inside it. Overrides the config file's value.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -135,6 +140,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     device = torch.device(config["env"]["device"])
 
     # --- log dir ---
+    if args_cli.experiment_directory:
+        config["training"]["experiment_directory"] = args_cli.experiment_directory
     log_root = os.path.abspath(os.path.join("logs", "torchrl", config["training"]["experiment_directory"]))
     log_dir = os.path.join(
         log_root,

@@ -1,0 +1,264 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""
+Zero-shot swarm-size scalability evaluation for the formation-assignment task.
+
+Loads a MAPPO checkpoint trained at one swarm size (e.g. num_agents=5) and evaluates it,
+WITHOUT any retraining, on an env instantiated with a different swarm size. This works
+because the policy network only depends on obs_dim/action_dim (fixed at 28/4 regardless
+of swarm size, see mappo_train.py::make_policy) and observations are size-invariant
+(mean-pooled neighbor embedding, see torchrl_swarm/sensing.py) -- the same checkpoint
+loads and runs unchanged at any N.
+
+Isaac Sim supports one simulated scene per process, so this script evaluates a single
+--num_agents value per invocation. Run it once per swarm size (appending to the same
+--results_csv) to build the full N-vs-metrics table, e.g.:
+
+  for n in 5 10 15 20; do
+    python scripts/torchrl/eval_formation_scalability.py \\
+      --checkpoint logs/torchrl/formation/.../checkpoint.pt \\
+      --num_agents $n --results_csv results/formation_scalability.csv
+  done
+
+Reports, per swarm size: success rate (all agents reached their assigned slot),
+mean time-to-form (steps), mean formation error (final mean distance to assigned slot),
+path efficiency (Hungarian-assigned straight-line distance / actual distance traveled --
+1.0 is perfectly efficient), and collision rate.
+"""
+
+"""Launch Isaac Sim Simulator first."""
+
+import argparse
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Zero-shot scalability eval for the formation-assignment task.")
+parser.add_argument("--task", type=str, default="Formation-TorchRL-UAVSwarm-Direct-v0")
+parser.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg.yaml")
+parser.add_argument("--checkpoint", type=str, required=True, help="Path to a MAPPO policy checkpoint (.pt).")
+parser.add_argument(
+    "--num_agents", type=int, default=5,
+    help="Swarm size to evaluate. The checkpoint was trained at 5; pass a larger value to test zero-shot scaling.",
+)
+parser.add_argument("--num_envs", type=int, default=32)
+parser.add_argument("--num_steps", type=int, default=600)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument(
+    "--controller", type=str, default="geometric", choices=["geometric", "pd_velocity", "direct"],
+)
+parser.add_argument("--results_csv", type=str, default=None, help="Append a summary row to this CSV (created if missing).")
+AppLauncher.add_app_launcher_args(parser)
+args_cli, hydra_args = parser.parse_known_args()
+
+import sys  # noqa: E402
+
+sys.argv = [sys.argv[0]] + hydra_args
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+"""Rest everything follows."""
+
+import csv
+import os
+
+import gymnasium as gym
+import torch
+import yaml
+from tensordict.nn import TensorDictModule
+from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
+from torchrl.modules import ProbabilisticActor, TanhNormal
+
+from isaaclab.envs import DirectMARLEnv
+
+import UavSwarm.tasks  # noqa: F401
+from UavSwarm.tasks.direct.torchrl_swarm.torchrl_swarm_env_cfg import FormationUAVSwarmEnvCfg
+
+from torchrl_wrapper import IsaacLabTorchRLWrapper
+# mappo_train.py is a script with top-level argparse/AppLauncher side effects (it launches
+# its own Isaac Sim app on import), so it cannot be imported here. MAPPOPolicy lives in the
+# side-effect-free mappo_torchl.py; load_config/make_policy are small enough to duplicate.
+from mappo_torchl import MAPPOPolicy
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def make_policy(obs_dim: int, action_dim: int, config: dict, device: torch.device) -> ProbabilisticActor:
+    """Create the shared policy: TensorDictModule -> ProbabilisticActor.
+
+    Mirrors mappo_train.py::make_policy exactly (obs_dim/action_dim-only, N-agnostic).
+    """
+    net = MAPPOPolicy(obs_dim, action_dim, config["models"]["policy"]["hidden_sizes"]).to(device)
+    module = TensorDictModule(
+        module=net,
+        in_keys=[("agents", "observation")],
+        out_keys=[("agents", "loc"), ("agents", "scale")],
+    )
+    return ProbabilisticActor(
+        module=module,
+        in_keys=[("agents", "loc"), ("agents", "scale")],
+        out_keys=[("agents", "action")],
+        distribution_class=TanhNormal,
+        distribution_kwargs={"low": -1.0, "high": 1.0},
+        return_log_prob=True,
+        log_prob_key=("agents", "sample_log_prob"),
+    )
+
+
+def build_eval_cfg(num_agents: int, num_envs: int, device: str, controller_type: str) -> FormationUAVSwarmEnvCfg:
+    """Patch a FormationUAVSwarmEnvCfg for a swarm size different from the one it trained at.
+
+    possible_agents/action_spaces/observation_spaces/state_space are baked as plain class
+    attributes at class-definition time (a configclass constraint: no @property, since
+    configclass deep-copies fields via setattr -- see torchrl_swarm_env_cfg.py), so setting
+    cfg.num_agents alone does not resize them. All four must be rebuilt here.
+    """
+    cfg = FormationUAVSwarmEnvCfg()
+    cfg.num_agents = num_agents
+    cfg.possible_agents = [f"robot_{i}" for i in range(num_agents)]
+    cfg.action_spaces = {
+        f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)
+    }
+    cfg.observation_spaces = {
+        f"robot_{i}": gym.spaces.Box(low=-float("inf"), high=float("inf"), shape=(cfg.single_observation_space,))
+        for i in range(num_agents)
+    }
+    cfg.state_space = num_agents * cfg.single_observation_space
+    cfg.scene.num_envs = num_envs
+    cfg.sim.device = device
+    cfg.controller.type = controller_type
+    return cfg
+
+
+def main():
+    config = load_config(args_cli.config)
+    device = torch.device(config["env"]["device"])
+    torch.manual_seed(args_cli.seed)
+
+    env_cfg = build_eval_cfg(args_cli.num_agents, args_cli.num_envs, str(device), args_cli.controller)
+
+    print(f"\n{'='*80}")
+    print("  Formation Scalability Eval — zero-shot swarm-size generalization")
+    print(f"{'='*80}")
+    print(f"  Task:       {args_cli.task}")
+    print(f"  Checkpoint: {args_cli.checkpoint}")
+    print(f"  Agents:     {args_cli.num_agents}")
+    print(f"  Envs:       {args_cli.num_envs}")
+    print(f"  Steps:      {args_cli.num_steps}")
+    print(f"{'='*80}\n")
+
+    base_env = gym.make(args_cli.task, cfg=env_cfg)
+    if not isinstance(base_env.unwrapped, DirectMARLEnv):
+        raise TypeError(f"Expected DirectMARLEnv, got {type(base_env.unwrapped)}")
+
+    env = IsaacLabTorchRLWrapper(base_env, device=str(device))
+    unwrapped = env.unwrapped_env
+    num_envs = unwrapped.num_envs
+    num_agents = args_cli.num_agents
+
+    print(f"[INFO] obs={env.obs_dim}  action={env.action_dim}  state={env.state_dim}  agents={env.num_agents}\n")
+
+    policy = make_policy(env.obs_dim, env.action_dim, config, device)
+    ckpt = torch.load(args_cli.checkpoint, map_location=device)
+    policy.load_state_dict(ckpt["policy"])
+    policy.eval()
+
+    tensordict = env.reset()
+
+    def _all_positions() -> torch.Tensor:
+        # (num_envs, num_agents, 3)
+        return torch.stack([rob.data.root_pos_w for rob in unwrapped._robots], dim=1)
+
+    def _dist_to_assigned_slot() -> torch.Tensor:
+        # (num_envs, num_agents)
+        return torch.linalg.norm(unwrapped._desired_pos_w - _all_positions(), dim=2)
+
+    # Hungarian-assigned straight-line distance per agent, captured right after reset.
+    optimal_dist = _dist_to_assigned_slot().clone()
+
+    prev_pos = _all_positions().clone()
+    path_length = torch.zeros(num_envs, num_agents, device=device)
+    success_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+    collided = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    final_formation_error = torch.zeros(num_envs, device=device)
+    finished = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+        for step in range(args_cli.num_steps):
+            tensordict = policy(tensordict)
+            tensordict = env.step(tensordict)
+
+            cur_pos = _all_positions()
+            active = ~finished
+            path_length += torch.linalg.norm(cur_pos - prev_pos, dim=2) * active.unsqueeze(1).float()
+            prev_pos = cur_pos.clone()
+
+            if hasattr(unwrapped, "_termination_reasons"):
+                newly_collided = unwrapped._termination_reasons["collision"] & active
+                collided = collided | newly_collided
+
+                goal_reached = unwrapped._termination_reasons["goal_reached"] & active
+                success_step[goal_reached] = step
+                final_formation_error[goal_reached] = _dist_to_assigned_slot().mean(dim=1)[goal_reached]
+
+            still_running = active & (~collided) & (success_step < 0)
+            if step == args_cli.num_steps - 1:
+                final_formation_error[still_running] = _dist_to_assigned_slot().mean(dim=1)[still_running]
+
+            finished = finished | collided | (success_step >= 0)
+
+            tensordict = step_mdp(tensordict)
+
+    success_mask = success_step >= 0
+    success_rate = success_mask.float().mean().item()
+    mean_time_to_form = success_step[success_mask].float().mean().item() if success_mask.any() else float("nan")
+    mean_formation_error = final_formation_error.mean().item()
+    path_efficiency = (optimal_dist / path_length.clamp(min=1e-3)).mean().item()
+    collision_rate = collided.float().mean().item()
+
+    print(f"\n{'='*80}")
+    print(f"  Results — num_agents={num_agents}")
+    print(f"{'='*80}")
+    print(f"  Success rate:        {success_rate:.3f}")
+    print(f"  Mean time-to-form:   {mean_time_to_form:.1f} steps")
+    print(f"  Mean formation error:{mean_formation_error:.3f} m")
+    print(f"  Path efficiency:     {path_efficiency:.3f}  (1.0 = straight-line optimal)")
+    print(f"  Collision rate:      {collision_rate:.3f}")
+    print(f"{'='*80}\n")
+
+    if args_cli.results_csv:
+        os.makedirs(os.path.dirname(args_cli.results_csv) or ".", exist_ok=True)
+        write_header = not os.path.exists(args_cli.results_csv)
+        with open(args_cli.results_csv, "a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow([
+                    "num_agents", "checkpoint", "success_rate", "mean_time_to_form_steps",
+                    "mean_formation_error_m", "path_efficiency", "collision_rate",
+                ])
+            writer.writerow([
+                num_agents, args_cli.checkpoint, success_rate, mean_time_to_form,
+                mean_formation_error, path_efficiency, collision_rate,
+            ])
+        print(f"[INFO] Appended results row to {args_cli.results_csv}\n")
+
+    env.close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted.")
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        simulation_app.close()

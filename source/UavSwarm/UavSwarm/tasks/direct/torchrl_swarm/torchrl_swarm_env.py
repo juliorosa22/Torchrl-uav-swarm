@@ -13,7 +13,12 @@ from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.utils.math import subtract_frame_transforms
 
-from .torchrl_swarm_env_cfg import BaseSwarmEnvCfg, FullTaskUAVSwarmEnvCfg, BaselineUAVSwarmEnvCfg
+from .torchrl_swarm_env_cfg import (
+    BaseSwarmEnvCfg,
+    FullTaskUAVSwarmEnvCfg,
+    BaselineUAVSwarmEnvCfg,
+    FormationUAVSwarmEnvCfg,
+)
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
 from .formation import compute_swarm_centroid, get_inverted_v_formation
@@ -26,13 +31,14 @@ from .curriculum import (
     set_stage3_positions,
     set_stage4_positions,
     set_stage5_positions,
+    set_formation_positions,
 )
 from .termination import (
     get_dones,
     update_waypoint_goals,
     update_swarm_waypoint_goals,
 )
-from .rewards import get_rewards
+from .rewards import get_rewards, get_formation_rewards
 from .debug_viz import set_debug_vis_impl, debug_vis_callback
 
 
@@ -161,7 +167,7 @@ class BaseSwarmEnv(DirectMARLEnv):
         elif self.curriculum_stage == 5:
             update_swarm_waypoint_goals(self)
 
-        if self.curriculum_stage in [4, 5]:
+        if self.curriculum_stage in [4, 5, 6]:
             compute_swarm_centroid(self)
 
         all_positions = torch.stack([rob.data.root_pos_w for rob in self._robots], dim=0)
@@ -266,6 +272,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_stage4_positions(self, env_ids, env_origins)
         elif stage == 5:
             set_stage5_positions(self, env_ids, env_origins)
+        elif stage == 6:
+            set_formation_positions(self, env_ids, env_origins)
 
     # ------------------------------------------------------------------
     # Observations
@@ -352,6 +360,8 @@ class BaseSwarmEnv(DirectMARLEnv):
     # ------------------------------------------------------------------
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
+        if self.curriculum_stage == 6:
+            return get_formation_rewards(self)
         return get_rewards(self)
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -419,3 +429,10 @@ class BaselineUAVSwarmEnv(BaseSwarmEnv):
     """Baseline variant: 19-dim observations without RM state one-hot."""
 
     cfg: BaselineUAVSwarmEnvCfg
+
+
+class FormationUAVSwarmEnv(BaseSwarmEnv):
+    """Formation-assignment scalability task: scatter-spawn -> Hungarian-assigned
+    V-formation slots, 28-dim observations without RM state one-hot."""
+
+    cfg: FormationUAVSwarmEnvCfg

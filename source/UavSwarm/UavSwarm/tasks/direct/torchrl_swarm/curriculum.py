@@ -7,6 +7,9 @@ goal positions according to the curriculum progression:
   Stage 3: Obstacle course (per-agent waypoints)
   Stage 4: Swarm formation navigation
   Stage 5: Swarm + obstacles (formation through stacked-X pattern)
+  Stage 6: Formation-assignment scalability task (scatter-spawn -> Hungarian-assigned
+           V-formation slots). Internal dispatch value only; not part of the sequential
+           1-5 curriculum, used by the standalone Formation-TorchRL-UAVSwarm-Direct-v0 task.
 """
 
 import torch
@@ -385,3 +388,69 @@ def set_stage5_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
             env._desired_pos_w[env_id_single, j, 0] = goal_pos[0]
             env._desired_pos_w[env_id_single, j, 1] = goal_pos[1]
             env._desired_pos_w[env_id_single, j, 2] = goal_pos[2]
+
+
+def set_formation_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
+    """Scatter-spawn drones randomly, then assign each to the V-formation slot that
+    minimizes total swarm travel distance (Hungarian / linear-sum assignment).
+
+    Decentralized execution is preserved: the assignment is solved centrally here at
+    reset time (same category as any other env-side goal generation), but each agent
+    only ever observes its own assigned slot through the existing desired_pos_b field
+    in _get_observations() -- never the assignment matrix or other agents' targets.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    from .formation import get_inverted_v_formation
+
+    num_reset_envs = len(env_ids)
+    cfg_c = env.cfg.curriculum
+
+    grid_size = int(torch.ceil(torch.sqrt(torch.tensor(env.num_drones, dtype=torch.float32))))
+    spacing = torch.zeros(1, device=env.device).uniform_(
+        cfg_c.stage6_scatter_spacing_range[0],
+        cfg_c.stage6_scatter_spacing_range[1],
+    )
+
+    spawn_lo, spawn_hi = cfg_c.stage6_spawn_height_range
+    target_lo, target_hi = cfg_c.stage6_target_height_range
+
+    # Target V-formation slots: one shared target altitude per env, independent of the
+    # scattered spawn heights below, so the assignment problem is non-trivial in 3D.
+    target_heights = torch.zeros(num_reset_envs, device=env.device).uniform_(target_lo, target_hi)
+    formation_slots = get_inverted_v_formation(env, env_ids, env_origins, target_heights)  # (num_reset_envs, num_drones, 3)
+
+    for env_idx in range(num_reset_envs):
+        env_id_single = env_ids[env_idx].unsqueeze(0)
+
+        # Randomized grid scatter: guarantees minimum separation without rejection sampling.
+        perm = torch.randperm(env.num_drones, device=env.device)
+        heights = torch.zeros(env.num_drones, device=env.device).uniform_(spawn_lo, spawn_hi)
+        spawn_positions = torch.zeros(env.num_drones, 3, device=env.device)
+
+        for j in range(env.num_drones):
+            grid_idx = perm[j].item()
+            grid_x = (grid_idx % grid_size) * spacing - (grid_size * spacing / 2.0)
+            grid_y = (grid_idx // grid_size) * spacing - (grid_size * spacing / 2.0)
+            spawn_positions[j, 0] = env_origins[env_idx, 0] + grid_x
+            spawn_positions[j, 1] = env_origins[env_idx, 1] + grid_y
+            spawn_positions[j, 2] = heights[j]
+
+        # Hungarian assignment: minimize total distance from scattered spawn to V-slots.
+        cost_matrix = torch.cdist(
+            spawn_positions.unsqueeze(0), formation_slots[env_idx].unsqueeze(0)
+        ).squeeze(0).cpu().numpy()
+        _, col_ind = linear_sum_assignment(cost_matrix)
+
+        for j, rob in enumerate(env._robots):
+            joint_pos = rob.data.default_joint_pos[env_id_single]
+            joint_vel = rob.data.default_joint_vel[env_id_single]
+            default_root_state = rob.data.default_root_state[env_id_single].clone()
+            default_root_state[:, :3] = spawn_positions[j]
+
+            rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
+            rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
+            rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
+
+            assigned_slot = formation_slots[env_idx, col_ind[j]]
+            env._desired_pos_w[env_id_single, j, :] = assigned_slot

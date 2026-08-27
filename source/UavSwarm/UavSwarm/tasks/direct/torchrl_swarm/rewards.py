@@ -50,6 +50,11 @@ JERK_PENALTY_SCALE = 0.01
 LIN_VEL_PENALTY_SCALE = 0.005
 ANG_VEL_PENALTY_SCALE = 0.0025
 
+# Formation-assignment task (stage 6): inter-agent safety penalty, distinct from the
+# K_COOP travel potential above (that one rewards staying near an in-transit neighbor;
+# this one only penalizes violating min_safe_distance while converging to an assigned slot).
+K_FORM_SAFETY = 5.0
+
 
 def get_rewards(env) -> dict[str, torch.Tensor]:
     """Energy-based reward with distance delta, velocity alignment, and RM state shaping.
@@ -240,6 +245,87 @@ def get_rewards(env) -> dict[str, torch.Tensor]:
         coop_component=coop_component.mean(dim=0),
         formation=formation_error,
         swarm_cohesion=formation_error,  # cohesion = same metric as formation for now
+    )
+
+    return {f"robot_{i}": reward for i in range(env.num_drones)}
+
+
+def get_formation_rewards(env) -> dict[str, torch.Tensor]:
+    """Purely additive formation-assignment reward (curriculum stage 6).
+
+    Reach and hold the Hungarian-assigned V-formation slot. No RM-state weighting --
+    this is the plain MARL baseline arm; the MARL+RM comparison arm for this task is a
+    follow-up. Mirrors the additive-reward design used for the baseline navigation task.
+    """
+    from .sensing import ensure_cache_populated
+
+    ensure_cache_populated(env)
+
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
+    all_lin_vels_w = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
+
+    desired_transposed = env._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+
+    # 1. POSITION ENERGY toward assigned slot
+    distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)
+    position_energy = K_POS / (1.0 + distances ** 2)
+
+    # 2. DISTANCE DELTA (progress indicator)
+    if not hasattr(env, '_prev_distances'):
+        env._prev_distances = distances.clone()
+
+    distance_delta = env._prev_distances - distances
+    env._prev_distances = distances.clone()
+    delta_term = K_DELTA * distance_delta
+
+    # 3. VELOCITY ALIGNMENT toward assigned slot
+    goal_directions = desired_transposed - all_positions
+    goal_dist = torch.linalg.norm(goal_directions, dim=2, keepdim=True) + 1e-8
+    goal_directions_norm = goal_directions / goal_dist
+
+    vel_mag = torch.linalg.norm(all_lin_vels_w, dim=2, keepdim=True) + 1e-8
+    vel_directions_norm = all_lin_vels_w / vel_mag
+
+    cos_alignment = torch.sum(goal_directions_norm * vel_directions_norm, dim=2)
+    is_moving = (vel_mag.squeeze(-1) > 0.1).float()
+    alignment_term = K_ALIGN * torch.clamp(cos_alignment, min=0.0) * is_moving
+
+    # 4. INTER-AGENT SAFETY PENALTY (nearest-neighbor threshold, not the travel potential)
+    neighbor_dists = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)  # (num_drones, num_envs)
+    min_safe = env.cfg.swarm_cfg.min_safe_distance
+    safety_violation = torch.clamp(min_safe - neighbor_dists, min=0.0)
+    safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
+
+    per_drone_reward = position_energy + delta_term + alignment_term + safety_penalty
+    mean_reward_per_env = per_drone_reward.mean(dim=0)
+
+    # 5. HARD COLLISION PENALTY (ground / ceiling)
+    agent_z = all_positions[:, :, 2]
+    too_low = agent_z < env.cfg.reward_cfg.min_flight_height
+    too_high = agent_z > env.cfg.reward_cfg.max_flight_height
+    collision = -(too_low | too_high).any(dim=0).float() * COLLISION_PENALTY
+
+    # 6. JERK PENALTY (action smoothness)
+    if not hasattr(env, '_prev_actions'):
+        env._prev_actions = torch.zeros_like(env._actions)
+
+    action_diff = env._actions - env._prev_actions
+    jerk_penalty = torch.sum(action_diff ** 2, dim=(1, 2)) * -JERK_PENALTY_SCALE
+    env._prev_actions = env._actions.clone()
+
+    reward = mean_reward_per_env + collision + jerk_penalty
+    reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=-COLLISION_PENALTY)
+
+    # 7. LOGGING -- formation error = mean per-agent distance to assigned slot
+    formation_error = distances.mean(dim=0)
+
+    env._metrics.update(
+        distance_to_goal=distances.mean(dim=0),
+        collision=collision.abs(),
+        mean_reward=reward,
+        dist_component=mean_reward_per_env,
+        formation=formation_error,
+        swarm_cohesion=formation_error,
     )
 
     return {f"robot_{i}": reward for i in range(env.num_drones)}
