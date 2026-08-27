@@ -29,6 +29,16 @@ class RunningMeanStd:
         batch_var = x.var(unbiased=False)
         batch_count = x.numel()
 
+        # A single non-finite sample here would permanently poison self.mean/self.var --
+        # every later update's formula folds in the previous mean/var, so NaN propagates
+        # forever once it enters, silently breaking reward normalization (and therefore
+        # every downstream loss) for the rest of the run without ever raising. Skip
+        # rather than absorb; the env's own reward already clamps NaN/Inf to 0 (see
+        # get_formation_rewards's nan_to_num), so this is a last-resort guard, not the
+        # primary defense.
+        if not (torch.isfinite(batch_mean) and torch.isfinite(batch_var)):
+            return
+
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
 
@@ -240,6 +250,7 @@ class MAPPO:
             total_obj, total_critic, total_ent = 0.0, 0.0, 0.0
             total_grad_norm = 0.0
             num_updates = 0
+            num_skipped_updates = 0
             # NOTE: previously accumulated via `locals()[accum] += ...` in the loop below --
             # locals() returns a snapshot dict in CPython; writing into it does not affect
             # the actual local variables, so those diagnostics were always frozen at 0.0
@@ -257,8 +268,28 @@ class MAPPO:
                         + loss_vals["loss_critic"]
                         + loss_vals["loss_entropy"]
                     )
+
+                    # Rare PPO numerical instability (e.g. an extreme action/value estimate
+                    # pushing the loss to NaN/Inf) must not reach optimizer.step() -- once
+                    # network weights go NaN they never recover on their own (every later
+                    # forward/backward pass stays NaN), silently wasting the rest of the run.
+                    # Confirmed necessary: seed 1 of the first 5-seed sweep hit exactly this
+                    # at 11% through and produced NaN losses for the remainder undetected --
+                    # train_multi_seed.py doesn't treat it as a failure since the process
+                    # itself never crashes. Skip the minibatch entirely instead.
+                    if not torch.isfinite(loss):
+                        num_skipped_updates += 1
+                        self.optimizer.zero_grad()
+                        continue
+
                     loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.loss_module.parameters(), 1.0)
+
+                    if not torch.isfinite(grad_norm):
+                        num_skipped_updates += 1
+                        self.optimizer.zero_grad()
+                        continue
+
                     self.optimizer.step()
                     self.optimizer.zero_grad()
 
@@ -313,6 +344,10 @@ class MAPPO:
             self.writer.add_scalar("Diagnostics/explained_variance", avg_ev, collected_frames)
             self.writer.add_scalar("Diagnostics/entropy", avg_entropy, collected_frames)
             self.writer.add_scalar("Diagnostics/grad_norm", avg_grad_norm, collected_frames)
+            self.writer.add_scalar("Diagnostics/skipped_updates", num_skipped_updates, collected_frames)
+            if num_skipped_updates > 0:
+                print(f"[WARN] Skipped {num_skipped_updates} minibatch update(s) this iteration "
+                      f"(non-finite loss/grad_norm) -- see Diagnostics/skipped_updates")
             if self.normalize_rewards:
                 self.writer.add_scalar("Diagnostics/reward_running_std", self._last_reward_std, collected_frames)
 
