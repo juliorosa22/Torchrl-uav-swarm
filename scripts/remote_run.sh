@@ -31,16 +31,29 @@
 
 set -euo pipefail
 
-REMOTE_HOST="${REMOTE_HOST:-lab-gpu}"
-REMOTE_REPO="${REMOTE_REPO:-~/UavSwarm-baseline_branch}"
-REMOTE_PY="${REMOTE_PY:-~/miniconda3/envs/isaac_env/bin/python}"
-REMOTE_LOG_DIR="${REMOTE_REPO}/logs/remote_runs"
-SESSION_PREFIX="uav_"
-
 usage() {
     sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 }
+
+# Check argument count before doing any network I/O, so `--help`/no-args doesn't
+# require reaching the remote host.
+[[ $# -ge 1 ]] || usage
+
+REMOTE_HOST="${REMOTE_HOST:-lab-gpu}"
+REMOTE_REPO="${REMOTE_REPO:-~/UavSwarm-baseline_branch}"
+REMOTE_PY="${REMOTE_PY:-~/miniconda3/envs/isaac_env/bin/python}"
+SESSION_PREFIX="uav_"
+
+# Resolve a leading ~ to an absolute path ONCE, up front. Every remote command below
+# wraps these paths in single quotes for safety (arguments may contain spaces) --
+# but `~` inside single quotes is never shell-expanded (it's the literal character),
+# so a quoted '~/foo' silently created a directory *named* "~" instead of expanding to
+# $HOME/foo. Resolving to an absolute path here means quoting it later is always safe.
+REMOTE_HOME="$(ssh "$REMOTE_HOST" 'echo $HOME')"
+REMOTE_REPO="${REMOTE_REPO/#\~/$REMOTE_HOME}"
+REMOTE_PY="${REMOTE_PY/#\~/$REMOTE_HOME}"
+REMOTE_LOG_DIR="${REMOTE_REPO}/logs/remote_runs"
 
 # cd to repo root so this works regardless of invocation cwd.
 cd "$(git rev-parse --show-toplevel)"
@@ -172,7 +185,6 @@ cmd_kill() {
     fi
 }
 
-[[ $# -ge 1 ]] || usage
 subcmd="$1"; shift
 case "$subcmd" in
     run)    [[ $# -ge 1 ]] || usage; job="$1"; shift; cmd_run "$job" "$@" ;;
