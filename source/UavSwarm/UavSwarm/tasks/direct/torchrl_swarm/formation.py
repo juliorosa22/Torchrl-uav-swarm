@@ -25,6 +25,7 @@ def get_inverted_v_formation(
     env_ids: torch.Tensor,
     env_origins: torch.Tensor,
     spawn_heights: torch.Tensor,
+    randomize_heading: bool = False,
 ) -> torch.Tensor:
     """Calculate inverted V formation positions for all drones in specified environments.
 
@@ -32,6 +33,11 @@ def get_inverted_v_formation(
         env_ids: Indices of environments to reset
         env_origins: Origins of the environments being reset, shape (num_reset_envs, 3)
         spawn_heights: Height offset for each environment, shape (num_reset_envs,)
+        randomize_heading: If True, rotate the formation template by an independent random
+            yaw per environment (about the vertical axis) before translating to env_origins.
+            Agents only ever observe their assigned slot in their own body frame
+            (desired_pos_b), so this needs no observation/reward/termination changes -- it
+            only prevents the swarm from always assembling into a V pointing the same way.
 
     Returns:
         Tensor of shape (num_reset_envs, num_drones, 3) with absolute world positions
@@ -96,6 +102,17 @@ def get_inverted_v_formation(
 
     # Expand template to all resetting environments
     formation_positions = formation_template.unsqueeze(0).expand(num_reset_envs, -1, -1).clone()
+
+    if randomize_heading:
+        # Independent yaw per env, rotating the whole V about the vertical axis. Applied
+        # before the env_origins translation so it rotates about the formation's own
+        # centroid (the apex-relative template), not about the world origin.
+        yaw = torch.empty(num_reset_envs, device=device).uniform_(-torch.pi, torch.pi)
+        cos_yaw = torch.cos(yaw).unsqueeze(1)  # (num_reset_envs, 1)
+        sin_yaw = torch.sin(yaw).unsqueeze(1)
+        x, y = formation_positions[:, :, 0].clone(), formation_positions[:, :, 1].clone()
+        formation_positions[:, :, 0] = cos_yaw * x - sin_yaw * y
+        formation_positions[:, :, 1] = sin_yaw * x + cos_yaw * y
 
     # Add environment origins (XY) to all drones in each environment
     formation_positions[:, :, :2] += env_origins[:, :2].unsqueeze(1)

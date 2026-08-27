@@ -96,6 +96,10 @@ class CurriculumCfg:
     stage6_spawn_height_range: tuple = (2.0, 4.5)
     # Target formation altitude, independent of scattered spawn heights.
     stage6_target_height_range: tuple = (1.5, 3.0)
+    # Randomize the V-formation's world-frame heading each episode (see
+    # formation.py::get_inverted_v_formation) instead of always pointing -X, so the policy
+    # can't overfit to a single formation orientation.
+    stage6_randomize_heading: bool = True
 
     def get_episode_length(self) -> float:
         """Return episode length based on active stage."""

@@ -418,7 +418,10 @@ def set_formation_positions(env, env_ids: torch.Tensor, env_origins: torch.Tenso
     # Target V-formation slots: one shared target altitude per env, independent of the
     # scattered spawn heights below, so the assignment problem is non-trivial in 3D.
     target_heights = torch.zeros(num_reset_envs, device=env.device).uniform_(target_lo, target_hi)
-    formation_slots = get_inverted_v_formation(env, env_ids, env_origins, target_heights)  # (num_reset_envs, num_drones, 3)
+    formation_slots = get_inverted_v_formation(
+        env, env_ids, env_origins, target_heights,
+        randomize_heading=cfg_c.stage6_randomize_heading,
+    )  # (num_reset_envs, num_drones, 3)
 
     for env_idx in range(num_reset_envs):
         env_id_single = env_ids[env_idx].unsqueeze(0)
