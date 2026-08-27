@@ -22,7 +22,13 @@ class EpisodeMetrics:
 
         Formation metrics (stages 4-5):
             - formation: Formation maintenance penalties
-            - swarm_cohesion: Inter-agent distance variance
+
+        Formation-shape metric (stage 6):
+            - swarm_cohesion: Mean absolute difference between actual pairwise inter-agent
+              distances and the pairwise distances implied by the assigned target slots --
+              i.e. how well the swarm's *shape* matches the target formation's shape,
+              independent of translation/progress toward it (see get_formation_rewards()).
+              Zero (unpopulated) for stages that don't call update(swarm_cohesion=...).
     """
     # Basic metrics
     lin_vel: torch.Tensor
@@ -61,6 +67,7 @@ class EpisodeMetrics:
             obs_component=torch.zeros(num_envs, dtype=torch.float, device=device),
             coop_component=torch.zeros(num_envs, dtype=torch.float, device=device),
             formation=torch.zeros(num_envs, dtype=torch.float, device=device),
+            swarm_cohesion=torch.zeros(num_envs, dtype=torch.float, device=device),
         )
 
     def reset(self, env_ids: torch.Tensor) -> None:

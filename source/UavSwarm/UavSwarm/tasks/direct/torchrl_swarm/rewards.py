@@ -317,10 +317,22 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
     reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=-COLLISION_PENALTY)
 
     # 7. LOGGING -- formation error = mean per-agent distance to assigned slot.
-    # (swarm_cohesion is a dead EpisodeMetrics field -- never initialized in
-    # EpisodeMetrics.create(), so update() silently no-ops on it everywhere in this
-    # codebase, not just here; not passed below to avoid implying it does something.)
     formation_error = distances.mean(dim=0)
+
+    # Formation-shape error (swarm_cohesion): mean absolute difference between actual
+    # pairwise inter-agent distances and the pairwise distances implied by the assigned
+    # target slots. Translation-invariant -- measures whether the swarm's *shape* matches
+    # the target formation's shape, independent of (and complementary to) formation_error's
+    # convergence-toward-the-slot signal. Matches the "formation integrity / spacing error"
+    # metric used in the multi-robot formation-control literature.
+    positions_by_env = all_positions.transpose(0, 1)  # (num_envs, num_drones, 3)
+    actual_pairwise = torch.cdist(positions_by_env, positions_by_env)  # (num_envs, D, D)
+    target_pairwise = torch.cdist(env._desired_pos_w, env._desired_pos_w)  # (num_envs, D, D)
+    off_diag = ~torch.eye(env.num_drones, dtype=torch.bool, device=env.device)
+    shape_error = (actual_pairwise - target_pairwise).abs()
+    formation_shape_error = shape_error.masked_select(off_diag.unsqueeze(0)).view(
+        env.num_envs, -1
+    ).mean(dim=1)
 
     env._metrics.update(
         distance_to_goal=distances.mean(dim=0),
@@ -328,6 +340,7 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
         mean_reward=reward,
         dist_component=mean_reward_per_env,
         formation=formation_error,
+        swarm_cohesion=formation_shape_error,
     )
 
     return {f"robot_{i}": reward for i in range(env.num_drones)}
