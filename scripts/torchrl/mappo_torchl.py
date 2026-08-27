@@ -13,6 +13,35 @@ from tqdm import tqdm
 import torch.nn as nn
 
 
+class RunningMeanStd:
+    """Scalar running mean/variance via Welford/Chan's parallel-variance combination
+    (same algorithm as OpenAI Baselines' RunningMeanStd) -- numerically stable, no need to
+    store samples.
+    """
+
+    def __init__(self, device=None, epsilon: float = 1e-4):
+        self.mean = torch.zeros((), device=device)
+        self.var = torch.ones((), device=device)
+        self.count = epsilon
+
+    def update(self, x: torch.Tensor):
+        batch_mean = x.mean()
+        batch_var = x.var(unbiased=False)
+        batch_count = x.numel()
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
+
+        self.mean = new_mean
+        self.var = m2 / tot_count
+        self.count = tot_count
+
+
 class MAPPOPolicy(nn.Module):
     """Shared policy network — one instance processes all agents' observations."""
 
@@ -80,6 +109,8 @@ class MAPPO:
         model_name: str = "mappo_run",
         log_dir: Optional[str] = None,
         checkpoint_interval: int = 100,
+        normalize_advantage: bool = True,
+        normalize_rewards: bool = True,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.env = env
@@ -90,6 +121,15 @@ class MAPPO:
         self.n_epochs = n_epochs
         self.checkpoint_interval = checkpoint_interval
         self.model_name = model_name
+        self.gamma = gamma
+
+        # --- reward normalization (standard PPO stabilizer; see train()'s _normalize_rewards_
+        # -inplace for why this -- not a raw value-target rescale -- is what's implemented) ---
+        self.normalize_rewards = normalize_rewards
+        if self.normalize_rewards:
+            num_envs = env.batch_size[0]
+            self.returns = torch.zeros(num_envs, n_agents, device=self.device)
+            self.reward_rms = RunningMeanStd(device=self.device)
 
         # --- directories ---
         if log_dir is not None:
@@ -142,7 +182,20 @@ class MAPPO:
             loss_critic_type="l2",
             entropy_coeff=c2,
             critic_coeff=c1,
-            normalize_advantage=False,
+            # torchrl_mappo_cfg.yaml declares normalize_advantages: true but that value was
+            # never actually read (mappo_train.py never passes it through) -- this was
+            # hardcoded False regardless, contradicting the config's stated intent. Now wired
+            # through from config; batch-level advantage normalization is standard PPO practice.
+            normalize_advantage=normalize_advantage,
+            # PPO2-style value clipping: bounds how far the critic's prediction can move
+            # from its pre-update value in a single minibatch step (loss = max of the
+            # unclipped and clipped squared error), same clip_epsilon as the policy's
+            # trust region. Added after reward normalization alone still let Loss/Value
+            # explode 3.3 -> 54M over 100 iterations (grad_norm up to 27M) -- the critic
+            # loss was so much larger than the policy loss that the shared gradient clip
+            # left almost nothing for the policy (clip_fraction/kl_approx both collapsed
+            # toward 0 by iteration 100, i.e. the policy had effectively stopped updating).
+            clip_value=True,
             safe=True,
         )
         self.loss_module.make_value_estimator(ValueEstimators.GAE, gamma=gamma, lmbda=gae_lambda)
@@ -167,6 +220,12 @@ class MAPPO:
             # Remove collector metadata
             rollout.pop("collector", None)
 
+            # --- Step 0: reward normalization (stabilizes the critic target scale; see
+            # _normalize_rewards_inplace) -- must run before GAE so bootstrapping and the
+            # critic loss both operate on the same normalized reward scale end to end.
+            if self.normalize_rewards:
+                self._normalize_rewards_inplace(rollout)
+
             # --- Step 1: Flatten (frames, envs, agents) → single batch ---
             rollout_flat = _flatten_agents(rollout, self.n_agents)
 
@@ -179,9 +238,15 @@ class MAPPO:
 
             # --- PPO update epochs ---
             total_obj, total_critic, total_ent = 0.0, 0.0, 0.0
-            total_kl, total_clip_frac, total_ess, total_ev, total_entropy = 0.0, 0.0, 0.0, 0.0, 0.0
             total_grad_norm = 0.0
             num_updates = 0
+            # NOTE: previously accumulated via `locals()[accum] += ...` in the loop below --
+            # locals() returns a snapshot dict in CPython; writing into it does not affect
+            # the actual local variables, so those diagnostics were always frozen at 0.0
+            # regardless of what ClipPPOLoss returned (confirmed: kl/clip/ESS/explained_variance
+            # stayed exactly 0.0000 for an entire 100-iteration validation run). A plain dict
+            # accumulator (mutated in place, not reassigned) has no such issue.
+            diag_totals = {"kl_approx": 0.0, "clip_fraction": 0.0, "ESS": 0.0, "explained_variance": 0.0, "entropy": 0.0}
 
             for _ in range(self.n_epochs):
                 for _ in range(self._buffer_size // self.batch_size):
@@ -203,15 +268,9 @@ class MAPPO:
                     total_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
 
                     # PPO diagnostics (ClipPPOLoss computes these; extract for logging)
-                    for key, accum in [
-                        ("kl_approx", "total_kl"),
-                        ("clip_fraction", "total_clip_frac"),
-                        ("ESS", "total_ess"),
-                        ("explained_variance", "total_ev"),
-                        ("entropy", "total_entropy"),
-                    ]:
+                    for key in diag_totals:
                         if key in loss_vals.keys():
-                            locals()[accum] += loss_vals[key].item()
+                            diag_totals[key] += loss_vals[key].item()
 
                     num_updates += 1
 
@@ -230,11 +289,11 @@ class MAPPO:
             avg_obj = total_obj / max(num_updates, 1)
             avg_critic = total_critic / max(num_updates, 1)
             avg_ent = total_ent / max(num_updates, 1)
-            avg_kl = total_kl / max(num_updates, 1)
-            avg_clip_frac = total_clip_frac / max(num_updates, 1)
-            avg_ess = total_ess / max(num_updates, 1)
-            avg_ev = total_ev / max(num_updates, 1)
-            avg_entropy = total_entropy / max(num_updates, 1)
+            avg_kl = diag_totals["kl_approx"] / max(num_updates, 1)
+            avg_clip_frac = diag_totals["clip_fraction"] / max(num_updates, 1)
+            avg_ess = diag_totals["ESS"] / max(num_updates, 1)
+            avg_ev = diag_totals["explained_variance"] / max(num_updates, 1)
+            avg_entropy = diag_totals["entropy"] / max(num_updates, 1)
             avg_grad_norm = total_grad_norm / max(num_updates, 1)
 
             reward_tensor = rollout_flat["next", "reward"]
@@ -254,6 +313,8 @@ class MAPPO:
             self.writer.add_scalar("Diagnostics/explained_variance", avg_ev, collected_frames)
             self.writer.add_scalar("Diagnostics/entropy", avg_entropy, collected_frames)
             self.writer.add_scalar("Diagnostics/grad_norm", avg_grad_norm, collected_frames)
+            if self.normalize_rewards:
+                self.writer.add_scalar("Diagnostics/reward_running_std", self._last_reward_std, collected_frames)
 
             # Task-level episode metrics (success rate, formation error, collision rate, ...)
             # computed by the env's own _reset_idx and drained from the wrapper. Averaged
@@ -292,6 +353,37 @@ class MAPPO:
         pbar.close()
         self.save_checkpoint(collected_frames)
         print(f"[INFO] Training complete — {collected_frames:,} frames")
+
+    def _normalize_rewards_inplace(self, rollout: TensorDict) -> None:
+        """Divide rewards by a running estimate of the per-env discounted-return std
+        (OpenAI Baselines / CleanRL-style reward normalization), in place, before GAE runs.
+
+        This -- not normalizing the value target directly (PopArt) -- is what's implemented
+        for the yaml's `normalize_values` intent: it needs no separate raw/normalized critic
+        output split, since GAE bootstraps (`reward + gamma * V(s')`) on the same normalized
+        reward scale throughout rather than mixing raw rewards with rescaled values. Confirmed
+        necessary empirically: a validation run without this showed Loss/Value growing
+        ~1000x (2.4k -> 2.27M) over 100 iterations with the pre-clip grad norm exploding to
+        ~218k, consistent with the critic regressing onto unbounded raw returns.
+        """
+        # Layout is (num_envs, T, n_agents, 1) -- env-dim first, time second (verified
+        # empirically via SyncDataCollector; _flatten_agents's own "T = batch_size[0]"
+        # naming is misleading here, since its correctness only depends on the total
+        # element count, not on which leading dim is actually time vs. env).
+        rewards = rollout["next", "agents", "reward"]  # (num_envs, T, n_agents, 1)
+        dones = rollout["next", "done"].float()  # (num_envs, T, 1)
+        T = rewards.shape[1]
+        normed = torch.empty_like(rewards)
+        std = torch.sqrt(self.reward_rms.var + 1e-8)
+        for t in range(T):
+            r_t = rewards[:, t, :, 0]  # (num_envs, n_agents)
+            d_t = dones[:, t]  # (num_envs, 1), broadcasts over n_agents
+            self.returns = self.returns * self.gamma * (1.0 - d_t) + r_t
+            self.reward_rms.update(self.returns.reshape(-1))
+            std = torch.sqrt(self.reward_rms.var + 1e-8)
+            normed[:, t, :, 0] = r_t / std
+        rollout["next", "agents", "reward"] = normed
+        self._last_reward_std = float(std.item())
 
     def save_checkpoint(self, iteration: int):
         torch.save(

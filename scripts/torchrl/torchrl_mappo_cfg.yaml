@@ -61,9 +61,20 @@ algorithm:
                              # GAE critic peak: 40960 * 256 hidden * 4 bytes ≈ 42 MB
   max_grad_norm: 1.0
 
-  normalize_observations: true
+  # Batch-level advantage normalization (ClipPPOLoss's normalize_advantage kwarg).
   normalize_advantages: true
-  normalize_values: true
+  # Reward normalization (running discounted-return std, OpenAI Baselines/CleanRL-style),
+  # applied in MAPPO._normalize_rewards_inplace before GAE runs. This is what actually
+  # implements the intent behind "normalize values" here -- it stabilizes the critic's
+  # target scale without needing a separate raw/normalized critic-output split (PopArt),
+  # since GAE bootstraps on the same normalized reward scale throughout. Confirmed
+  # necessary: without it, Loss/Value grew ~1000x (2.4k -> 2.27M) over 100 iterations.
+  normalize_rewards: true
+  # NOTE: observation normalization (a running mean/std on the 28-dim obs vector, which mixes
+  # velocities, position deltas up to ~15m, and fixed-value sentinels on quite different
+  # scales) is NOT implemented anywhere in this pipeline. It's a separate, independent
+  # stabilizer from the two above -- worth adding later if training still looks unstable
+  # after reward normalization, but out of scope for the current fix.
 
 # Training run
 training:

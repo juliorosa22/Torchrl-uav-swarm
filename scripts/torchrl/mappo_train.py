@@ -224,6 +224,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         model_name=args_cli.model_name,
         log_dir=log_dir,
         checkpoint_interval=config["training"]["checkpoint_interval"],
+        normalize_advantage=config["algorithm"].get("normalize_advantages", True),
+        normalize_rewards=config["algorithm"].get("normalize_rewards", True),
     )
 
     # --- resume ---
