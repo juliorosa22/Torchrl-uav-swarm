@@ -236,6 +236,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         checkpoint_interval=config["training"]["checkpoint_interval"],
         normalize_advantage=config["algorithm"].get("normalize_advantages", True),
         normalize_rewards=config["algorithm"].get("normalize_rewards", True),
+        max_grad_norm=config["algorithm"].get("max_grad_norm", 1.0),
     )
 
     # --- resume ---

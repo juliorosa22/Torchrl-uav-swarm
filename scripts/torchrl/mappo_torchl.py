@@ -121,6 +121,7 @@ class MAPPO:
         checkpoint_interval: int = 100,
         normalize_advantage: bool = True,
         normalize_rewards: bool = True,
+        max_grad_norm: float = 1.0,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.env = env
@@ -130,6 +131,9 @@ class MAPPO:
         self.batch_size = batch_size
         self.n_epochs = n_epochs
         self.checkpoint_interval = checkpoint_interval
+        # torchrl_mappo_cfg.yaml declares max_grad_norm but it was never threaded through --
+        # clip_grad_norm_ below used a bare hardcoded 1.0 regardless of the config's value.
+        self.max_grad_norm = max_grad_norm
         self.model_name = model_name
         self.gamma = gamma
 
@@ -248,7 +252,8 @@ class MAPPO:
 
             # --- PPO update epochs ---
             total_obj, total_critic, total_ent = 0.0, 0.0, 0.0
-            total_grad_norm = 0.0
+            total_actor_grad_norm = 0.0
+            total_critic_grad_norm = 0.0
             num_updates = 0
             num_skipped_updates = 0
             # NOTE: previously accumulated via `locals()[accum] += ...` in the loop below --
@@ -283,9 +288,21 @@ class MAPPO:
                         continue
 
                     loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.loss_module.parameters(), 1.0)
+                    # Separate clips per network -- a single combined clip over both networks'
+                    # parameters lets whichever one has the larger raw gradient (almost always
+                    # the critic here: deeper net, value_loss_coef=1.0, L2 loss on unbounded
+                    # returns) dictate the shared scaling factor, silently shrinking the
+                    # actor's effective step far below what its own gradient would warrant on
+                    # its own. Confirmed on the formation-simple-reward diagnostic run: KL and
+                    # clip_fraction stayed ~0.002-0.004 / ~1-3% for the entire 1M-frame run
+                    # (policy essentially frozen, entropy flat) while Loss/Value kept dropping
+                    # and outweighed Loss/Policy by 4-5 orders of magnitude -- exactly the
+                    # collapse already flagged above (clip_value's docstring) as a known risk
+                    # of clipping both networks together.
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
-                    if not torch.isfinite(grad_norm):
+                    if not (torch.isfinite(actor_grad_norm) and torch.isfinite(critic_grad_norm)):
                         num_skipped_updates += 1
                         self.optimizer.zero_grad()
                         continue
@@ -296,7 +313,8 @@ class MAPPO:
                     total_obj += loss_vals["loss_objective"].item()
                     total_critic += loss_vals["loss_critic"].item()
                     total_ent += loss_vals["loss_entropy"].item()
-                    total_grad_norm += grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                    total_actor_grad_norm += actor_grad_norm.item()
+                    total_critic_grad_norm += critic_grad_norm.item()
 
                     # PPO diagnostics (ClipPPOLoss computes these; extract for logging)
                     for key in diag_totals:
@@ -325,7 +343,8 @@ class MAPPO:
             avg_ess = diag_totals["ESS"] / max(num_updates, 1)
             avg_ev = diag_totals["explained_variance"] / max(num_updates, 1)
             avg_entropy = diag_totals["entropy"] / max(num_updates, 1)
-            avg_grad_norm = total_grad_norm / max(num_updates, 1)
+            avg_actor_grad_norm = total_actor_grad_norm / max(num_updates, 1)
+            avg_critic_grad_norm = total_critic_grad_norm / max(num_updates, 1)
 
             reward_tensor = rollout_flat["next", "reward"]
             self.last_avg_reward = reward_tensor.mean().item()
@@ -343,7 +362,8 @@ class MAPPO:
             self.writer.add_scalar("Diagnostics/ESS", avg_ess, collected_frames)
             self.writer.add_scalar("Diagnostics/explained_variance", avg_ev, collected_frames)
             self.writer.add_scalar("Diagnostics/entropy", avg_entropy, collected_frames)
-            self.writer.add_scalar("Diagnostics/grad_norm", avg_grad_norm, collected_frames)
+            self.writer.add_scalar("Diagnostics/actor_grad_norm", avg_actor_grad_norm, collected_frames)
+            self.writer.add_scalar("Diagnostics/critic_grad_norm", avg_critic_grad_norm, collected_frames)
             self.writer.add_scalar("Diagnostics/skipped_updates", num_skipped_updates, collected_frames)
             if num_skipped_updates > 0:
                 print(f"[WARN] Skipped {num_skipped_updates} minibatch update(s) this iteration "
