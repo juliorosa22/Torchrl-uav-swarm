@@ -357,3 +357,43 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
     )
 
     return {f"robot_{i}": reward for i in range(env.num_drones)}
+
+
+def get_formation_rewards_simple(env) -> dict[str, torch.Tensor]:
+    """Diagnostic reward for curriculum stage 6 (enabled via
+    CurriculumCfg.stage6_simple_reward): only the pose-distance term to the assigned
+    formation slot -- no delta/alignment/inter-agent-safety/jerk terms.
+
+    get_formation_rewards()'s goal-pull term (position_energy = K_POS/(1+d^2)) has a
+    gradient that vanishes past ~1m -- at the 3-5m range where 5-seed training plateaued,
+    it's 20-30x weaker than near the peak and comparable in magnitude to the safety/jerk
+    penalties working against it. This strips every other term and uses a plain negative
+    distance instead, which has constant gradient at every range, to check whether the
+    swarm converges on the goal at all once nothing else can compete with it.
+
+    Termination (altitude bounds, out-of-bounds, goal-reached) is handled independently in
+    termination.py regardless of which reward function is active, so dropping the
+    reward-side collision penalty here does not disable safety termination.
+    """
+    from .sensing import ensure_cache_populated
+
+    ensure_cache_populated(env)
+
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
+    desired_transposed = env._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+
+    # POSE DISTANCE TERM -- the only term. Negative distance: constant unit gradient
+    # everywhere, unlike position_energy's peaked-then-vanishing potential.
+    distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
+    per_drone_reward = -distances
+    reward = per_drone_reward.mean(dim=0)
+    reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+    env._metrics.update(
+        distance_to_goal=distances.mean(dim=0),
+        mean_reward=reward,
+        dist_component=reward,
+        formation=distances.mean(dim=0),
+    )
+
+    return {f"robot_{i}": reward for i in range(env.num_drones)}

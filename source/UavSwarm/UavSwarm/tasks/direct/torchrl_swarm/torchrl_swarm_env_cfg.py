@@ -100,6 +100,11 @@ class CurriculumCfg:
     # formation.py::get_inverted_v_formation) instead of always pointing -X, so the policy
     # can't overfit to a single formation orientation.
     stage6_randomize_heading: bool = True
+    # Diagnostic switch: when True, stage 6 uses get_formation_rewards_simple() instead of
+    # get_formation_rewards() -- only the pose-distance term to the assigned slot, no
+    # delta/alignment/safety/jerk terms. See rewards.py for why (training plateaued with
+    # the full reward despite stable formation-holding).
+    stage6_simple_reward: bool = False
 
     def get_episode_length(self) -> float:
         """Return episode length based on active stage."""

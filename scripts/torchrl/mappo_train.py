@@ -40,6 +40,12 @@ parser.add_argument(
 )
 parser.add_argument("--stage", type=int, default=None, help="Curriculum stage 1-5. Overrides config.")
 parser.add_argument(
+    "--simple_reward", action="store_true", default=False,
+    help="Stage 6 only: use get_formation_rewards_simple() (pose-distance term only, no "
+         "delta/alignment/safety/jerk terms) instead of the full formation reward. Diagnostic "
+         "switch -- see CurriculumCfg.stage6_simple_reward in torchrl_swarm_env_cfg.py.",
+)
+parser.add_argument(
     "--experiment_directory", type=str, default=None,
     help="Base folder under logs/torchrl/ shared by every run of this experiment; each run "
          "still gets its own timestamped subdir inside it. Overrides the config file's value.",
@@ -136,6 +142,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     env_cfg.controller.type = args_cli.controller
     if args_cli.stage is not None:
         env_cfg.curriculum.active_stage = args_cli.stage
+    if args_cli.simple_reward:
+        env_cfg.curriculum.stage6_simple_reward = True
 
     device = torch.device(config["env"]["device"])
 
@@ -158,6 +166,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"  Task:       {args_cli.task}")
     print(f"  Controller: {env_cfg.controller.type}  (max_vel={env_cfg.controller.max_lin_vel_cmd} m/s)")
     print(f"  Stage:      {env_cfg.curriculum.active_stage}")
+    if env_cfg.curriculum.active_stage == 6:
+        print(f"  Reward:     {'simple (pose-distance only)' if env_cfg.curriculum.stage6_simple_reward else 'full formation'}")
     print(f"  Device:     {device}")
     print(f"  Seed:       {config['seed']}")
     print(f"  Envs:       {env_cfg.scene.num_envs}")

@@ -38,7 +38,7 @@ from .termination import (
     update_waypoint_goals,
     update_swarm_waypoint_goals,
 )
-from .rewards import get_rewards, get_formation_rewards
+from .rewards import get_rewards, get_formation_rewards, get_formation_rewards_simple
 from .debug_viz import set_debug_vis_impl, debug_vis_callback
 
 
@@ -202,7 +202,14 @@ class BaseSwarmEnv(DirectMARLEnv):
                 dim=1,
             )
             final_distances.append(dist)
-        final_distance_to_goal = torch.stack(final_distances).mean()
+        # (num_drones, num_reset_envs): per-agent distance to its own assigned slot.
+        final_distances_stacked = torch.stack(final_distances)
+        final_distance_to_goal = final_distances_stacked.mean()
+        # Per-env closest/farthest agent, averaged over reset envs -- distinguishes a
+        # uniform shortfall (min and max close together) from a split where some agents
+        # converge and others don't (mean alone can't tell these apart).
+        final_distance_to_goal_min = final_distances_stacked.min(dim=0)[0].mean()
+        final_distance_to_goal_max = final_distances_stacked.max(dim=0)[0].mean()
 
         log_dict = self._metrics.to_log_dict(
             env_ids=env_ids,
@@ -229,6 +236,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             ).item() / n_reset
 
         log_dict["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
+        log_dict["Metrics/final_distance_to_goal_min"] = final_distance_to_goal_min.item()
+        log_dict["Metrics/final_distance_to_goal_max"] = final_distance_to_goal_max.item()
         log_dict["Metrics/curriculum_stage"] = self.curriculum_stage
 
         if self.curriculum_stage == 3:
@@ -372,6 +381,8 @@ class BaseSwarmEnv(DirectMARLEnv):
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
         if self.curriculum_stage == 6:
+            if self.cfg.curriculum.stage6_simple_reward:
+                return get_formation_rewards_simple(self)
             return get_formation_rewards(self)
         return get_rewards(self)
 
