@@ -18,7 +18,12 @@ from torchrl.data import (
 import gymnasium as gym
 
 from isaaclab.envs import DirectMARLEnv
-from rsl_rl.networks.normalization import EmpiricalNormalization
+try:
+    # Newer rsl_rl: normalization.py lives under networks/.
+    from rsl_rl.networks.normalization import EmpiricalNormalization
+except ModuleNotFoundError:
+    # Older rsl_rl (e.g. the lab GPU's pinned version): same module, under modules/ instead.
+    from rsl_rl.modules.normalization import EmpiricalNormalization
 
 
 class IsaacLabTorchRLWrapper(EnvBase):
