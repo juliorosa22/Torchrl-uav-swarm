@@ -174,6 +174,19 @@ class MAPPO:
         self._buffer_size = frames_per_batch * n_agents
 
         # --- replay buffer ---
+        # NOTE: tried SamplerWithoutReplacement here (shuffled, non-overlapping per-epoch
+        # partition -- canonical PPO practice, vs. the default RandomSampler's with-
+        # replacement draws) to close a known fidelity gap. Reverted: reproduced the same
+        # NaN-velocity instability EmpiricalNormalization was just confirmed to fix, 2/2
+        # local runs, despite having no direct mechanism to touch the environment/physics --
+        # it only changes which stored transitions get selected for gradient updates. Most
+        # likely explanation: it alters the training trajectory enough (different transitions
+        # weighted into early gradient steps) to produce a differently-behaved policy that
+        # still triggers whatever underlying fragility causes physics divergence -- possibly
+        # the SE(3) controller's frame-construction singularity (see compute_geometric_
+        # controller's b2_des cross-product, which can degenerate when desired thrust
+        # direction and desired heading go near-collinear). Revisit once that's confirmed/
+        # ruled out; don't re-add without a smoke test run showing it's actually clean.
         self.buffer = ReplayBuffer(
             storage=LazyTensorStorage(max_size=self._buffer_size),
             batch_size=batch_size,
