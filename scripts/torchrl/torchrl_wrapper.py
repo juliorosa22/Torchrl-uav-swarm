@@ -18,6 +18,7 @@ from torchrl.data import (
 import gymnasium as gym
 
 from isaaclab.envs import DirectMARLEnv
+from rsl_rl.networks.normalization import EmpiricalNormalization
 
 
 class IsaacLabTorchRLWrapper(EnvBase):
@@ -43,6 +44,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         env: gym.Env,
         device: str = "cuda:0",
         centralized_critic: bool = True,
+        normalize_obs: bool = False,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
@@ -72,6 +74,24 @@ class IsaacLabTorchRLWrapper(EnvBase):
         # Centralized state dimension (all agent obs concatenated)
         dummy_state = self.unwrapped_env._get_states(dummy=True)
         self.state_dim = dummy_state.shape[1]
+
+        # Running per-dimension obs normalization (opt-in -- default off so eval/play scripts
+        # reusing this wrapper against checkpoints trained without it see unchanged behavior).
+        # `state` is just per-agent observations concatenated (same 28-dim schema, num_agents
+        # times), so it's normalized by tiling this same obs_rms rather than tracking separate
+        # statistics for it -- one running estimate of "what does obs channel k look like",
+        # not two that could drift apart.
+        #
+        # Backed by RSL-RL's EmpiricalNormalization (the reference obs normalizer used across
+        # nearly all of Isaac Lab's own official RL tasks), not a hand-rolled Welford/SB3-
+        # VecNormalize-style normalizer -- a from-scratch implementation (eps=1e-8, clip=+-10,
+        # mathematically identical to VecNormalize's defaults) reliably produced NaN robot
+        # velocities by the 2nd training iteration on this task (see
+        # torchrl_mappo_cfg_remote.yaml's normalize_observations comment for the full story).
+        # EmpiricalNormalization's smaller-magnitude eps and lack of clipping reliably avoided
+        # the failure in side-by-side testing.
+        self.normalize_obs = normalize_obs
+        self.obs_rms = EmpiricalNormalization(shape=(self.obs_dim,), eps=1e-2).to(device) if normalize_obs else None
 
         self._make_specs()
         self._print_info(device, num_envs)
@@ -167,6 +187,34 @@ class IsaacLabTorchRLWrapper(EnvBase):
         print(f"  Device:           {device}")
         print(f"{'='*80}\n")
 
+    # -- observation normalization ----------------------------------------------
+    def _normalize_obs_stacked(self, obs_stacked: torch.Tensor) -> torch.Tensor:
+        """Update EmpiricalNormalization's running stats with this step's raw observations,
+        then return the normalized copy. update() and forward() both expect (batch, obs_dim);
+        obs_stacked is (num_envs, n_agents, obs_dim), so flatten the leading dims and restore
+        the shape afterward.
+        """
+        assert self.obs_rms is not None
+        n_envs, n_agents, obs_dim = obs_stacked.shape
+        flat = obs_stacked.reshape(n_envs * n_agents, obs_dim)
+        self.obs_rms.update(flat)
+        normed = self.obs_rms(flat)
+        return normed.reshape(n_envs, n_agents, obs_dim)
+
+    def _get_state(self) -> torch.Tensor:
+        """Centralized critic state -- per-agent observations concatenated. When obs
+        normalization is on, normalize it with the *same* obs_rms stats tiled across agents
+        (state is literally num_agents copies of the same 28-dim obs schema back to back),
+        not a second independently-tracked statistic.
+        """
+        state = self.unwrapped_env._get_states().to(self.device)
+        obs_rms = self.obs_rms
+        if self.normalize_obs and obs_rms is not None:
+            tiled_mean = obs_rms.mean.repeat(self.num_agents)
+            tiled_std = obs_rms.std.repeat(self.num_agents)
+            state = (state - tiled_mean) / (tiled_std + obs_rms.eps)
+        return state
+
     # -- env interface ---------------------------------------------------------
     def _reset(self, tensordict: Optional[TensorDict] = None, **kwargs) -> TensorDict:
         obs_dict, _info = self.env.reset()
@@ -175,6 +223,8 @@ class IsaacLabTorchRLWrapper(EnvBase):
         obs_stacked = torch.stack(
             [obs_dict[a].to(self.device) for a in self.possible_agents], dim=1
         )
+        if self.normalize_obs:
+            obs_stacked = self._normalize_obs_stacked(obs_stacked)
 
         td = TensorDict({}, batch_size=self.batch_size, device=self.device)
         td["agents"] = TensorDict(
@@ -184,7 +234,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         )
 
         if self.centralized_critic:
-            td["state"] = self.unwrapped_env._get_states().to(self.device)
+            td["state"] = self._get_state()
 
         td["done"] = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
         td["terminated"] = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
@@ -205,6 +255,8 @@ class IsaacLabTorchRLWrapper(EnvBase):
         obs_stacked = torch.stack(
             [obs_dict[a].to(self.device) for a in self.possible_agents], dim=1
         )
+        if self.normalize_obs:
+            obs_stacked = self._normalize_obs_stacked(obs_stacked)
         # Stack rewards → (num_envs, n_agents, 1)
         reward_stacked = torch.stack(
             [
@@ -224,7 +276,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         )
 
         if self.centralized_critic:
-            td["state"] = self.unwrapped_env._get_states().to(self.device)
+            td["state"] = self._get_state()
 
         # Aggregate done flags — episode done if ANY agent is done
         done = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)

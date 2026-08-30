@@ -441,8 +441,16 @@ class MAPPO:
         self._last_reward_std = float(std.item())
 
     def save_checkpoint(self, iteration: int):
+        ckpt = {"policy": self.policy.state_dict(), "critic": self.critic.state_dict()}
+        # Obs normalization stats live on the env wrapper, not this trainer -- a resumed run
+        # that reloads policy/critic weights but starts obs_rms fresh (mean=0/var=1) would feed
+        # the already-converged policy a differently-scaled input than it was trained on.
+        # EmpiricalNormalization is an nn.Module (mean/var/std/count are registered buffers),
+        # so its own state_dict() is the correct save/load mechanism.
+        if getattr(self.env, "normalize_obs", False):
+            ckpt["obs_rms"] = self.env.obs_rms.state_dict()
         torch.save(
-            {"policy": self.policy.state_dict(), "critic": self.critic.state_dict()},
+            ckpt,
             os.path.join(self.checkpoint_dir, f"checkpoint_{self.model_name}_iter_{iteration}.pt"),
         )
         print(f"[Checkpoint] Saved at iteration {iteration}")

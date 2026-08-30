@@ -84,11 +84,25 @@ algorithm:
   # since GAE bootstraps on the same normalized reward scale throughout. Confirmed
   # necessary: without it, Loss/Value grew ~1000x (2.4k -> 2.27M) over 100 iterations.
   normalize_rewards: true
-  # NOTE: observation normalization (a running mean/std on the 28-dim obs vector, which mixes
-  # velocities, position deltas up to ~15m, and fixed-value sentinels on quite different
-  # scales) is NOT implemented anywhere in this pipeline. It's a separate, independent
-  # stabilizer from the two above -- worth adding later if training still looks unstable
-  # after reward normalization, but out of scope for the current fix.
+  # Running per-dimension mean/std on the 28-dim obs vector (IsaacLabTorchRLWrapper's
+  # obs_rms), separate from and complementary to the reward normalization above -- that one
+  # stabilizes the critic's *target* scale, this one stabilizes the *input* scale the
+  # actor/critic networks actually condition on. Backed by rsl_rl.networks.normalization.
+  # EmpiricalNormalization (the same tool Isaac Lab's own official RL tasks use), NOT a
+  # hand-rolled Welford/SB3-VecNormalize-style normalizer -- a from-scratch implementation
+  # (eps=1e-8, clip=+-10, mathematically identical to VecNormalize's defaults) reliably
+  # produced NaN robot velocities by the 2nd training iteration on this task: lin_vel/
+  # ang_vel are reset to exactly [0,0,0] for every robot, so those channels start with
+  # *exactly zero* true variance, and dividing by a near-zero std turned tiny real velocity
+  # fluctuations into saturated +/-clip signals the (untrained) policy reacted to with
+  # oversized actions. Neither a variance floor nor a sample-count warm-up gate fixed it.
+  # EmpiricalNormalization's std+eps divisor (eps=1e-2, smaller-magnitude floor than what
+  # already failed) and lack of clipping reliably avoided the failure in side-by-side
+  # testing -- clipping is the leading suspect for the actual difference, since the eps
+  # alone was not more conservative. Off by default (opt-in, like stage6_simple_reward) so
+  # it doesn't silently change behavior for eval/play against checkpoints trained without
+  # it; enable explicitly with --normalize_obs.
+  normalize_observations: false
 
 # Training run
 training:

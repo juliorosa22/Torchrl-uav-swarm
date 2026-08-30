@@ -46,6 +46,12 @@ parser.add_argument(
          "switch -- see CurriculumCfg.stage6_simple_reward in torchrl_swarm_env_cfg.py.",
 )
 parser.add_argument(
+    "--normalize_obs", action="store_true", default=False,
+    help="Running per-dimension mean/std normalization on the observation vector "
+         "(IsaacLabTorchRLWrapper's obs_rms). Off by default -- see algorithm."
+         "normalize_observations in the config yaml.",
+)
+parser.add_argument(
     "--experiment_directory", type=str, default=None,
     help="Base folder under logs/torchrl/ shared by every run of this experiment; each run "
          "still gets its own timestamped subdir inside it. Overrides the config file's value.",
@@ -168,6 +174,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"  Stage:      {env_cfg.curriculum.active_stage}")
     if env_cfg.curriculum.active_stage == 6:
         print(f"  Reward:     {'simple (pose-distance only)' if env_cfg.curriculum.stage6_simple_reward else 'full formation'}")
+    normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
+    print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Device:     {device}")
     print(f"  Seed:       {config['seed']}")
     print(f"  Envs:       {env_cfg.scene.num_envs}")
@@ -191,7 +199,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
             disable_logger=True,
         )
 
-    env = IsaacLabTorchRLWrapper(base_env, device=str(device))
+    env = IsaacLabTorchRLWrapper(base_env, device=str(device), normalize_obs=normalize_obs)
 
     # --- dimensions ---
     obs_dim = env.obs_dim
@@ -245,6 +253,14 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         ckpt = torch.load(args_cli.checkpoint, map_location=device)
         policy.load_state_dict(ckpt["policy"])
         critic.load_state_dict(ckpt["critic"])
+        if normalize_obs and "obs_rms" in ckpt:
+            assert env.obs_rms is not None
+            env.obs_rms.load_state_dict(ckpt["obs_rms"])
+        elif normalize_obs:
+            print("[WARN] --normalize_obs is on but the checkpoint has no obs_rms stats "
+                  "(it was likely trained without normalization) -- resuming with fresh "
+                  "(mean=0, var=1) statistics, which will not match what the loaded policy "
+                  "was trained on until they reconverge.")
         # Sync collector with loaded weights
         trainer.collector.update_policy_weights_()
 
