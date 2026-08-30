@@ -206,7 +206,21 @@ class MAPPO:
             critic_network=self.critic_flat,
             clip_epsilon=clip_epsilon,
             entropy_bonus=True,
-            loss_critic_type="l2",
+            # Huber loss (TorchRL's own default -- this was previously overridden to "l2"),
+            # not squared error: L2 loss grows QUADRATICALLY with the critic's residual, so
+            # once it overshoots by any real margin, the loss and gradient for that sample
+            # scale up disproportionately, pushing the next update further off -- a
+            # self-reinforcing spiral. Directly observed on a 5M-frame run: Loss/Value sat
+            # in a healthy 5-40 range for ~1M frames (iterations 84-118), then, with no
+            # external trigger (reward_running_std stayed smooth through the same window),
+            # entered a runaway that roughly doubled every few iterations for the rest of
+            # training (64 -> 5,921 -> 25,078 -> 67,394) -- the same shape as the 3.3 -> 54M
+            # explosion clip_value was added for below, just recurring despite it. Huber
+            # matches L2 near the optimum (same useful gradient signal for typical-sized
+            # errors) but grows only LINEARLY beyond a threshold, breaking the feedback loop
+            # instead of just bounding how far one update can go (clip_value, still useful
+            # as a second line of defense, kept below).
+            loss_critic_type="smooth_l1",
             entropy_coeff=c2,
             critic_coeff=c1,
             # torchrl_mappo_cfg.yaml declares normalize_advantages: true but that value was
