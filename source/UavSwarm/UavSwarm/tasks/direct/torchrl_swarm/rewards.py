@@ -386,14 +386,23 @@ def get_formation_rewards_simple(env) -> dict[str, torch.Tensor]:
     # everywhere, unlike position_energy's peaked-then-vanishing potential.
     distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (num_drones, num_envs)
     per_drone_reward = -distances
-    reward = per_drone_reward.mean(dim=0)
-    reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)
+    per_drone_reward = torch.nan_to_num(per_drone_reward, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Individual, not team-averaged: every prior version of this reward (and get_rewards,
+    # get_formation_rewards) collapsed per_drone_reward via .mean(dim=0) before handing
+    # every agent the *same* scalar back -- team-average pooling, a classic MARL credit-
+    # assignment dilution (parameter sharing and reward sharing are orthogonal choices;
+    # Gupta, Egorov & Kochenderfer 2017's foundational parameter-sharing paper, and
+    # MAPPO's own cooperative-navigation experiments, keep individual rewards under a
+    # shared policy for exactly this reason). Diagnostic: does the swarm converge once
+    # each agent's gradient reflects only its own distance, not the whole team's average?
+    mean_reward = per_drone_reward.mean(dim=0)  # logging only, for continuity with prior runs
 
     env._metrics.update(
         distance_to_goal=distances.mean(dim=0),
-        mean_reward=reward,
-        dist_component=reward,
+        mean_reward=mean_reward,
+        dist_component=mean_reward,
         formation=distances.mean(dim=0),
     )
 
-    return {f"robot_{i}": reward for i in range(env.num_drones)}
+    return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}
