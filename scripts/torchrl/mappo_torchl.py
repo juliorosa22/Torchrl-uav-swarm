@@ -168,7 +168,7 @@ class MAPPO:
             reset_at_each_iter=False,
         )
 
-        # After _flatten_agents the buffer holds T * num_envs * n_agents transitions,
+        # After _finalize_flat the buffer holds T * num_envs * n_agents transitions,
         # not just frames_per_batch. Sizing at frames_per_batch alone would silently
         # discard (n_agents - 1)/n_agents ≈ 80% of each rollout.
         self._buffer_size = frames_per_batch * n_agents
@@ -200,7 +200,7 @@ class MAPPO:
         )
 
         # --- PPO loss (uses ClipPPOLoss DEFAULT keys: "reward", "action", "done", etc.) ---
-        # After _flatten_agents, all keys are at top level matching ClipPPOLoss defaults.
+        # After _finalize_flat, all keys are at top level matching ClipPPOLoss defaults.
         self.loss_module = ClipPPOLoss(
             actor_network=self.policy,
             critic_network=self.critic_flat,
@@ -253,12 +253,17 @@ class MAPPO:
             if self.normalize_rewards:
                 self._normalize_rewards_inplace(rollout)
 
-            # --- Step 1: Flatten (frames, envs, agents) → single batch ---
-            rollout_flat = _flatten_agents(rollout, self.n_agents)
+            # --- Step 1: Reshape into per-(env,agent) trajectories, keeping T explicit ---
+            # so GAE's recursive bootstrap walks real time, not an arbitrary flattened
+            # order (see _reshape_for_gae's docstring for why this used to be broken).
+            reshaped = _reshape_for_gae(rollout, self.n_agents)
 
-            # --- Step 2: GAE on flattened data (computes state_value internally) ---
+            # --- Step 2: GAE — genuinely time-aware now (computes state_value internally) ---
             with torch.no_grad():
-                self.gae(rollout_flat)
+                self.gae(reshaped)
+
+            # --- Step 3: collapse to a flat batch for the PPO minibatch loop / buffer ---
+            rollout_flat = _finalize_flat(reshaped)
 
             # Store flat rollout in buffer
             self.buffer.extend(rollout_flat)
@@ -435,9 +440,8 @@ class MAPPO:
         ~218k, consistent with the critic regressing onto unbounded raw returns.
         """
         # Layout is (num_envs, T, n_agents, 1) -- env-dim first, time second (verified
-        # empirically via SyncDataCollector; _flatten_agents's own "T = batch_size[0]"
-        # naming is misleading here, since its correctness only depends on the total
-        # element count, not on which leading dim is actually time vs. env).
+        # empirically via SyncDataCollector; matches _reshape_for_gae's own layout
+        # assumption below).
         rewards = rollout["next", "agents", "reward"]  # (num_envs, T, n_agents, 1)
         dones = rollout["next", "done"].float()  # (num_envs, T, 1)
         T = rewards.shape[1]
@@ -469,85 +473,118 @@ class MAPPO:
         print(f"[Checkpoint] Saved at iteration {iteration}")
 
 
-def _flatten_agents(td: TensorDict, n_agents: int) -> TensorDict:
-    """Flatten (frames, envs, agents) → single batch for shared-weight PPO.
+def _reshape_for_gae(td: TensorDict, n_agents: int) -> TensorDict:
+    """Reshape a collector rollout (num_envs, T, ...) into (num_envs*n_agents, T, ...) --
+    merging env+agent into one batch dimension while keeping T as its own, explicit axis.
 
-    Input TensorDict (from collector) has batch_size=[T] where T = frames_per_batch.
-    Each value's leading dims are [T, num_envs, ...].
-    Agents subtree entries have shape [T, num_envs, n_agents, ...].
+    GAE's recursive lambda-return bootstrap needs a genuine time dimension to walk (its
+    own docstring: input must be shaped [*B, T], defaulting to "the last dimension" as
+    time when none is named). The previous single-shot flatten collapsed
+    (num_envs, T, n_agents) into ONE flat dimension *before* calling GAE, silently
+    destroying that structure -- GAE's "last dimension is time" fallback then bootstrapped
+    across whatever order the flattening happened to interleave samples in (different
+    agents, then different envs), not real consecutive timesteps of one trajectory.
+    Confirmed with a synthetic test: constant per-(env,agent) value + zero reward should
+    give ~0 advantage everywhere; the old flatten produced advantages up to +-110 by
+    bootstrapping across completely unrelated envs' value scales. This was upstream of
+    every PPO update in every experiment this session -- reward shape, gradient clipping,
+    observation normalization, replay-buffer sampling -- none of which touch this step.
 
-    Output has batch_size=[T * num_envs * n_agents] with agent keys at root level
-    AND re-nested under "agents" for policy in_keys compatibility. Centralized values
-    (state_value, advantage, etc.) are repeated n_agents times so every
-    (frame, env, agent) sample has its own copy.
+    Collector layout (verified empirically, not assumed): agent-level keys are shaped
+    (num_envs, T, n_agents, *F); centralized keys (state, done, terminated, truncated)
+    are (num_envs, T, *F) with no agent dimension -- termination/state are env-wide, not
+    per-agent, in this task (confirmed in torchrl_wrapper.py: done is the OR of every
+    agent's terminated/truncated, shared across the whole env).
+
+    Returns a TensorDict with batch_size=[num_envs*n_agents, T] -- current-step keys at
+    root (flat, not yet re-nested under "agents"), and a "next" subtree of the same shape.
+    Call self.gae(...) directly on this output; only flatten further (see
+    _finalize_flat) once GAE has added "advantage"/"value_target".
     """
-    T = td.batch_size[0]
-    num_envs = td["agents", "observation"].shape[1]
-    total = T * num_envs * n_agents
-    obs_dim = td["agents", "observation"].shape[-1]
+    num_envs = td.batch_size[0]
+    T = td["agents", "observation"].shape[1]
+    B = num_envs * n_agents
 
-    # -- agent-level keys: reshape from [T, num_envs, n_agents, ...] to [total, ...] --
-    def _flatten_agent_val(val):
-        return val.reshape(total, *val.shape[3:])
+    def _agent_to_gae_shape(val: torch.Tensor) -> torch.Tensor:
+        # (num_envs, T, n_agents, *F) -> (num_envs, n_agents, T, *F) -> (B, T, *F)
+        v = val.permute(0, 2, 1, *range(3, val.ndim))
+        return v.reshape(B, T, *val.shape[3:])
+
+    def _centralized_to_gae_shape(val: torch.Tensor) -> torch.Tensor:
+        # (num_envs, T, *F) -> (num_envs, n_agents, T, *F) -> (B, T, *F): same value
+        # repeated per agent (state/done/terminated are env-wide, not agent-specific).
+        v = val.unsqueeze(1).expand(num_envs, n_agents, T, *val.shape[2:])
+        return v.reshape(B, T, *val.shape[2:])
 
     agents = td.pop("agents")
-    result = TensorDict({}, batch_size=torch.Size([total]), device=td.device)
-
+    result = TensorDict({}, batch_size=torch.Size([B, T]), device=td.device)
     for key in agents.keys(include_nested=True, leaves_only=True):
-        result[key] = _flatten_agent_val(agents[key])
+        result[key] = _agent_to_gae_shape(agents[key])
 
-    # -- centralized keys: repeat per agent, then flatten --
-    def _expand_centralized(val):
-        v = val.unsqueeze(2).expand(T, num_envs, n_agents, *val.shape[2:])
-        return v.reshape(total, *val.shape[2:])
-
-    for key in ("done", "terminated", "truncated", "state_value", "advantage", "value_target", "state"):
+    for key in ("done", "terminated", "truncated", "state"):
         if key in td.keys():
-            result[key] = _expand_centralized(td.pop(key))
+            result[key] = _centralized_to_gae_shape(td.pop(key))
 
-    # -- re-nest agent keys under "agents" for policy in_keys compatibility --
-    # TensorDict stores references, so nested and flat keys share the same tensors.
-    _agent_leaf_keys = list(agents.keys(include_nested=True, leaves_only=True))
-    result["agents"] = TensorDict(
-        {k: result[k] for k in _agent_leaf_keys if k in result.keys()},
-        batch_size=torch.Size([total]),
-        device=td.device,
-    )
-
-    # -- next subtree --
     if "next" in td.keys():
         nxt = td.pop("next")
-        next_result = TensorDict({}, batch_size=torch.Size([total]), device=td.device)
+        next_result = TensorDict({}, batch_size=torch.Size([B, T]), device=td.device)
 
-        _next_agent_keys = []
         if "agents" in nxt.keys():
             nxt_agents = nxt.pop("agents")
-            _next_agent_keys = list(nxt_agents.keys(include_nested=True, leaves_only=True))
-            for key in _next_agent_keys:
-                next_result[key] = _flatten_agent_val(nxt_agents[key])
+            for key in nxt_agents.keys(include_nested=True, leaves_only=True):
+                next_result[key] = _agent_to_gae_shape(nxt_agents[key])
 
-        for key in ("done", "terminated", "truncated", "state_value", "state"):
+        for key in ("done", "terminated", "truncated", "state"):
             if key in nxt.keys():
-                next_result[key] = _expand_centralized(nxt.pop(key))
+                next_result[key] = _centralized_to_gae_shape(nxt.pop(key))
 
-        # Reconstruct centralized state from next-agent observations for GAE
-        if "observation" in next_result.keys() and "state" not in next_result.keys():
-            next_result["state"] = (
-                next_result["observation"]
-                .reshape(T, num_envs, n_agents, obs_dim)
-                .reshape(T, num_envs, n_agents * obs_dim)
-                .unsqueeze(2).expand(T, num_envs, n_agents, n_agents * obs_dim)
-                .reshape(total, n_agents * obs_dim)
-            )
-
-        # Re-nest next agent keys for policy in_keys compatibility
-        if _next_agent_keys:
-            next_result["agents"] = TensorDict(
-                {k: next_result[k] for k in _next_agent_keys if k in next_result.keys()},
-                batch_size=torch.Size([total]),
-                device=td.device,
-            )
+        # SyncDataCollector doesn't thread state_spec-declared keys into "next" the same
+        # way it does observation_spec keys -- confirmed empirically: torchrl_wrapper.py's
+        # _step() sets td["state"] on every call, but rollout["next"] arrives without
+        # "state" regardless. Reconstruct it the same way the env itself does (concatenate
+        # all agents' next observations, per env) rather than silently running GAE with a
+        # missing next-state.
+        if "state" not in next_result.keys() and "observation" in next_result.keys():
+            obs_dim = next_result["observation"].shape[-1]
+            per_env_agent = next_result["observation"].reshape(num_envs, n_agents, T, obs_dim)
+            concatenated = per_env_agent.permute(0, 2, 1, 3).reshape(num_envs, T, n_agents * obs_dim)
+            next_result["state"] = _centralized_to_gae_shape(concatenated)
 
         result["next"] = next_result
 
     return result
+
+
+def _finalize_flat(td: TensorDict) -> TensorDict:
+    """Collapse a (B=num_envs*n_agents, T)-shaped, GAE-processed rollout into a single
+    flat batch dimension for the PPO minibatch loop / replay buffer, and re-nest
+    per-agent keys under "agents" for the actor's in_keys.
+
+    Safe to fully flatten now: GAE has already consumed the temporal structure it
+    needed (advantage/value_target are already computed), and PPO's clipped objective
+    treats every (env, agent, t) sample independently regardless of order.
+    """
+    B, T = td.batch_size
+    total = B * T
+
+    agent_keys = [k for k in ("observation", "action", "sample_log_prob") if k in td.keys()]
+    next_agent_keys = (
+        [k for k in ("observation", "reward") if k in td["next"].keys()]
+        if "next" in td.keys() else []
+    )
+
+    flat = td.reshape(total)
+
+    flat["agents"] = TensorDict(
+        {k: flat[k] for k in agent_keys},
+        batch_size=torch.Size([total]),
+        device=td.device,
+    )
+    if next_agent_keys:
+        flat["next", "agents"] = TensorDict(
+            {k: flat["next", k] for k in next_agent_keys},
+            batch_size=torch.Size([total]),
+            device=td.device,
+        )
+
+    return flat
