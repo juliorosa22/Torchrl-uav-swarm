@@ -73,6 +73,13 @@ class BaseSwarmEnv(DirectMARLEnv):
         self._thrust = torch.zeros(self.num_envs, self.num_drones, 1, 3, device=self.device)
         self._moment = torch.zeros(self.num_envs, self.num_drones, 1, 3, device=self.device)
         self._desired_pos_w = torch.zeros(self.num_envs, self.num_drones, 3, device=self.device)
+        # Stage 6 only: which V-formation slot (a stable geometric identity -- 0=apex,
+        # increasing index = further out on a wing, see get_inverted_v_formation) each
+        # drone was Hungarian-assigned to this episode. Drone index itself carries no
+        # signal across episodes since the assignment is re-solved every reset; slot
+        # index does, and is what lets _reset_idx's per-slot metrics distinguish "one
+        # specific slot always lags" from "a random agent lags each episode".
+        self._assigned_slot_idx = torch.zeros(self.num_envs, self.num_drones, dtype=torch.long, device=self.device)
 
         self._last_terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._last_timed_out = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -239,6 +246,26 @@ class BaseSwarmEnv(DirectMARLEnv):
         log_dict["Metrics/final_distance_to_goal_min"] = final_distance_to_goal_min.item()
         log_dict["Metrics/final_distance_to_goal_max"] = final_distance_to_goal_max.item()
         log_dict["Metrics/curriculum_stage"] = self.curriculum_stage
+
+        if self.curriculum_stage == 6:
+            # Per-slot breakdown: distinguishes "one specific V-formation slot always
+            # lags" from "a random agent lags each episode" -- slot index is a stable
+            # geometric identity (0=apex, see get_inverted_v_formation) across episodes,
+            # unlike drone index, which is reshuffled every reset by the Hungarian
+            # assignment in set_formation_positions().
+            slot_ids = self._assigned_slot_idx[env_ids].t()  # (num_drones, num_reset_envs)
+            for slot in range(self.num_drones):
+                slot_mask = slot_ids == slot
+                if slot_mask.any():
+                    log_dict[f"Metrics/final_distance_by_slot/slot_{slot}"] = (
+                        final_distances_stacked[slot_mask].mean().item()
+                    )
+            # Per-drone (physical identity) breakdown, to separately rule out a
+            # drone-specific issue (e.g. asymmetric mass/thrust) independent of slot.
+            for j in range(self.num_drones):
+                log_dict[f"Metrics/final_distance_by_drone/drone_{j}"] = (
+                    final_distances_stacked[j].mean().item()
+                )
 
         if self.curriculum_stage == 3:
             avg_waypoint_progress = self._current_waypoint_idx[env_ids].float().mean().item()

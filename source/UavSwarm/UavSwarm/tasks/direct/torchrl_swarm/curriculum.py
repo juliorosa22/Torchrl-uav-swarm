@@ -457,3 +457,4 @@ def set_formation_positions(env, env_ids: torch.Tensor, env_origins: torch.Tenso
 
             assigned_slot = formation_slots[env_idx, col_ind[j]]
             env._desired_pos_w[env_id_single, j, :] = assigned_slot
+            env._assigned_slot_idx[env_id_single, j] = int(col_ind[j])
