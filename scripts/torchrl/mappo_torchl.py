@@ -276,6 +276,31 @@ class MAPPO:
             with torch.no_grad():
                 self.gae(reshaped)
 
+            # --- Diagnostic: can a single per-env V(s) even explain individual per-agent
+            # targets? Law of total variance: Var(target) = E[Var(target|env,t)] +
+            # Var(E[target|env,t]). The first term is variance ACROSS AGENTS at fixed
+            # (env,t) -- CentralizedCritic's "state" input (and thus its prediction) is
+            # identical for every agent within one env/timestep (see _reshape_for_gae's
+            # _centralized_to_gae_shape), so a shared V(s) can never reduce this term no
+            # matter how well trained. It caps explained_variance at (1 - this fraction)
+            # regardless of critic quality. Tests whether the persistently-near-zero
+            # Diagnostics/explained_variance (unmoved by every fix so far) is this
+            # structural ceiling from the individual-reward fix, not a tuning problem.
+            with torch.no_grad():
+                num_envs_g = reshaped.batch_size[0] // self.n_agents
+                T_g = reshaped.batch_size[1]
+
+                def _agent_variance_fraction(flat: torch.Tensor) -> float:
+                    x = flat.reshape(num_envs_g, self.n_agents, T_g)
+                    total_var = x.var(unbiased=False).item()
+                    if total_var < 1e-12:
+                        return 0.0
+                    within_agent_var = x.var(dim=1, unbiased=False).mean().item()
+                    return within_agent_var / total_var
+
+                reward_agent_frac = _agent_variance_fraction(reshaped["next", "reward"])
+                value_target_agent_frac = _agent_variance_fraction(reshaped["value_target"])
+
             # --- Step 3: collapse to a flat batch for the PPO minibatch loop / buffer ---
             rollout_flat = _finalize_flat(reshaped)
 
@@ -393,6 +418,9 @@ class MAPPO:
             self.writer.add_scalar("Diagnostics/clip_fraction", avg_clip_frac, collected_frames)
             self.writer.add_scalar("Diagnostics/ESS", avg_ess, collected_frames)
             self.writer.add_scalar("Diagnostics/explained_variance", avg_ev, collected_frames)
+            self.writer.add_scalar("Diagnostics/reward_agent_variance_fraction", reward_agent_frac, collected_frames)
+            self.writer.add_scalar("Diagnostics/value_target_agent_variance_fraction", value_target_agent_frac, collected_frames)
+            self.writer.add_scalar("Diagnostics/explained_variance_ceiling", 1.0 - value_target_agent_frac, collected_frames)
             self.writer.add_scalar("Diagnostics/entropy", avg_entropy, collected_frames)
             self.writer.add_scalar("Diagnostics/actor_grad_norm", avg_actor_grad_norm, collected_frames)
             self.writer.add_scalar("Diagnostics/critic_grad_norm", avg_critic_grad_norm, collected_frames)
