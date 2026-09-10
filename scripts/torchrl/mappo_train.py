@@ -56,6 +56,11 @@ parser.add_argument(
     help="Base folder under logs/torchrl/ shared by every run of this experiment; each run "
          "still gets its own timestamped subdir inside it. Overrides the config file's value.",
 )
+parser.add_argument(
+    "--entropy_coef", type=float, default=None,
+    help="Overrides config algorithm.entropy_coef (default 0.01). Diagnostic switch for "
+         "premature entropy collapse (see formation-convergence-investigation memory).",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -150,6 +155,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.curriculum.active_stage = args_cli.stage
     if args_cli.simple_reward:
         env_cfg.curriculum.stage6_simple_reward = True
+    if args_cli.entropy_coef is not None:
+        config["algorithm"]["entropy_coef"] = args_cli.entropy_coef
 
     device = torch.device(config["env"]["device"])
 
@@ -176,6 +183,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         print(f"  Reward:     {'simple (pose-distance only)' if env_cfg.curriculum.stage6_simple_reward else 'full formation'}")
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
+    print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
     print(f"  Device:     {device}")
     print(f"  Seed:       {config['seed']}")
     print(f"  Envs:       {env_cfg.scene.num_envs}")
