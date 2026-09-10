@@ -56,6 +56,7 @@ class SyntheticSwarmEnv(EnvBase):
         momentum: bool = False,
         max_accel: float = 3.0,
         drag: float = 0.5,
+        out_of_bounds_factor: float = 2.0,
     ):
         super().__init__(device=device, batch_size=torch.Size([num_envs]))
 
@@ -70,6 +71,12 @@ class SyntheticSwarmEnv(EnvBase):
         self.momentum = momentum
         self.max_accel = max_accel
         self.drag = drag
+        # Mirrors the real UAV task's out-of-bounds termination (_get_dones: collision,
+        # out-of-bounds, goal-reached, timeout) -- without this, an agent that drifts under
+        # momentum has no early-termination signal and nothing stops small early mistakes
+        # from compounding across a full episode. Spawn/goals live in [-bound, bound];
+        # anything past out_of_bounds_factor*bound on either axis ends the episode.
+        self.out_of_bounds_limit = out_of_bounds_factor * bound
 
         self.obs_dim = 4
         self.action_dim = 2
@@ -218,7 +225,8 @@ class SyntheticSwarmEnv(EnvBase):
         reached = dist < self.goal_threshold
         all_reached = reached.all(dim=-1)  # (num_envs,)
         timeout = self.t >= self.max_episode_steps  # (num_envs,)
-        done_env = all_reached | timeout
+        out_of_bounds = (self.pos.abs() > self.out_of_bounds_limit).any(dim=-1).any(dim=-1)  # (num_envs,)
+        done_env = all_reached | timeout | out_of_bounds
 
         # Individual per-agent reward -- deliberately no cross-agent pooling, same
         # credit-assignment shape as the real task's get_formation_rewards_simple.
@@ -231,6 +239,7 @@ class SyntheticSwarmEnv(EnvBase):
             for i in done_idx.tolist():
                 self.episode_logs.append({
                     "Episode_Termination/goal_reached": float(all_reached[i].item()),
+                    "Episode_Termination/out_of_bounds": float(out_of_bounds[i].item()),
                     "Metrics/final_distance_to_goal": float(dist[i].mean().item()),
                 })
             self._sample_spawn_and_goal(done_env)
@@ -245,8 +254,11 @@ class SyntheticSwarmEnv(EnvBase):
         )
         td["state"] = state
         td["done"] = done_env.unsqueeze(-1)
-        td["terminated"] = all_reached.unsqueeze(-1)
-        td["truncated"] = (timeout & ~all_reached).unsqueeze(-1)
+        # Out-of-bounds is a real terminal state caused by the agent's own trajectory
+        # (like the real task's out-of-bounds termination), not a time-limit cutoff --
+        # grouped with "terminated", not "truncated".
+        td["terminated"] = (all_reached | out_of_bounds).unsqueeze(-1)
+        td["truncated"] = (timeout & ~all_reached & ~out_of_bounds).unsqueeze(-1)
         return td
 
     def drain_episode_logs(self) -> list[dict]:
