@@ -1,0 +1,42 @@
+# SANITY profile -- config for sanity_train.py's SyntheticSwarmEnv (no Isaac Sim).
+# Small nets / short episodes / cheap rollout so a full run finishes in minutes on any
+# machine, CPU included. Purpose: isolate whether scripts/torchrl/mappo_torchl.py's MAPPO
+# trainer (GAE, PPO update, shared-critic/individual-reward setup) can converge at all on
+# a trivial point-to-goal task, decoupled from Isaac Sim/UAV physics entirely.
+seed: 42
+
+env:
+  num_envs: 256
+  device: cuda:0
+  num_agents: 5
+  max_episode_steps: 100
+  max_speed: 1.0
+  dt: 0.1
+  bound: 5.0
+  goal_threshold: 0.2
+  goal_bonus: 5.0
+
+models:
+  policy:
+    hidden_sizes: [64, 64]
+  critic:
+    hidden_sizes: [64, 64]
+
+algorithm:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_loss_coef: 1.0
+  entropy_coef: 0.01
+  n_epochs: 5
+  batch_size: 512
+  frames_per_batch: 4096      # 256 envs x 16 steps/rollout
+  max_grad_norm: 1.0
+  normalize_advantages: true
+  normalize_rewards: true
+
+training:
+  total_frames: 500000
+  checkpoint_interval: 20
+  experiment_directory: "sanity_check"
