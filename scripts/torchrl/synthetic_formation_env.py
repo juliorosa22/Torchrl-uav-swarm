@@ -49,8 +49,7 @@ class SyntheticFormationEnv(SyntheticSwarmEnv):
 
         # Scatter spawn -- unchanged from the base env.
         self.pos[idx] = (torch.rand(n, self.num_agents, 2, device=self.device) * 2 - 1) * self.bound
-        self.last_vel[idx] = 0.0
-        self.t[idx] = 0
+        self._reset_kinematics(idx)
 
         # Shared V-formation target: random center + heading per env, fixed relative shape.
         center = (torch.rand(n, 2, device=self.device) * 2 - 1) * self.bound * 0.5

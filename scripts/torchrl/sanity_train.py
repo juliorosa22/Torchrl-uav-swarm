@@ -73,10 +73,19 @@ def main():
              "formation/coordination structure itself (not UAV flight dynamics) blocks "
              "convergence on the real Formation-TorchRL-UAVSwarm task.",
     )
+    parser.add_argument(
+        "--momentum", action="store_true", default=False,
+        help="Double-integrator dynamics (action = acceleration through linear drag) "
+             "instead of direct velocity control -- isolates whether momentum/drift "
+             "making a tight simultaneous-arrival threshold hard to hit (not the MARL/"
+             "coordination structure) blocks convergence on the real task. Composable "
+             "with --formation.",
+    )
     args = parser.parse_args()
 
-    if args.formation and args.model_name == "mappo_sanity":
-        args.model_name = "mappo_sanity_formation"
+    suffix = ("_formation" if args.formation else "") + ("_momentum" if args.momentum else "")
+    if suffix and args.model_name == "mappo_sanity":
+        args.model_name = "mappo_sanity" + suffix
 
     config = load_config(args.config)
 
@@ -113,6 +122,10 @@ def main():
     )
     if args.formation:
         env_kwargs["formation_spacing"] = config["env"].get("formation_spacing", 1.0)
+    if args.momentum:
+        env_kwargs["momentum"] = True
+        env_kwargs["max_accel"] = config["env"].get("max_accel", 3.0)
+        env_kwargs["drag"] = config["env"].get("drag", 0.5)
     env = env_cls(**env_kwargs)
 
     obs_dim, action_dim, state_dim = env.obs_dim, env.action_dim, env.state_dim

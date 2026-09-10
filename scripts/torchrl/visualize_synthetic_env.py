@@ -76,6 +76,11 @@ def main():
         help="Use SyntheticFormationEnv (shared V-formation slots) instead of "
              "independent per-agent random goals -- matches sanity_train.py --formation.",
     )
+    parser.add_argument(
+        "--momentum", action="store_true", default=False,
+        help="Double-integrator dynamics (action = acceleration) instead of direct "
+             "velocity control -- matches sanity_train.py --momentum.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -96,6 +101,10 @@ def main():
     )
     if args.formation:
         env_kwargs["formation_spacing"] = config["env"].get("formation_spacing", 1.0)
+    if args.momentum:
+        env_kwargs["momentum"] = True
+        env_kwargs["max_accel"] = config["env"].get("max_accel", 3.0)
+        env_kwargs["drag"] = config["env"].get("drag", 0.5)
     env = env_cls(**env_kwargs)
 
     checkpoint_path = None if args.random else (args.checkpoint or find_latest_checkpoint())

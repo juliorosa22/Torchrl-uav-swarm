@@ -16,6 +16,8 @@ env:
   goal_threshold: 0.2
   goal_bonus: 5.0
   formation_spacing: 1.0    # only used with --formation (SyntheticFormationEnv)
+  max_accel: 3.0            # only used with --momentum (double-integrator accel limit)
+  drag: 0.5                 # only used with --momentum (linear velocity damping)
 
 models:
   policy:

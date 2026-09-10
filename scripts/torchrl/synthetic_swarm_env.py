@@ -2,13 +2,26 @@
 
 Sanity-check env for scripts/torchrl/mappo_torchl.py's MAPPO trainer, decoupled from
 Isaac Sim/physics entirely so a bad result can't be blamed on the simulator. Each agent
-is a 2D point mass that must reach its own randomly-sampled goal; kinematics are a
-single Euler integration step (no forces, no controller). Deliberately mirrors the real
-task's TensorDict contract (see IsaacLabTorchRLWrapper in torchrl_wrapper.py) exactly --
-individual per-agent reward, a centralized "state" that is literally every agent's
+is a 2D point mass that must reach its own randomly-sampled goal. Deliberately mirrors the
+real task's TensorDict contract (see IsaacLabTorchRLWrapper in torchrl_wrapper.py) exactly
+-- individual per-agent reward, a centralized "state" that is literally every agent's
 observation concatenated (so the same shared-V(s)-can't-explain-individual-rewards
 ceiling applies here too) -- so a convergence result here transfers to a statement about
 the MAPPO pipeline itself, not about a different problem.
+
+Two kinematics modes, both behind the `momentum` flag (default off, preserving the
+original behavior other variants/scripts were built against):
+  momentum=False (default): action IS the velocity command -- pos += action*max_speed*dt.
+    Agents can stop and change direction instantaneously; no way for control precision
+    itself to be the reason a run fails to converge.
+  momentum=True: action is an ACCELERATION command through linear drag -- a real
+    double-integrator, closer to how a UAV's velocity actually responds to a commanded
+    thrust vector than the instantaneous-teleport default. Tests whether momentum/drift
+    making a tight simultaneous-arrival threshold hard to hit -- not the MARL/coordination
+    structure -- is what's blocking the real Formation-TorchRL-UAVSwarm task. (The plain
+    and V-formation variants of this env, in synthetic_formation_env.py, already both
+    converged cleanly with momentum=False, ruling out the pipeline itself and the
+    coordination structure as explanations.)
 """
 
 import torch
@@ -40,6 +53,9 @@ class SyntheticSwarmEnv(EnvBase):
         bound: float = 5.0,
         goal_threshold: float = 0.2,
         goal_bonus: float = 5.0,
+        momentum: bool = False,
+        max_accel: float = 3.0,
+        drag: float = 0.5,
     ):
         super().__init__(device=device, batch_size=torch.Size([num_envs]))
 
@@ -51,6 +67,9 @@ class SyntheticSwarmEnv(EnvBase):
         self.bound = bound
         self.goal_threshold = goal_threshold
         self.goal_bonus = goal_bonus
+        self.momentum = momentum
+        self.max_accel = max_accel
+        self.drag = drag
 
         self.obs_dim = 4
         self.action_dim = 2
@@ -66,7 +85,7 @@ class SyntheticSwarmEnv(EnvBase):
         a = num_agents
         self.pos = torch.zeros(n, a, 2, device=self.device)
         self.goal = torch.zeros(n, a, 2, device=self.device)
-        self.last_vel = torch.zeros(n, a, 2, device=self.device)
+        self.vel = torch.zeros(n, a, 2, device=self.device)
         self.t = torch.zeros(n, dtype=torch.long, device=self.device)
 
         self._make_specs()
@@ -130,10 +149,20 @@ class SyntheticSwarmEnv(EnvBase):
         print(f"  Obs dim (each):   {self.obs_dim}")
         print(f"  Action dim:       {self.action_dim}")
         print(f"  State dim (crit): {self.state_dim}")
+        print(f"  Dynamics:         {'momentum (accel cmd + drag)' if self.momentum else 'direct (velocity cmd)'}")
         print(f"  Device:           {self.device}")
         print(f"{'='*80}\n")
 
     # -- internals -----------------------------------------------------------
+    def _reset_kinematics(self, idx: torch.Tensor):
+        """Zero velocity/step-counter for the given env indices. Shared by every goal-
+        generation variant (SyntheticFormationEnv overrides _sample_spawn_and_goal but
+        calls back into this for the kinematics-only part) so momentum support doesn't
+        need to be reimplemented per subclass.
+        """
+        self.vel[idx] = 0.0
+        self.t[idx] = 0
+
     def _sample_spawn_and_goal(self, mask: torch.Tensor):
         """Resample position/goal/velocity/step-counter for the envs where mask is True."""
         idx = mask.nonzero(as_tuple=True)[0]
@@ -142,11 +171,10 @@ class SyntheticSwarmEnv(EnvBase):
         n = idx.numel()
         self.pos[idx] = (torch.rand(n, self.num_agents, 2, device=self.device) * 2 - 1) * self.bound
         self.goal[idx] = (torch.rand(n, self.num_agents, 2, device=self.device) * 2 - 1) * self.bound
-        self.last_vel[idx] = 0.0
-        self.t[idx] = 0
+        self._reset_kinematics(idx)
 
     def _obs(self) -> torch.Tensor:
-        return torch.cat([self.goal - self.pos, self.last_vel], dim=-1)  # (num_envs, n_agents, 4)
+        return torch.cat([self.goal - self.pos, self.vel], dim=-1)  # (num_envs, n_agents, 4)
 
     def _state(self, obs: torch.Tensor) -> torch.Tensor:
         return obs.reshape(obs.shape[0], self.state_dim)
@@ -167,9 +195,23 @@ class SyntheticSwarmEnv(EnvBase):
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
         actions = tensordict["agents", "action"].clamp(-1.0, 1.0)  # (num_envs, n_agents, 2)
-        vel = actions * self.max_speed
-        self.pos = self.pos + vel * self.dt
-        self.last_vel = vel
+
+        if self.momentum:
+            # Double-integrator: action is an acceleration command, velocity carries over
+            # between steps (linear drag, semi-implicit Euler), so the agent can't stop or
+            # change direction instantaneously the way the default direct-control mode can.
+            accel = actions * self.max_accel
+            self.vel = self.vel * (1.0 - self.drag * self.dt) + accel * self.dt
+            speed = self.vel.norm(dim=-1, keepdim=True)
+            self.vel = self.vel * (self.max_speed / speed.clamp(min=self.max_speed))
+            self.pos = self.pos + self.vel * self.dt
+        else:
+            # Direct control (original behavior): action IS the velocity command --
+            # agents can stop/turn instantaneously, so control precision can't itself be
+            # the reason convergence fails.
+            self.vel = actions * self.max_speed
+            self.pos = self.pos + self.vel * self.dt
+
         self.t += 1
 
         dist = torch.norm(self.goal - self.pos, dim=-1)  # (num_envs, n_agents)
