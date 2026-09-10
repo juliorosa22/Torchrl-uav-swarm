@@ -24,6 +24,7 @@ from torchrl.modules import ProbabilisticActor, TanhNormal
 from tensordict.nn import TensorDictModule
 
 from synthetic_swarm_env import SyntheticSwarmEnv
+from synthetic_formation_env import SyntheticFormationEnv
 from mappo_torchl import MAPPOPolicy, CentralizedCritic, MAPPO
 
 
@@ -65,7 +66,17 @@ def main():
     parser.add_argument("--max_iterations", type=int, default=None)
     parser.add_argument("--model_name", type=str, default="mappo_sanity")
     parser.add_argument("--experiment_directory", type=str, default=None)
+    parser.add_argument(
+        "--formation", action="store_true", default=False,
+        help="Use SyntheticFormationEnv (shared, Hungarian-assigned V-formation slots) "
+             "instead of independent per-agent random goals -- isolates whether the "
+             "formation/coordination structure itself (not UAV flight dynamics) blocks "
+             "convergence on the real Formation-TorchRL-UAVSwarm task.",
+    )
     args = parser.parse_args()
+
+    if args.formation and args.model_name == "mappo_sanity":
+        args.model_name = "mappo_sanity_formation"
 
     config = load_config(args.config)
 
@@ -88,7 +99,8 @@ def main():
     print(f"  Log:    {log_dir}")
     print(f"{'='*80}\n")
 
-    env = SyntheticSwarmEnv(
+    env_cls = SyntheticFormationEnv if args.formation else SyntheticSwarmEnv
+    env_kwargs = dict(
         num_envs=num_envs,
         num_agents=num_agents,
         device=str(device),
@@ -99,6 +111,9 @@ def main():
         goal_threshold=config["env"]["goal_threshold"],
         goal_bonus=config["env"]["goal_bonus"],
     )
+    if args.formation:
+        env_kwargs["formation_spacing"] = config["env"].get("formation_spacing", 1.0)
+    env = env_cls(**env_kwargs)
 
     obs_dim, action_dim, state_dim = env.obs_dim, env.action_dim, env.state_dim
     policy = make_policy(obs_dim, action_dim, config, device)

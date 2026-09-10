@@ -23,6 +23,7 @@ from tensordict import TensorDict
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
 from synthetic_swarm_env import SyntheticSwarmEnv
+from synthetic_formation_env import SyntheticFormationEnv
 from mappo_torchl import MAPPOPolicy
 from tensordict.nn import TensorDictModule
 from torchrl.modules import ProbabilisticActor, TanhNormal
@@ -70,13 +71,19 @@ def main():
     parser.add_argument("--num_agents", type=int, default=None)
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--trail_len", type=int, default=40, help="Trail length in frames.")
+    parser.add_argument(
+        "--formation", action="store_true", default=False,
+        help="Use SyntheticFormationEnv (shared V-formation slots) instead of "
+             "independent per-agent random goals -- matches sanity_train.py --formation.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
     num_agents = args.num_agents or config["env"]["num_agents"]
     device = torch.device("cpu")  # single env, tiny nets -- no reason to touch the GPU
 
-    env = SyntheticSwarmEnv(
+    env_cls = SyntheticFormationEnv if args.formation else SyntheticSwarmEnv
+    env_kwargs = dict(
         num_envs=1,
         num_agents=num_agents,
         device="cpu",
@@ -87,6 +94,9 @@ def main():
         goal_threshold=config["env"]["goal_threshold"],
         goal_bonus=config["env"]["goal_bonus"],
     )
+    if args.formation:
+        env_kwargs["formation_spacing"] = config["env"].get("formation_spacing", 1.0)
+    env = env_cls(**env_kwargs)
 
     checkpoint_path = None if args.random else (args.checkpoint or find_latest_checkpoint())
     policy = None

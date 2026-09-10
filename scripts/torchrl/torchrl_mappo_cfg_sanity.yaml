@@ -15,6 +15,7 @@ env:
   bound: 5.0
   goal_threshold: 0.2
   goal_bonus: 5.0
+  formation_spacing: 1.0    # only used with --formation (SyntheticFormationEnv)
 
 models:
   policy:
