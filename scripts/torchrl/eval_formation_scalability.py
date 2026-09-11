@@ -49,6 +49,7 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument(
     "--controller", type=str, default="geometric", choices=["geometric", "pd_velocity", "direct"],
 )
+parser.add_argument("--stage", type=int, default=None, help="Curriculum stage 1-6. Overrides the task's default.")
 parser.add_argument("--results_csv", type=str, default=None, help="Append a summary row to this CSV (created if missing).")
 parser.add_argument(
     "--stochastic", action="store_true", default=False,
@@ -77,9 +78,9 @@ from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 from torchrl.modules import ProbabilisticActor, TanhNormal
 
 from isaaclab.envs import DirectMARLEnv
+from isaaclab_tasks.utils import parse_env_cfg
 
 import UavSwarm.tasks  # noqa: F401
-from UavSwarm.tasks.direct.torchrl_swarm.torchrl_swarm_env_cfg import FormationUAVSwarmEnvCfg
 
 from torchrl_wrapper import IsaacLabTorchRLWrapper
 # mappo_train.py is a script with top-level argparse/AppLauncher side effects (it launches
@@ -115,27 +116,33 @@ def make_policy(obs_dim: int, action_dim: int, config: dict, device: torch.devic
     )
 
 
-def build_eval_cfg(num_agents: int, num_envs: int, device: str, controller_type: str) -> FormationUAVSwarmEnvCfg:
-    """Patch a FormationUAVSwarmEnvCfg for a swarm size different from the one it trained at.
+def build_eval_cfg(task: str, num_agents: int, num_envs: int, device: str, controller_type: str, stage: int | None):
+    """Load the task's own registered cfg class (not hardcoded to Formation -- a checkpoint
+    trained on FullTask-TorchRL-UAVSwarm-Direct-v0 has a different single_observation_space
+    (32, includes RM one-hot) than Formation's (28), so using the wrong cfg class silently
+    mismatches obs_rms/policy shapes), then patch it for a swarm size different from the one
+    it trained at.
 
     possible_agents/action_spaces/observation_spaces/state_space are baked as plain class
     attributes at class-definition time (a configclass constraint: no @property, since
     configclass deep-copies fields via setattr -- see torchrl_swarm_env_cfg.py), so setting
-    cfg.num_agents alone does not resize them. All four must be rebuilt here.
+    cfg.num_agents alone does not resize them. All four are rebuilt when num_agents differs
+    from the class default.
     """
-    cfg = FormationUAVSwarmEnvCfg()
-    cfg.num_agents = num_agents
-    cfg.possible_agents = [f"robot_{i}" for i in range(num_agents)]
-    cfg.action_spaces = {
-        f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)
-    }
-    cfg.observation_spaces = {
-        f"robot_{i}": gym.spaces.Box(low=-float("inf"), high=float("inf"), shape=(cfg.single_observation_space,))
-        for i in range(num_agents)
-    }
-    cfg.state_space = num_agents * cfg.single_observation_space
-    cfg.scene.num_envs = num_envs
-    cfg.sim.device = device
+    cfg = parse_env_cfg(task, device=device, num_envs=num_envs)
+    if stage is not None:
+        cfg.curriculum.active_stage = stage
+    if num_agents != cfg.num_agents:
+        cfg.num_agents = num_agents
+        cfg.possible_agents = [f"robot_{i}" for i in range(num_agents)]
+        cfg.action_spaces = {
+            f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(num_agents)
+        }
+        cfg.observation_spaces = {
+            f"robot_{i}": gym.spaces.Box(low=-float("inf"), high=float("inf"), shape=(cfg.single_observation_space,))
+            for i in range(num_agents)
+        }
+        cfg.state_space = num_agents * cfg.single_observation_space
     cfg.controller.type = controller_type
     return cfg
 
@@ -145,7 +152,7 @@ def main():
     device = torch.device(config["env"]["device"])
     torch.manual_seed(args_cli.seed)
 
-    env_cfg = build_eval_cfg(args_cli.num_agents, args_cli.num_envs, str(device), args_cli.controller)
+    env_cfg = build_eval_cfg(args_cli.task, args_cli.num_agents, args_cli.num_envs, str(device), args_cli.controller, args_cli.stage)
 
     print(f"\n{'='*80}")
     print("  Formation Scalability Eval — zero-shot swarm-size generalization")
