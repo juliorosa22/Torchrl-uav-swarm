@@ -44,6 +44,7 @@ class CurriculumCfg:
     stage4_episode_length_s: float = 300.0
     stage5_episode_length_s: float = 300.0
     stage6_episode_length_s: float = 180.0
+    stage7_episode_length_s: float = 90.0
 
     # Stage 2 parameters
     stage2_goal_distance: float = 6.0
@@ -106,6 +107,13 @@ class CurriculumCfg:
     # the full reward despite stable formation-holding).
     stage6_simple_reward: bool = False
 
+    # Stage 7 parameters (single-goal navigation -- isolates the formation task's own
+    # get_formation_rewards_simple/termination path from Hungarian/V-formation assignment,
+    # to test whether the formation-assignment machinery itself matters).
+    stage7_spawn_height_range: tuple = (2.0, 4.0)
+    stage7_goal_distance: float = 6.0
+    stage7_zdist_xy_plane: float = 1.0
+
     def get_episode_length(self) -> float:
         """Return episode length based on active stage."""
         stage_lengths = {
@@ -115,9 +123,10 @@ class CurriculumCfg:
             4: self.stage4_episode_length_s,
             5: self.stage5_episode_length_s,
             6: self.stage6_episode_length_s,
+            7: self.stage7_episode_length_s,
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-6.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-7.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -295,3 +304,28 @@ class FormationUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=6)
+
+
+@configclass
+class SingleGoalUAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """Single-UAV point-to-target navigation: same 28-dim obs schema and
+    get_formation_rewards_simple/_check_individual_goals_reached path as the Formation
+    task, but goals are independently sampled per agent (no Hungarian/V-formation
+    assignment). Isolates whether the formation-assignment machinery itself matters to
+    the Formation task's convergence, vs. the shared obs/reward/controller/physics path.
+
+    Uses curriculum stage 7 purely as an internal dispatch value, same pattern as
+    Formation's stage 6. Defaults to num_agents=5 like every other cfg class here (baking
+    num_agents=1 directly into the class body broke PhysX scene setup -- "Failed to get
+    DOF positions from backend" -- for reasons not fully understood; the proven path is
+    mappo_train.py's --num_agents CLI override, which patches an already-constructed
+    5-agent cfg instance at runtime instead). Pass --num_agents 1 at launch for the actual
+    single-UAV diagnostic.
+    """
+
+    include_rm_in_obs: bool = False
+    single_observation_space: int = 28
+    state_space: int = 140
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=7)

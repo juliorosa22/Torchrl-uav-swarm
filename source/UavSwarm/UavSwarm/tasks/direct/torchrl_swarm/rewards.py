@@ -337,9 +337,14 @@ def get_formation_rewards(env) -> dict[str, torch.Tensor]:
     off_diag = ~torch.eye(env.num_drones, dtype=torch.bool, device=env.device)
     shape_error = (actual_pairwise - target_pairwise).abs()
     off_diag_actual = actual_pairwise.masked_select(off_diag.unsqueeze(0)).view(env.num_envs, -1)
-    formation_shape_error = shape_error.masked_select(off_diag.unsqueeze(0)).view(
-        env.num_envs, -1
-    ).mean(dim=1)
+    if env.num_drones > 1:
+        formation_shape_error = shape_error.masked_select(off_diag.unsqueeze(0)).view(
+            env.num_envs, -1
+        ).mean(dim=1)
+    else:
+        # No other agent to compare pairwise distance against -- .mean(dim=1) over the
+        # empty off-diagonal would be NaN (0/0).
+        formation_shape_error = torch.zeros(env.num_envs, device=env.device)
 
     # Logging-only true pairwise inter-agent collision check (distinct from the nearest-
     # neighbor-only soft safety penalty above, and from the altitude-bound `collision` var

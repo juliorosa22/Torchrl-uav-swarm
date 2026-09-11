@@ -18,6 +18,7 @@ from .torchrl_swarm_env_cfg import (
     FullTaskUAVSwarmEnvCfg,
     BaselineUAVSwarmEnvCfg,
     FormationUAVSwarmEnvCfg,
+    SingleGoalUAVSwarmEnvCfg,
 )
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
@@ -32,6 +33,7 @@ from .curriculum import (
     set_stage4_positions,
     set_stage5_positions,
     set_formation_positions,
+    set_singlegoal_positions,
 )
 from .termination import (
     get_dones,
@@ -321,6 +323,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_stage5_positions(self, env_ids, env_origins)
         elif stage == 6:
             set_formation_positions(self, env_ids, env_origins)
+        elif stage == 7:
+            set_singlegoal_positions(self, env_ids, env_origins)
 
     # ------------------------------------------------------------------
     # Observations
@@ -411,6 +415,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             if self.cfg.curriculum.stage6_simple_reward:
                 return get_formation_rewards_simple(self)
             return get_formation_rewards(self)
+        if self.curriculum_stage == 7:
+            return get_formation_rewards_simple(self)
         return get_rewards(self)
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -485,3 +491,10 @@ class FormationUAVSwarmEnv(BaseSwarmEnv):
     V-formation slots, 28-dim observations without RM state one-hot."""
 
     cfg: FormationUAVSwarmEnvCfg
+
+
+class SingleGoalUAVSwarmEnv(BaseSwarmEnv):
+    """Single-UAV point-to-target diagnostic: same 28-dim obs/reward/termination path as
+    Formation, independent per-agent goal instead of Hungarian-assigned V-formation slot."""
+
+    cfg: SingleGoalUAVSwarmEnvCfg

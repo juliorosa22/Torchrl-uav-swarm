@@ -94,6 +94,8 @@ def _check_goal_reached(env) -> torch.Tensor:
         # Formation-assignment task: _desired_pos_w holds each agent's Hungarian-assigned
         # slot, so "every agent within threshold of its own goal" is exactly right here too.
         return _check_individual_goals_reached(env)
+    elif stage == 7:
+        return _check_individual_goals_reached(env)
     else:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 

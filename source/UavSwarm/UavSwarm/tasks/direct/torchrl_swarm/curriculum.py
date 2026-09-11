@@ -151,6 +151,88 @@ def set_stage2_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) 
             env._desired_pos_w[env_id_single, j, 2] = goal_z
 
 
+def set_singlegoal_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
+    """Set independent point-to-point goals for curriculum stage 7 (single-UAV diagnostic).
+
+    Same scatter-spawn + independent-random-goal pattern as set_stage2_positions, using
+    stage7_* config fields -- no Hungarian/V-formation assignment, unlike stage 6.
+    """
+    num_reset_envs = len(env_ids)
+
+    grid_size = int(torch.ceil(torch.sqrt(torch.tensor(env.num_drones, dtype=torch.float32))))
+    spacing = torch.zeros(1, device=env.device).uniform_(
+        env.cfg.curriculum.spawn_grid_spacing_range[0],
+        env.cfg.curriculum.spawn_grid_spacing_range[1],
+    )
+
+    min_height = env.cfg.curriculum.goal_height_range[0]
+    max_height = env.cfg.curriculum.goal_height_range[1]
+
+    z_spacing = env.cfg.curriculum.stage7_zdist_xy_plane
+    spawn_lo, spawn_hi = env.cfg.curriculum.stage7_spawn_height_range
+    base_height = torch.zeros(1, device=env.device).uniform_(spawn_lo, spawn_hi).item()
+
+    for env_idx in range(num_reset_envs):
+        perm = torch.randperm(env.num_drones, device=env.device)
+
+        heights = torch.arange(env.num_drones, device=env.device, dtype=torch.float32)
+        heights = base_height + heights * z_spacing
+        heights = torch.clamp(heights, min=min_height, max=max_height)
+
+        height_perm = torch.randperm(env.num_drones, device=env.device)
+        assigned_heights = heights[height_perm]
+
+        for j, rob in enumerate(env._robots):
+            env_id_single = env_ids[env_idx].unsqueeze(0)
+
+            grid_idx = perm[j].item()
+            grid_x = (grid_idx % grid_size) * spacing - (grid_size * spacing / 2.0)
+            grid_y = (grid_idx // grid_size) * spacing - (grid_size * spacing / 2.0)
+
+            joint_pos = rob.data.default_joint_pos[env_id_single]
+            joint_vel = rob.data.default_joint_vel[env_id_single]
+            default_root_state = rob.data.default_root_state[env_id_single].clone()
+
+            start_x = env_origins[env_idx, 0] + grid_x
+            start_y = env_origins[env_idx, 1] + grid_y
+            start_z = assigned_heights[j].item()
+
+            default_root_state[:, 0] = start_x
+            default_root_state[:, 1] = start_y
+            default_root_state[:, 2] = start_z
+
+            rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
+            rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
+            rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
+
+            goal_distance = torch.zeros(1, device=env.device).uniform_(
+                2.0,
+                env.cfg.curriculum.stage7_goal_distance,
+            ).item()
+
+            goal_angle = torch.zeros(1, device=env.device).uniform_(
+                0.0,
+                2.0 * torch.pi,
+            ).item()
+
+            goal_offset_x = goal_distance * torch.cos(torch.tensor(goal_angle, device=env.device))
+            goal_offset_y = goal_distance * torch.sin(torch.tensor(goal_angle, device=env.device))
+
+            goal_x = start_x + goal_offset_x
+            goal_y = start_y + goal_offset_y
+
+            goal_z_noise = torch.zeros(1, device=env.device).uniform_(-0.3, 0.3).item()
+            goal_z = torch.clamp(
+                torch.tensor(start_z + goal_z_noise, device=env.device),
+                min=min_height,
+                max=max_height,
+            ).item()
+
+            env._desired_pos_w[env_id_single, j, 0] = goal_x
+            env._desired_pos_w[env_id_single, j, 1] = goal_y
+            env._desired_pos_w[env_id_single, j, 2] = goal_z
+
+
 def set_stage3_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
     """Set individual obstacle course navigation with waypoint-based goals.
 

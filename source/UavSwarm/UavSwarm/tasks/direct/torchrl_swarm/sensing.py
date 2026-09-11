@@ -56,9 +56,13 @@ def _get_neighbor_data_vectorized(
     device = env.device
     max_dist = cfg.swarm_cfg.max_neighbor_distance
 
-    # Stages 1-3: neighbour tracking inactive — return sentinels.
+    # Stages 1-3, 7: neighbour tracking inactive -- return sentinels. Also guard directly
+    # on num_drones <= 1 regardless of stage (e.g. Formation/stage 6 run with
+    # --num_agents 1): "mean of all OTHER drones" is undefined with zero other drones, and
+    # the (num_drones - 1) division below produces NaN that splices straight into
+    # _build_obs_tensor with no downstream guard, poisoning every observation from step 1.
     # Sentinel: neighbour is max_dist straight ahead (x-axis in world), zero relative vel.
-    if env.curriculum_stage in [1, 2, 3]:
+    if env.curriculum_stage in [1, 2, 3, 7] or num_drones <= 1:
         default_w = torch.zeros(num_drones, num_envs, 3, device=device)
         default_w[:, :, 0] = max_dist
         default_b = quat_apply_inverse(
