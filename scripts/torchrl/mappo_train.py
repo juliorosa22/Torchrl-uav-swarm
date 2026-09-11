@@ -59,6 +59,15 @@ parser.add_argument(
          "normalize_observations in the config yaml.",
 )
 parser.add_argument(
+    "--residual_rl", action="store_true", default=False,
+    help="Env receives compute_baseline_action(pos, desired_pos_w) + residual_scale * "
+         "policy_action instead of the raw policy action -- PPO learns a correction on "
+         "top of a proven P-controller (see controller.py) instead of the full command "
+         "from scratch. See formation-convergence-investigation memory for why.",
+)
+parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline P-controller gain.")
+parser.add_argument("--residual_scale", type=float, default=0.3, help="residual_rl: policy correction weight.")
+parser.add_argument(
     "--experiment_directory", type=str, default=None,
     help="Base folder under logs/torchrl/ shared by every run of this experiment; each run "
          "still gets its own timestamped subdir inside it. Overrides the config file's value.",
@@ -204,6 +213,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
+    if args_cli.residual_rl:
+        print(f"  Residual RL: ON  (kp={args_cli.residual_kp}, scale={args_cli.residual_scale})")
     print(f"  Device:     {device}")
     print(f"  Seed:       {config['seed']}")
     print(f"  Envs:       {env_cfg.scene.num_envs}")
@@ -227,7 +238,11 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
             disable_logger=True,
         )
 
-    env = IsaacLabTorchRLWrapper(base_env, device=str(device), normalize_obs=normalize_obs)
+    env = IsaacLabTorchRLWrapper(
+        base_env, device=str(device), normalize_obs=normalize_obs,
+        residual_rl=args_cli.residual_rl, residual_kp=args_cli.residual_kp,
+        residual_scale=args_cli.residual_scale,
+    )
 
     # --- dimensions ---
     obs_dim = env.obs_dim

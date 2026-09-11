@@ -18,6 +18,7 @@ from torchrl.data import (
 import gymnasium as gym
 
 from isaaclab.envs import DirectMARLEnv
+from UavSwarm.tasks.direct.torchrl_swarm.controller import compute_baseline_action
 try:
     # Newer rsl_rl: normalization.py lives under networks/.
     from rsl_rl.networks.normalization import EmpiricalNormalization
@@ -50,9 +51,22 @@ class IsaacLabTorchRLWrapper(EnvBase):
         device: str = "cuda:0",
         centralized_critic: bool = True,
         normalize_obs: bool = False,
+        residual_rl: bool = False,
+        residual_kp: float = 2.0,
+        residual_scale: float = 0.3,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
+
+        # Residual RL: env receives baseline_P_controller(pos, desired_pos_w) +
+        # residual_scale * policy_action, not the raw policy action directly -- see
+        # controller.py::compute_baseline_action (same law proven in flight_test.py's
+        # --goto_target mode). The policy's own sampled action is left untouched in the
+        # tensordict (see _step) so ClipPPOLoss's log-prob ratio stays correct -- PPO's
+        # distribution is over the residual, not over the final env-facing action.
+        self.residual_rl = residual_rl
+        self.residual_kp = residual_kp
+        self.residual_scale = residual_scale
 
         if not isinstance(self.unwrapped_env, DirectMARLEnv):
             raise TypeError(
@@ -250,9 +264,20 @@ class IsaacLabTorchRLWrapper(EnvBase):
     def _step(self, tensordict: TensorDict) -> TensorDict:
         # Extract per-agent actions from nested structure → flat dict for IsaacLab
         actions_stacked = tensordict["agents"]["action"]  # (num_envs, n_agents, action_dim)
+
+        # Residual RL: the env receives baseline + residual_scale * policy_action, but
+        # actions_stacked itself (used below only for the split into actions_dict) is
+        # reassigned to that combined value -- the tensordict's own ("agents","action")
+        # entry is untouched, so ClipPPOLoss's log-prob ratio still reads the policy's
+        # actual sampled residual, not the env-facing combined action.
+        env_actions = actions_stacked
+        if self.residual_rl:
+            baseline = compute_baseline_action(self.unwrapped_env, self.residual_kp)
+            env_actions = (baseline + self.residual_scale * actions_stacked).clamp(-1.0, 1.0)
+
         actions_dict = {}
         for i, agent_id in enumerate(self.possible_agents):
-            actions_dict[agent_id] = actions_stacked[:, i, :]  # (num_envs, action_dim)
+            actions_dict[agent_id] = env_actions[:, i, :]  # (num_envs, action_dim)
 
         obs_dict, rewards_dict, terminated_dict, truncated_dict, _info = self.env.step(actions_dict)
 

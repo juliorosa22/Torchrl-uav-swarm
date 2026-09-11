@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import torch
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply_inverse
 
 
 @configclass
@@ -305,6 +306,34 @@ def compute_direct_controller(
         moment[:, j, 0, :] = env.cfg.moment_scale * actions_tensor[:, j, 1:]
 
     return thrust, moment
+
+
+# ---------------------------------------------------------------------------
+# Residual-RL baseline
+# ---------------------------------------------------------------------------
+
+def compute_baseline_action(env, kp: float) -> torch.Tensor:
+    """P-controller reference command: body-frame velocity proportional to the position
+    error toward env._desired_pos_w, no yaw term. Same control law proven in
+    scripts/torchrl/flight_test.py's --goto_target mode (converges ~4.85m -> ~0.1-0.2m in
+    ~200 steps with zero training), generalized to read the env's own live goal buffer.
+    Used as the residual-RL baseline: final action = baseline + residual_scale * policy.
+
+    Returns actions_tensor of shape (num_envs, num_drones, 4) in [-1, 1], the same layout
+    apply_controller expects.
+    """
+    cfg = env.cfg.controller
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    all_quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)      # (D, E, 4)
+    desired = env._desired_pos_w.transpose(0, 1)  # (D, E, 3)
+    error_w = desired - all_positions
+    error_b = quat_apply_inverse(
+        all_quats.reshape(-1, 4), error_w.reshape(-1, 3)
+    ).reshape(env.num_drones, env.num_envs, 3)
+    vel_cmd_b = (kp * error_b / cfg.max_lin_vel_cmd).clamp(-1.0, 1.0)
+    baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
+    baseline[:, :, :3] = vel_cmd_b
+    return baseline.transpose(0, 1)  # (E, D, 4)
 
 
 # ---------------------------------------------------------------------------
