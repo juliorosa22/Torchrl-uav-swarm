@@ -30,6 +30,8 @@ parser.add_argument(
     help="Low-level controller to test.",
 )
 parser.add_argument("--kp", type=float, default=2.0, help="Altitude proportional gain.")
+parser.add_argument("--vx_cmd", type=float, default=0.0, help="Constant vx_b command in [-1,1], added on top of altitude hold.")
+parser.add_argument("--yaw_cmd", type=float, default=0.0, help="Constant yaw_rate command in [-1,1], added on top of altitude hold.")
 parser.add_argument("--duration", type=int, default=1000, help="Steps to run (0 = infinite).")
 parser.add_argument("--log_interval", type=int, default=50, help="Steps between status prints.")
 
@@ -53,8 +55,9 @@ import UavSwarm.tasks  # noqa: F401
 
 # ── hover controller ─────────────────────────────────────────────────────────
 
-def hover_actions(env: DirectMARLEnv, target_z: float, max_vel: float, kp: float) -> dict:
-    """P-altitude controller: zero xy/yaw, proportional vz toward target_z.
+def hover_actions(env: DirectMARLEnv, target_z: float, max_vel: float, kp: float, vx_cmd: float = 0.0, yaw_cmd: float = 0.0) -> dict:
+    """P-altitude controller: proportional vz toward target_z, plus a constant
+    vx_b/yaw_rate command to test whether lateral motion destabilizes attitude.
 
     Returns a dict matching the MARL action format:
         { agent_name: (num_envs, 4) }  — [vx_b, vy_b, vz_b, yaw_rate] in [-1, 1]
@@ -64,7 +67,9 @@ def hover_actions(env: DirectMARLEnv, target_z: float, max_vel: float, kp: float
         z = env._robots[i].data.root_pos_w[:, 2]          # (num_envs,)
         vz_cmd = (kp * (target_z - z) / max_vel).clamp(-1.0, 1.0)
         act = torch.zeros(env.num_envs, 4, device=env.device)
+        act[:, 0] = vx_cmd
         act[:, 2] = vz_cmd
+        act[:, 3] = yaw_cmd
         actions[agent] = act
     return actions
 
@@ -72,22 +77,36 @@ def hover_actions(env: DirectMARLEnv, target_z: float, max_vel: float, kp: float
 # ── diagnostics helper ────────────────────────────────────────────────────────
 
 def read_state(env: DirectMARLEnv):
-    """Return (mean_z, min_z, max_z, mean_vz, xy_drift) across all drones/envs."""
+    """Return (mean_z, min_z, max_z, mean_vz, xy_drift, tilt_deg) across all drones/envs.
+
+    xy_drift is relative to each env's own origin (env.scene.env_origins), not world
+    origin -- parallel envs are spatially offset, so a raw world-frame xy norm is
+    dominated by that spacing rather than actual drift.
+    """
     pos_list = [r.data.root_pos_w for r in env._robots]   # each (num_envs, 3)
     vel_list = [r.data.root_lin_vel_b for r in env._robots]
+    quat_list = [r.data.root_quat_w for r in env._robots]  # (num_envs, 4) w,x,y,z
 
     pos = torch.stack(pos_list, dim=0)   # (num_drones, num_envs, 3)
     vel = torch.stack(vel_list, dim=0)   # (num_drones, num_envs, 3)
+    quat = torch.stack(quat_list, dim=0)  # (num_drones, num_envs, 4)
 
     z   = pos[..., 2]
     vz  = vel[..., 2]
-    xy  = pos[..., :2]
+    xy_local = pos[..., :2] - env.scene.env_origins[:, :2].unsqueeze(0)
+
+    # Tilt angle from vertical: angle between body-z axis and world-z, derived from quaternion.
+    qw, qx, qy, qz = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    b3_z = 1.0 - 2.0 * (qx**2 + qy**2)  # world-z component of the body-z axis
+    tilt_deg = torch.rad2deg(torch.acos(b3_z.clamp(-1.0, 1.0)))
+
     return (
         z.mean().item(),
         z.min().item(),
         z.max().item(),
         vz.mean().item(),
-        xy.norm(dim=-1).mean().item(),   # mean horizontal distance from origin
+        xy_local.norm(dim=-1).mean().item(),
+        tilt_deg.mean().item(),
     )
 
 
@@ -118,6 +137,8 @@ def main():
     print(f"  Max lin vel   : {max_vel} m/s")
     print(f"  Target alt    : {args_cli.target_altitude} m")
     print(f"  Hover Kp      : {args_cli.kp}")
+    print(f"  vx_cmd        : {args_cli.vx_cmd}")
+    print(f"  yaw_cmd       : {args_cli.yaw_cmd}")
     print(f"  Envs          : {env_cfg.scene.num_envs}")
     print(f"  Spawn height  : {env_cfg.curriculum.spawn_height_range}")
     print()
@@ -127,7 +148,7 @@ def main():
 
     env.reset()
 
-    header = f"  {'Step':>6}  {'Alt mean':>9}  {'Alt min':>8}  {'Alt max':>8}  {'Vz mean':>8}  {'XY drift':>9}  {'Err':>7}"
+    header = f"  {'Step':>6}  {'Alt mean':>9}  {'Alt min':>8}  {'Alt max':>8}  {'Vz mean':>8}  {'XY drift':>9}  {'Tilt deg':>9}  {'Err':>7}"
     print(header)
     print("  " + "-" * (len(header) - 2))
 
@@ -135,11 +156,11 @@ def main():
     t0 = time.time()
 
     for step in range(max_steps):
-        acts = hover_actions(unwrapped, args_cli.target_altitude, max_vel, args_cli.kp)
+        acts = hover_actions(unwrapped, args_cli.target_altitude, max_vel, args_cli.kp, args_cli.vx_cmd, args_cli.yaw_cmd)
         env.step(acts)
 
         if (step + 1) % args_cli.log_interval == 0:
-            mean_z, min_z, max_z, mean_vz, xy_drift = read_state(unwrapped)
+            mean_z, min_z, max_z, mean_vz, xy_drift, tilt_deg = read_state(unwrapped)
             err = abs(mean_z - args_cli.target_altitude)
             print(
                 f"  {step+1:>6}  "
@@ -148,6 +169,7 @@ def main():
                 f"{max_z:>8.3f}  "
                 f"{mean_vz:>8.3f}  "
                 f"{xy_drift:>9.3f}  "
+                f"{tilt_deg:>9.3f}  "
                 f"{err:>7.3f}"
             )
 

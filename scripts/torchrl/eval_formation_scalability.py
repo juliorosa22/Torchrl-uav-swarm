@@ -50,6 +50,11 @@ parser.add_argument(
     "--controller", type=str, default="geometric", choices=["geometric", "pd_velocity", "direct"],
 )
 parser.add_argument("--results_csv", type=str, default=None, help="Append a summary row to this CSV (created if missing).")
+parser.add_argument(
+    "--stochastic", action="store_true", default=False,
+    help="Sample actions (matches how SyncDataCollector actually rolled out during "
+         "training) instead of using the deterministic mean action.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -156,15 +161,19 @@ def main():
     if not isinstance(base_env.unwrapped, DirectMARLEnv):
         raise TypeError(f"Expected DirectMARLEnv, got {type(base_env.unwrapped)}")
 
-    env = IsaacLabTorchRLWrapper(base_env, device=str(device))
+    ckpt = torch.load(args_cli.checkpoint, map_location=device, weights_only=True)
+    normalize_obs = "obs_rms" in ckpt
+    env = IsaacLabTorchRLWrapper(base_env, device=str(device), normalize_obs=normalize_obs)
+    if normalize_obs:
+        assert env.obs_rms is not None
+        env.obs_rms.load_state_dict(ckpt["obs_rms"])
     unwrapped = env.unwrapped_env
     num_envs = unwrapped.num_envs
     num_agents = args_cli.num_agents
 
-    print(f"[INFO] obs={env.obs_dim}  action={env.action_dim}  state={env.state_dim}  agents={env.num_agents}\n")
+    print(f"[INFO] obs={env.obs_dim}  action={env.action_dim}  state={env.state_dim}  agents={env.num_agents}  obs_norm={normalize_obs}\n")
 
     policy = make_policy(env.obs_dim, env.action_dim, config, device)
-    ckpt = torch.load(args_cli.checkpoint, map_location=device)
     policy.load_state_dict(ckpt["policy"])
     policy.eval()
 
@@ -188,7 +197,8 @@ def main():
     final_formation_error = torch.zeros(num_envs, device=device)
     finished = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
-    with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
+    exploration = ExplorationType.RANDOM if args_cli.stochastic else ExplorationType.DETERMINISTIC
+    with set_exploration_type(exploration), torch.no_grad():
         for step in range(args_cli.num_steps):
             tensordict = policy(tensordict)
             tensordict = env.step(tensordict)
