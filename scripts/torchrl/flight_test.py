@@ -32,6 +32,16 @@ parser.add_argument(
 parser.add_argument("--kp", type=float, default=2.0, help="Altitude proportional gain.")
 parser.add_argument("--vx_cmd", type=float, default=0.0, help="Constant vx_b command in [-1,1], added on top of altitude hold.")
 parser.add_argument("--yaw_cmd", type=float, default=0.0, help="Constant yaw_rate command in [-1,1], added on top of altitude hold.")
+parser.add_argument(
+    "--goto_target", action="store_true", default=False,
+    help="Replace the hover/constant-command controller with a full-3D P-controller "
+         "(vx_b/vy_b/vz_b all proportional to world-frame position error toward "
+         "--target_x/--target_y/--target_altitude, no learned policy) -- tests whether "
+         "the controller/physics can reach a target at all, independent of PPO.",
+)
+parser.add_argument("--target_x", type=float, default=4.0, help="goto_target: target X offset from each env's own origin, metres.")
+parser.add_argument("--target_y", type=float, default=0.0, help="goto_target: target Y offset from each env's own origin, metres.")
+parser.add_argument("--goal_threshold", type=float, default=0.15, help="goto_target: distance (m) counted as 'reached'.")
 parser.add_argument("--duration", type=int, default=1000, help="Steps to run (0 = infinite).")
 parser.add_argument("--log_interval", type=int, default=50, help="Steps between status prints.")
 
@@ -49,6 +59,7 @@ import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 from isaaclab.envs import DirectMARLEnv
+from isaaclab.utils.math import quat_apply_inverse
 
 import UavSwarm.tasks  # noqa: F401
 
@@ -70,6 +81,29 @@ def hover_actions(env: DirectMARLEnv, target_z: float, max_vel: float, kp: float
         act[:, 0] = vx_cmd
         act[:, 2] = vz_cmd
         act[:, 3] = yaw_cmd
+        actions[agent] = act
+    return actions
+
+
+def goto_target_actions(env: DirectMARLEnv, target_local: torch.Tensor, max_vel: float, kp: float) -> dict:
+    """Full-3D P-controller: vx_b/vy_b/vz_b all proportional to world-frame position
+    error toward target_local (offset from each env's own origin), converted to body
+    frame. No learned policy -- isolates whether the controller/physics can track a
+    target at all, independent of what PPO did or didn't learn.
+
+    Returns a dict matching the MARL action format:
+        { agent_name: (num_envs, 4) }  — [vx_b, vy_b, vz_b, yaw_rate] in [-1, 1]
+    """
+    actions = {}
+    target_w = env.scene.env_origins + target_local  # (num_envs, 3)
+    for i, agent in enumerate(env.cfg.possible_agents):
+        pos_w = env._robots[i].data.root_pos_w        # (num_envs, 3)
+        quat_w = env._robots[i].data.root_quat_w      # (num_envs, 4)
+        error_w = target_w - pos_w
+        error_b = quat_apply_inverse(quat_w, error_w)
+        vel_cmd_b = (kp * error_b / max_vel).clamp(-1.0, 1.0)
+        act = torch.zeros(env.num_envs, 4, device=env.device)
+        act[:, :3] = vel_cmd_b
         actions[agent] = act
     return actions
 
@@ -137,8 +171,12 @@ def main():
     print(f"  Max lin vel   : {max_vel} m/s")
     print(f"  Target alt    : {args_cli.target_altitude} m")
     print(f"  Hover Kp      : {args_cli.kp}")
-    print(f"  vx_cmd        : {args_cli.vx_cmd}")
-    print(f"  yaw_cmd       : {args_cli.yaw_cmd}")
+    if args_cli.goto_target:
+        print(f"  goto_target   : ON  -> local offset ({args_cli.target_x}, {args_cli.target_y}, {args_cli.target_altitude})")
+        print(f"  Goal threshold: {args_cli.goal_threshold} m")
+    else:
+        print(f"  vx_cmd        : {args_cli.vx_cmd}")
+        print(f"  yaw_cmd       : {args_cli.yaw_cmd}")
     print(f"  Envs          : {env_cfg.scene.num_envs}")
     print(f"  Spawn height  : {env_cfg.curriculum.spawn_height_range}")
     print()
@@ -148,7 +186,14 @@ def main():
 
     env.reset()
 
-    header = f"  {'Step':>6}  {'Alt mean':>9}  {'Alt min':>8}  {'Alt max':>8}  {'Vz mean':>8}  {'XY drift':>9}  {'Tilt deg':>9}  {'Err':>7}"
+    target_local = torch.tensor(
+        [args_cli.target_x, args_cli.target_y, args_cli.target_altitude], device=unwrapped.device
+    ).unsqueeze(0).expand(unwrapped.num_envs, -1)
+
+    if args_cli.goto_target:
+        header = f"  {'Step':>6}  {'Dist mean':>9}  {'Dist min':>8}  {'Dist max':>8}  {'Tilt deg':>9}  {'Reached':>8}"
+    else:
+        header = f"  {'Step':>6}  {'Alt mean':>9}  {'Alt min':>8}  {'Alt max':>8}  {'Vz mean':>8}  {'XY drift':>9}  {'Tilt deg':>9}  {'Err':>7}"
     print(header)
     print("  " + "-" * (len(header) - 2))
 
@@ -156,10 +201,27 @@ def main():
     t0 = time.time()
 
     for step in range(max_steps):
-        acts = hover_actions(unwrapped, args_cli.target_altitude, max_vel, args_cli.kp, args_cli.vx_cmd, args_cli.yaw_cmd)
+        if args_cli.goto_target:
+            acts = goto_target_actions(unwrapped, target_local, max_vel, args_cli.kp)
+        else:
+            acts = hover_actions(unwrapped, args_cli.target_altitude, max_vel, args_cli.kp, args_cli.vx_cmd, args_cli.yaw_cmd)
         env.step(acts)
 
-        if (step + 1) % args_cli.log_interval == 0:
+        if (step + 1) % args_cli.log_interval == 0 and args_cli.goto_target:
+            target_w = unwrapped.scene.env_origins + target_local
+            pos = torch.stack([r.data.root_pos_w for r in unwrapped._robots], dim=0)  # (D, E, 3)
+            dist = torch.linalg.norm(target_w.unsqueeze(0) - pos, dim=-1)  # (D, E)
+            _, _, _, _, _, tilt_deg = read_state(unwrapped)
+            reached = (dist < args_cli.goal_threshold).float().mean().item()
+            print(
+                f"  {step+1:>6}  "
+                f"{dist.mean().item():>9.3f}  "
+                f"{dist.min().item():>8.3f}  "
+                f"{dist.max().item():>8.3f}  "
+                f"{tilt_deg:>9.3f}  "
+                f"{reached:>8.2%}"
+            )
+        elif (step + 1) % args_cli.log_interval == 0:
             mean_z, min_z, max_z, mean_vz, xy_drift, tilt_deg = read_state(unwrapped)
             err = abs(mean_z - args_cli.target_altitude)
             print(
