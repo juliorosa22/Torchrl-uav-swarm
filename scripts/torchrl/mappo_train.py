@@ -26,6 +26,13 @@ parser = argparse.ArgumentParser(description="Shared-weight MAPPO training with 
 parser.add_argument("--task", type=str, default="FullTask-TorchRL-UAVSwarm-Direct-v0")
 parser.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg_local.yaml")
 parser.add_argument("--num_envs", type=int, default=None)
+parser.add_argument(
+    "--num_agents", type=int, default=None,
+    help="Overrides env_cfg.num_agents (default 5). possible_agents/action_spaces/"
+         "observation_spaces/state_space are baked at class-definition time from "
+         "num_agents (a @configclass constraint), so all four are rebuilt here -- "
+         "same pattern as eval_formation_scalability.py's build_eval_cfg.",
+)
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--checkpoint", type=str, default=None)
 parser.add_argument("--model_name", type=str, default="mappo_uav_swarm")
@@ -157,6 +164,18 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.curriculum.stage6_simple_reward = True
     if args_cli.entropy_coef is not None:
         config["algorithm"]["entropy_coef"] = args_cli.entropy_coef
+    if args_cli.num_agents is not None and args_cli.num_agents != env_cfg.num_agents:
+        n = args_cli.num_agents
+        env_cfg.num_agents = n
+        env_cfg.possible_agents = [f"robot_{i}" for i in range(n)]
+        env_cfg.action_spaces = {
+            f"robot_{i}": gym.spaces.Box(low=-1.0, high=1.0, shape=(4,)) for i in range(n)
+        }
+        env_cfg.observation_spaces = {
+            f"robot_{i}": gym.spaces.Box(low=-float("inf"), high=float("inf"), shape=(env_cfg.single_observation_space,))
+            for i in range(n)
+        }
+        env_cfg.state_space = n * env_cfg.single_observation_space
 
     device = torch.device(config["env"]["device"])
 
@@ -179,6 +198,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"  Task:       {args_cli.task}")
     print(f"  Controller: {env_cfg.controller.type}  (max_vel={env_cfg.controller.max_lin_vel_cmd} m/s)")
     print(f"  Stage:      {env_cfg.curriculum.active_stage}")
+    print(f"  Agents:     {env_cfg.num_agents}")
     if env_cfg.curriculum.active_stage == 6:
         print(f"  Reward:     {'simple (pose-distance only)' if env_cfg.curriculum.stage6_simple_reward else 'full formation'}")
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
