@@ -65,8 +65,14 @@ parser.add_argument(
          "top of a proven P-controller (see controller.py) instead of the full command "
          "from scratch. See formation-convergence-investigation memory for why.",
 )
-parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline P-controller gain.")
+parser.add_argument(
+    "--residual_baseline", type=str, default="point", choices=["point", "apf"],
+    help="residual_rl: 'point' = plain P-controller toward desired_pos_w; 'apf' = adds "
+         "inter-agent repulsion for the swarm-gravity task (SwarmGravity-TorchRL-UAVSwarm-Direct-v0).",
+)
+parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline attraction gain.")
 parser.add_argument("--residual_scale", type=float, default=0.3, help="residual_rl: policy correction weight.")
+parser.add_argument("--residual_repel_gain", type=float, default=0.5, help="residual_rl: apf baseline's repulsion strength.")
 parser.add_argument(
     "--experiment_directory", type=str, default=None,
     help="Base folder under logs/torchrl/ shared by every run of this experiment; each run "
@@ -214,7 +220,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
     if args_cli.residual_rl:
-        print(f"  Residual RL: ON  (kp={args_cli.residual_kp}, scale={args_cli.residual_scale})")
+        print(f"  Residual RL: ON  (baseline={args_cli.residual_baseline}, kp={args_cli.residual_kp}, scale={args_cli.residual_scale}, repel={args_cli.residual_repel_gain})")
     print(f"  Device:     {device}")
     print(f"  Seed:       {config['seed']}")
     print(f"  Envs:       {env_cfg.scene.num_envs}")
@@ -240,8 +246,9 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
 
     env = IsaacLabTorchRLWrapper(
         base_env, device=str(device), normalize_obs=normalize_obs,
-        residual_rl=args_cli.residual_rl, residual_kp=args_cli.residual_kp,
-        residual_scale=args_cli.residual_scale,
+        residual_rl=args_cli.residual_rl, residual_baseline=args_cli.residual_baseline,
+        residual_kp=args_cli.residual_kp, residual_scale=args_cli.residual_scale,
+        residual_repel_gain=args_cli.residual_repel_gain,
     )
 
     # --- dimensions ---

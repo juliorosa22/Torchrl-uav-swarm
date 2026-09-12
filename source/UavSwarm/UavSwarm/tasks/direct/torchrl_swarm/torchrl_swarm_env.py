@@ -19,6 +19,7 @@ from .torchrl_swarm_env_cfg import (
     BaselineUAVSwarmEnvCfg,
     FormationUAVSwarmEnvCfg,
     SingleGoalUAVSwarmEnvCfg,
+    SwarmGravityUAVSwarmEnvCfg,
 )
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
@@ -34,13 +35,14 @@ from .curriculum import (
     set_stage5_positions,
     set_formation_positions,
     set_singlegoal_positions,
+    set_swarm_gravity_positions,
 )
 from .termination import (
     get_dones,
     update_waypoint_goals,
     update_swarm_waypoint_goals,
 )
-from .rewards import get_rewards, get_formation_rewards, get_formation_rewards_simple
+from .rewards import get_rewards, get_formation_rewards, get_formation_rewards_simple, get_swarm_gravity_rewards
 from .debug_viz import set_debug_vis_impl, debug_vis_callback
 
 
@@ -325,6 +327,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_formation_positions(self, env_ids, env_origins)
         elif stage == 7:
             set_singlegoal_positions(self, env_ids, env_origins)
+        elif stage == 8:
+            set_swarm_gravity_positions(self, env_ids, env_origins)
 
     # ------------------------------------------------------------------
     # Observations
@@ -417,6 +421,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             return get_formation_rewards(self)
         if self.curriculum_stage == 7:
             return get_formation_rewards_simple(self)
+        if self.curriculum_stage == 8:
+            return get_swarm_gravity_rewards(self)
         return get_rewards(self)
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -498,3 +504,10 @@ class SingleGoalUAVSwarmEnv(BaseSwarmEnv):
     Formation, independent per-agent goal instead of Hungarian-assigned V-formation slot."""
 
     cfg: SingleGoalUAVSwarmEnvCfg
+
+
+class SwarmGravityUAVSwarmEnv(BaseSwarmEnv):
+    """Swarm-gravity task: one shared target per env, agents self-organize around it via
+    attraction + inter-agent repulsion, no fixed formation shape."""
+
+    cfg: SwarmGravityUAVSwarmEnvCfg

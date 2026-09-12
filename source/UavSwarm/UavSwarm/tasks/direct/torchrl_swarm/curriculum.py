@@ -10,6 +10,11 @@ goal positions according to the curriculum progression:
   Stage 6: Formation-assignment scalability task (scatter-spawn -> Hungarian-assigned
            V-formation slots). Internal dispatch value only; not part of the sequential
            1-5 curriculum, used by the standalone Formation-TorchRL-UAVSwarm-Direct-v0 task.
+  Stage 7: Single-goal navigation (independent random goal per agent, no assignment).
+           Internal dispatch value only, used by SingleGoal-TorchRL-UAVSwarm-Direct-v0.
+  Stage 8: Swarm-gravity (one shared target per env, no fixed formation shape -- agents
+           self-organize around it). Internal dispatch value only, used by
+           SwarmGravity-TorchRL-UAVSwarm-Direct-v0.
 """
 
 import torch
@@ -231,6 +236,78 @@ def set_singlegoal_positions(env, env_ids: torch.Tensor, env_origins: torch.Tens
             env._desired_pos_w[env_id_single, j, 0] = goal_x
             env._desired_pos_w[env_id_single, j, 1] = goal_y
             env._desired_pos_w[env_id_single, j, 2] = goal_z
+
+
+def set_swarm_gravity_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
+    """Scatter-spawn (same pattern as set_stage2_positions/set_singlegoal_positions), then
+    write ONE shared random target per env into every drone's _desired_pos_w -- no
+    Hungarian assignment, no fixed formation shape. Agents self-organize around the
+    target via the stage-8 reward's attraction + inter-agent repulsion terms.
+    """
+    num_reset_envs = len(env_ids)
+
+    grid_size = int(torch.ceil(torch.sqrt(torch.tensor(env.num_drones, dtype=torch.float32))))
+    spacing = torch.zeros(1, device=env.device).uniform_(
+        env.cfg.curriculum.spawn_grid_spacing_range[0],
+        env.cfg.curriculum.spawn_grid_spacing_range[1],
+    )
+
+    min_height = env.cfg.curriculum.goal_height_range[0]
+    max_height = env.cfg.curriculum.goal_height_range[1]
+    spawn_lo, spawn_hi = env.cfg.curriculum.stage8_spawn_height_range
+    base_height = torch.zeros(1, device=env.device).uniform_(spawn_lo, spawn_hi).item()
+
+    for env_idx in range(num_reset_envs):
+        env_id_single = env_ids[env_idx].unsqueeze(0)
+        perm = torch.randperm(env.num_drones, device=env.device)
+
+        heights = torch.arange(env.num_drones, device=env.device, dtype=torch.float32)
+        heights = base_height + heights * env.cfg.curriculum.stage2_zdist_xy_plane
+        heights = torch.clamp(heights, min=min_height, max=max_height)
+        height_perm = torch.randperm(env.num_drones, device=env.device)
+        assigned_heights = heights[height_perm]
+
+        spawn_xy = torch.zeros(env.num_drones, 2, device=env.device)
+        for j, rob in enumerate(env._robots):
+            grid_idx = perm[j].item()
+            grid_x = (grid_idx % grid_size) * spacing - (grid_size * spacing / 2.0)
+            grid_y = (grid_idx // grid_size) * spacing - (grid_size * spacing / 2.0)
+
+            joint_pos = rob.data.default_joint_pos[env_id_single]
+            joint_vel = rob.data.default_joint_vel[env_id_single]
+            default_root_state = rob.data.default_root_state[env_id_single].clone()
+
+            start_x = env_origins[env_idx, 0] + grid_x
+            start_y = env_origins[env_idx, 1] + grid_y
+            start_z = assigned_heights[j].item()
+            spawn_xy[j, 0] = start_x
+            spawn_xy[j, 1] = start_y
+
+            default_root_state[:, 0] = start_x
+            default_root_state[:, 1] = start_y
+            default_root_state[:, 2] = start_z
+
+            rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
+            rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
+            rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
+
+        # One shared target for the whole swarm in this env -- offset from the swarm's
+        # own spawn centroid so the task always requires real travel.
+        centroid_xy = spawn_xy.mean(dim=0)
+        target_distance = torch.zeros(1, device=env.device).uniform_(
+            2.0, env.cfg.curriculum.stage8_target_distance,
+        ).item()
+        target_angle = torch.zeros(1, device=env.device).uniform_(0.0, 2.0 * torch.pi).item()
+        target_x = centroid_xy[0] + target_distance * torch.cos(torch.tensor(target_angle, device=env.device))
+        target_y = centroid_xy[1] + target_distance * torch.sin(torch.tensor(target_angle, device=env.device))
+        target_z = torch.zeros(1, device=env.device).uniform_(
+            env.cfg.curriculum.stage8_target_height_range[0],
+            env.cfg.curriculum.stage8_target_height_range[1],
+        ).item()
+
+        env._desired_pos_w[env_id_single, :, 0] = target_x
+        env._desired_pos_w[env_id_single, :, 1] = target_y
+        env._desired_pos_w[env_id_single, :, 2] = target_z
 
 
 def set_stage3_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:

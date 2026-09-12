@@ -411,3 +411,38 @@ def get_formation_rewards_simple(env) -> dict[str, torch.Tensor]:
     )
 
     return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}
+
+
+def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
+    """Swarm-gravity reward (curriculum stage 8): individual attraction to the shared
+    target (same pose-distance law as get_formation_rewards_simple, since every agent's
+    _desired_pos_w is now the same point) plus get_formation_rewards's existing
+    inter-agent safety penalty (repulsion below swarm_cfg.min_safe_distance = R_nh) --
+    nothing else, so the reward only encodes the two effects the task is meant to test.
+    """
+    from .sensing import ensure_cache_populated
+
+    ensure_cache_populated(env)
+
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
+    desired_transposed = env._desired_pos_w.transpose(0, 1)  # (num_drones, num_envs, 3)
+
+    distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)
+    attraction = torch.nan_to_num(-distances, nan=0.0, posinf=0.0, neginf=0.0)
+
+    neighbor_dists = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)
+    min_safe = env.cfg.swarm_cfg.min_safe_distance
+    safety_violation = torch.clamp(min_safe - neighbor_dists, min=0.0)
+    safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
+
+    per_drone_reward = attraction + safety_penalty
+    mean_reward = per_drone_reward.mean(dim=0)  # logging only
+
+    env._metrics.update(
+        distance_to_goal=distances.mean(dim=0),
+        mean_reward=mean_reward,
+        dist_component=attraction.mean(dim=0),
+        formation=distances.mean(dim=0),
+    )
+
+    return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}

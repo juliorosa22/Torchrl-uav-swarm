@@ -312,6 +312,24 @@ def compute_direct_controller(
 # Residual-RL baseline
 # ---------------------------------------------------------------------------
 
+def _compute_attraction_b(env, kp: float) -> torch.Tensor:
+    """Unclamped body-frame velocity proportional to the position error toward
+    env._desired_pos_w. Shared by compute_baseline_action and
+    compute_swarm_gravity_baseline_action -- see their docstrings.
+
+    Returns (num_drones, num_envs, 3), NOT yet clamped to [-1, 1].
+    """
+    cfg = env.cfg.controller
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    all_quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)      # (D, E, 4)
+    desired = env._desired_pos_w.transpose(0, 1)  # (D, E, 3)
+    error_w = desired - all_positions
+    error_b = quat_apply_inverse(
+        all_quats.reshape(-1, 4), error_w.reshape(-1, 3)
+    ).reshape(env.num_drones, env.num_envs, 3)
+    return kp * error_b / cfg.max_lin_vel_cmd
+
+
 def compute_baseline_action(env, kp: float) -> torch.Tensor:
     """P-controller reference command: body-frame velocity proportional to the position
     error toward env._desired_pos_w, no yaw term. Same control law proven in
@@ -322,17 +340,41 @@ def compute_baseline_action(env, kp: float) -> torch.Tensor:
     Returns actions_tensor of shape (num_envs, num_drones, 4) in [-1, 1], the same layout
     apply_controller expects.
     """
-    cfg = env.cfg.controller
-    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
-    all_quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)      # (D, E, 4)
-    desired = env._desired_pos_w.transpose(0, 1)  # (D, E, 3)
-    error_w = desired - all_positions
-    error_b = quat_apply_inverse(
-        all_quats.reshape(-1, 4), error_w.reshape(-1, 3)
-    ).reshape(env.num_drones, env.num_envs, 3)
-    vel_cmd_b = (kp * error_b / cfg.max_lin_vel_cmd).clamp(-1.0, 1.0)
+    vel_cmd_b = _compute_attraction_b(env, kp).clamp(-1.0, 1.0)
     baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
     baseline[:, :, :3] = vel_cmd_b
+    return baseline.transpose(0, 1)  # (E, D, 4)
+
+
+def compute_swarm_gravity_baseline_action(env, kp: float, repel_gain: float) -> torch.Tensor:
+    """Artificial-potential-field reference command for the swarm-gravity task (stage 8):
+    attraction toward the shared target (same law as compute_baseline_action) plus a
+    linear repulsion from the nearest neighbor when closer than swarm_cfg.min_safe_distance
+    (R_nh). Classical multi-robot swarm control law -- known to have local-minima failure
+    modes where attraction and repulsion cancel, which a residual-RL correction can learn
+    to escape without having to learn collision-avoidance from scratch.
+
+    Requires the sensing cache (ensure_cache_populated) for nearest-neighbor data.
+
+    Returns actions_tensor of shape (num_envs, num_drones, 4) in [-1, 1], the same layout
+    apply_controller expects.
+    """
+    from .sensing import ensure_cache_populated
+
+    ensure_cache_populated(env)
+
+    attract_b = _compute_attraction_b(env, kp)  # (D, E, 3), unclamped
+
+    neighbor_rel_pos_b = env._cached_neighbor_rel_pos_b  # (D, E, 3), self -> nearest neighbor
+    neighbor_dist = neighbor_rel_pos_b.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    r_nh = env.cfg.swarm_cfg.min_safe_distance
+    repel_mag = (r_nh - neighbor_dist).clamp(min=0.0) / r_nh  # (D, E, 1), in [0, 1]
+    repel_dir = -neighbor_rel_pos_b / neighbor_dist  # unit vector pointing away from the neighbor
+    repel_b = repel_dir * repel_mag * repel_gain
+
+    cmd_b = (attract_b + repel_b).clamp(-1.0, 1.0)
+    baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
+    baseline[:, :, :3] = cmd_b
     return baseline.transpose(0, 1)  # (E, D, 4)
 
 

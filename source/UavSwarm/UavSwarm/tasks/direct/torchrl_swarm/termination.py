@@ -96,6 +96,8 @@ def _check_goal_reached(env) -> torch.Tensor:
         return _check_individual_goals_reached(env)
     elif stage == 7:
         return _check_individual_goals_reached(env)
+    elif stage == 8:
+        return _check_swarm_gravity_reached(env)
     else:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
@@ -140,6 +142,27 @@ def _check_individual_goals_reached(env) -> torch.Tensor:
         goal_reached_per_env = goal_reached_per_env & agent_reached
 
     return goal_reached_per_env
+
+
+def _check_swarm_gravity_reached(env) -> torch.Tensor:
+    """Check stage-8 success: every agent inside the containment sphere around the
+    shared target (swarm hasn't scattered) AND the closest agent within R_gv of it
+    (swarm has actually arrived) -- see CurriculumCfg.get_containment_radius.
+
+    Returns:
+        Boolean tensor (num_envs,) - True if both conditions hold.
+    """
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    desired_transposed = env._desired_pos_w.transpose(0, 1)  # (D, E, 3)
+    distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (D, E)
+
+    containment_radius = env.cfg.curriculum.get_containment_radius(
+        env.num_drones, env.cfg.swarm_cfg.min_safe_distance
+    )
+    all_contained = (distances <= containment_radius).all(dim=0)
+    closest_arrived = distances.min(dim=0).values < env.cfg.curriculum.stage8_gravity_radius
+
+    return all_contained & closest_arrived
 
 
 def _check_waypoint_goals_reached(env) -> torch.Tensor:

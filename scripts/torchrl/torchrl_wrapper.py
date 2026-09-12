@@ -18,7 +18,7 @@ from torchrl.data import (
 import gymnasium as gym
 
 from isaaclab.envs import DirectMARLEnv
-from UavSwarm.tasks.direct.torchrl_swarm.controller import compute_baseline_action
+from UavSwarm.tasks.direct.torchrl_swarm.controller import compute_baseline_action, compute_swarm_gravity_baseline_action
 try:
     # Newer rsl_rl: normalization.py lives under networks/.
     from rsl_rl.networks.normalization import EmpiricalNormalization
@@ -52,21 +52,29 @@ class IsaacLabTorchRLWrapper(EnvBase):
         centralized_critic: bool = True,
         normalize_obs: bool = False,
         residual_rl: bool = False,
+        residual_baseline: str = "point",
         residual_kp: float = 2.0,
         residual_scale: float = 0.3,
+        residual_repel_gain: float = 0.5,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
 
-        # Residual RL: env receives baseline_P_controller(pos, desired_pos_w) +
-        # residual_scale * policy_action, not the raw policy action directly -- see
-        # controller.py::compute_baseline_action (same law proven in flight_test.py's
-        # --goto_target mode). The policy's own sampled action is left untouched in the
-        # tensordict (see _step) so ClipPPOLoss's log-prob ratio stays correct -- PPO's
-        # distribution is over the residual, not over the final env-facing action.
+        # Residual RL: env receives baseline(pos, desired_pos_w, ...) + residual_scale *
+        # policy_action, not the raw policy action directly -- see controller.py's
+        # compute_baseline_action ("point": same law proven in flight_test.py's
+        # --goto_target mode) or compute_swarm_gravity_baseline_action ("apf": adds
+        # inter-agent repulsion, for the swarm-gravity task). The policy's own sampled
+        # action is left untouched in the tensordict (see _step) so ClipPPOLoss's
+        # log-prob ratio stays correct -- PPO's distribution is over the residual, not
+        # over the final env-facing action.
+        if residual_baseline not in ("point", "apf"):
+            raise ValueError(f"residual_baseline must be 'point' or 'apf', got {residual_baseline!r}")
         self.residual_rl = residual_rl
+        self.residual_baseline = residual_baseline
         self.residual_kp = residual_kp
         self.residual_scale = residual_scale
+        self.residual_repel_gain = residual_repel_gain
 
         if not isinstance(self.unwrapped_env, DirectMARLEnv):
             raise TypeError(
@@ -272,7 +280,12 @@ class IsaacLabTorchRLWrapper(EnvBase):
         # actual sampled residual, not the env-facing combined action.
         env_actions = actions_stacked
         if self.residual_rl:
-            baseline = compute_baseline_action(self.unwrapped_env, self.residual_kp)
+            if self.residual_baseline == "apf":
+                baseline = compute_swarm_gravity_baseline_action(
+                    self.unwrapped_env, self.residual_kp, self.residual_repel_gain
+                )
+            else:
+                baseline = compute_baseline_action(self.unwrapped_env, self.residual_kp)
             env_actions = (baseline + self.residual_scale * actions_stacked).clamp(-1.0, 1.0)
 
         actions_dict = {}

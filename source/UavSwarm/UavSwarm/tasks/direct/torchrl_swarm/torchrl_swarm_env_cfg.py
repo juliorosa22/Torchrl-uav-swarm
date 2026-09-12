@@ -45,6 +45,7 @@ class CurriculumCfg:
     stage5_episode_length_s: float = 300.0
     stage6_episode_length_s: float = 180.0
     stage7_episode_length_s: float = 90.0
+    stage8_episode_length_s: float = 120.0
 
     # Stage 2 parameters
     stage2_goal_distance: float = 6.0
@@ -114,6 +115,33 @@ class CurriculumCfg:
     stage7_goal_distance: float = 6.0
     stage7_zdist_xy_plane: float = 1.0
 
+    # Stage 8 parameters (swarm-gravity: one shared target, no fixed formation shape --
+    # agents self-organize around it, attracted to the target and repelled from
+    # neighbors closer than swarm_cfg.min_safe_distance = R_nh).
+    stage8_spawn_height_range: tuple = (2.0, 4.0)
+    stage8_target_distance: float = 6.0
+    stage8_target_height_range: tuple = (1.5, 4.0)
+    # R_gv: the closest agent must be within this distance of the target to count as
+    # "arrived" -- with R_nh > 0 forcing separation, agents can't all sit on the target,
+    # so this measures the swarm's leading edge, not the whole swarm.
+    stage8_gravity_radius: float = 0.5
+    # Packing-efficiency factor for the containment-sphere radius (see
+    # CurriculumCfg.get_containment_radius): real swarms don't pack as tightly as
+    # hexagonal close-packing (~0.74); 0.6 is a reasonable loose-swarm default.
+    stage8_packing_density: float = 0.6
+
+    def get_containment_radius(self, num_drones: int, min_safe_distance: float) -> float:
+        """Sphere radius that must contain every agent for a stage-8 episode to count as
+        successful (see docstring on stage8_packing_density). Derived from the
+        equivalent-volume packing argument: N agents each need a non-overlapping ball of
+        radius R_nh/2 (two such balls don't overlap iff centers are >= R_nh apart), so the
+        containing sphere's volume must be >= N times that, inflated by 1/packing_density
+        for imperfect packing:
+            R_containment^3 = N * (R_nh/2)^3 / packing_density
+        """
+        r_nh_half = min_safe_distance / 2.0
+        return r_nh_half * (num_drones / self.stage8_packing_density) ** (1.0 / 3.0)
+
     def get_episode_length(self) -> float:
         """Return episode length based on active stage."""
         stage_lengths = {
@@ -124,9 +152,10 @@ class CurriculumCfg:
             5: self.stage5_episode_length_s,
             6: self.stage6_episode_length_s,
             7: self.stage7_episode_length_s,
+            8: self.stage8_episode_length_s,
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-7.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-8.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -329,3 +358,24 @@ class SingleGoalUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=7)
+
+
+@configclass
+class SwarmGravityUAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """Swarm-gravity task: one shared target position per env (not N per-agent slots) --
+    agents are attracted to it and repelled from neighbors closer than
+    swarm_cfg.min_safe_distance (R_nh), self-organizing into a cluster around the target
+    with no fixed formation shape. Success requires every agent within a containment
+    sphere (see CurriculumCfg.get_containment_radius) AND the closest agent within
+    stage8_gravity_radius (R_gv) of the target.
+
+    Uses curriculum stage 8 purely as an internal dispatch value, same pattern as
+    Formation's stage 6 / SingleGoal's stage 7.
+    """
+
+    include_rm_in_obs: bool = False
+    single_observation_space: int = 28
+    state_space: int = 140
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=8)
