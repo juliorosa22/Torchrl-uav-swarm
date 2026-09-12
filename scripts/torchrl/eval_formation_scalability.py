@@ -80,6 +80,23 @@ parser.add_argument(
          "mechanism as mappo_train.py's --video. Saved under --video_dir.",
 )
 parser.add_argument("--video_dir", type=str, default="videos/eval", help="Output directory for --video.")
+parser.add_argument(
+    "--waypoint_tour", action="store_true", default=False,
+    help="SwarmGravity(V2) only: instead of a single random target per episode, fly a "
+         "path of --num_waypoints points in sequence -- reaching a non-final waypoint "
+         "advances env._desired_pos_w in place (see termination.py's waypoint-tour "
+         "branch) rather than ending the episode, so the swarm keeps flying with no "
+         "reset between them. Arrival at the last waypoint ends the episode normally.",
+)
+parser.add_argument("--num_waypoints", type=int, default=5, help="--waypoint_tour: number of points on the path.")
+parser.add_argument(
+    "--waypoint_radius", type=float, default=4.0,
+    help="--waypoint_tour: radius (m) of the horizontal loop the waypoints sit on.",
+)
+parser.add_argument(
+    "--waypoint_height", type=float, default=3.0,
+    help="--waypoint_tour: fixed altitude (m) of every waypoint.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -95,6 +112,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import csv
+import math
 import os
 
 import gymnasium as gym
@@ -141,6 +159,21 @@ def make_policy(obs_dim: int, action_dim: int, config: dict, device: torch.devic
         return_log_prob=True,
         log_prob_key=("agents", "sample_log_prob"),
     )
+
+
+def _generate_waypoint_loop(
+    center_xy: torch.Tensor, num_waypoints: int, radius: float, height: float, device: str,
+) -> torch.Tensor:
+    """Points evenly spaced around a horizontal circle at a fixed altitude -- a simple,
+    visually clean path for --waypoint_tour rather than disconnected random jumps.
+
+    Returns (num_waypoints, 3).
+    """
+    angles = torch.linspace(0, 2 * math.pi, num_waypoints + 1, device=device)[:-1]
+    x = center_xy[0] + radius * torch.cos(angles)
+    y = center_xy[1] + radius * torch.sin(angles)
+    z = torch.full_like(x, height)
+    return torch.stack([x, y, z], dim=-1)
 
 
 def _compute_camera_pose(spawn_centroid: torch.Tensor, target: torch.Tensor) -> tuple[list, list]:
@@ -277,6 +310,27 @@ def main():
         # (num_envs, num_agents, 3)
         return torch.stack([rob.data.root_pos_w for rob in unwrapped._robots], dim=1)
 
+    def _init_waypoint_tour():
+        # A non-goal termination (collision/out-of-bounds/timeout) mid-tour triggers a
+        # normal full env reset -- fresh random spawn AND a fresh random target from
+        # set_swarm_gravity_positions, unrelated to the waypoint list. Re-generating the
+        # tour around wherever the swarm just respawned (called again from the loop
+        # whenever that's detected) keeps a long recording touring instead of silently
+        # falling back to single-random-target behavior for the rest of the run.
+        spawn_centroid = _all_positions()[0].mean(dim=0)
+        unwrapped._waypoint_list = _generate_waypoint_loop(
+            spawn_centroid[:2], args_cli.num_waypoints, args_cli.waypoint_radius,
+            args_cli.waypoint_height, str(device),
+        )
+        unwrapped._waypoint_idx = torch.zeros(num_envs, dtype=torch.long, device=device)
+        unwrapped._desired_pos_w[:] = unwrapped._waypoint_list[0].expand(num_envs, num_agents, 3)
+
+    prev_waypoint_idx = 0
+    if args_cli.waypoint_tour:
+        _init_waypoint_tour()
+        print(f"[INFO] Waypoint tour: {args_cli.num_waypoints} points, "
+              f"radius={args_cli.waypoint_radius}m, height={args_cli.waypoint_height}m\n")
+
     prev_target = unwrapped._desired_pos_w[0, 0].clone()
     if args_cli.video:
         eye, lookat = _compute_camera_pose(_all_positions()[0].mean(dim=0), prev_target)
@@ -307,11 +361,32 @@ def main():
             path_length += torch.linalg.norm(cur_pos - prev_pos, dim=2) * active.unsqueeze(1).float()
             prev_pos = cur_pos.clone()
 
+            if args_cli.waypoint_tour:
+                cur_wp_idx = unwrapped._waypoint_idx[0].item()
+                cur_target_check = unwrapped._desired_pos_w[0, 0]
+                target_jumped = torch.linalg.norm(cur_target_check - prev_target) > 0.5
+                if target_jumped and cur_wp_idx == prev_waypoint_idx:
+                    # Target changed but the tour's own index didn't -- termination.py's
+                    # waypoint-advance branch didn't cause this, so it must be a
+                    # non-goal termination (collision/out-of-bounds/timeout) that
+                    # triggered a normal full env reset mid-tour (env._waypoint_idx is
+                    # untouched by set_swarm_gravity_positions, which is what actually
+                    # wrote this new target). Restart the tour around the fresh spawn
+                    # instead of silently reverting to plain single-random-target
+                    # behavior for the rest of the recording. (episode_length_buf can't
+                    # be used as the reset signal here -- this project's own
+                    # _reset_idx deliberately randomizes it on every reset whenever
+                    # len(env_ids)==num_envs, which is always true at num_envs=1.)
+                    _init_waypoint_tour()
+                prev_waypoint_idx = unwrapped._waypoint_idx[0].item()
+
             if args_cli.video:
-                # DirectMARLEnv auto-resets a terminated env on the very next step() call
-                # -- detect that (env 0's target jumped) and re-center the camera on the
-                # new episode's own spawn/target, so a long multi-episode recording stays
-                # well-framed throughout instead of only for episode 1.
+                # Re-center whenever env 0's target changes -- either a full episode
+                # reset (DirectMARLEnv auto-resets on the very next step() call after
+                # termination) or, in --waypoint_tour mode, termination.py advancing
+                # _desired_pos_w to the next waypoint in place. Same detection, same fix
+                # either way: recompute framing from the swarm's current position and
+                # wherever it's headed next.
                 cur_target = unwrapped._desired_pos_w[0, 0]
                 if torch.linalg.norm(cur_target - prev_target) > 0.5:
                     eye, lookat = _compute_camera_pose(cur_pos[0].mean(dim=0), cur_target)

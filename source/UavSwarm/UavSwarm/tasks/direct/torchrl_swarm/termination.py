@@ -54,6 +54,20 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     # Goal reached termination (curriculum-aware)
     goal_reached = _check_goal_reached(env)
 
+    # Waypoint-tour mode (eval-only, opt-in via env._waypoint_list -- see
+    # eval_formation_scalability.py's --waypoint_tour): reaching a non-final waypoint
+    # advances _desired_pos_w to the next one in place instead of terminating, so the
+    # swarm keeps flying (no reset, no velocity/position wipe) through the whole path.
+    # Only arrival at the LAST waypoint counts as real termination.
+    if hasattr(env, "_waypoint_list"):
+        is_last_waypoint = env._waypoint_idx >= (env._waypoint_list.shape[0] - 1)
+        advancing = goal_reached & ~is_last_waypoint
+        if advancing.any():
+            env._waypoint_idx[advancing] += 1
+            next_targets = env._waypoint_list[env._waypoint_idx[advancing]]  # (n_advancing, 3)
+            env._desired_pos_w[advancing] = next_targets.unsqueeze(1).expand(-1, env.num_drones, -1)
+        goal_reached = goal_reached & is_last_waypoint
+
     # Inter-agent collision (stage 8/9 only -- see docstring point 5)
     died_agent_collision = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     if env.curriculum_stage in (8, 9):
