@@ -41,15 +41,6 @@ class EpisodeMetrics:
               metrics above, since "average of the closest approach" would hide a single
               dangerous moment). Meant for validating collision-avoidance margins ahead of
               real-hardware deployment, not just training-time reward shaping.
-
-        Packing metric (stage 8):
-            - pack_fraction: fraction of the episode each agent spent inside the
-              containment sphere (the per-step condition behind K_PACK_BONUS in
-              get_swarm_gravity_rewards) -- distinguishes "settled into the pack" from
-              "reached goal_reached at the last instant". Spacing is tracked separately
-              via min_neighbor_distance/agent_collision, not folded into this condition
-              -- an earlier version gated the bonus on both simultaneously and measured
-              it never firing, since R_containment is barely larger than R_nh itself.
     """
     # Basic metrics
     lin_vel: torch.Tensor
@@ -68,7 +59,6 @@ class EpisodeMetrics:
     swarm_cohesion: torch.Tensor = None
     agent_collision: torch.Tensor = None
     min_neighbor_distance: torch.Tensor = None
-    pack_fraction: torch.Tensor = None
 
     @classmethod
     def create(cls, num_envs: int, device: str) -> "EpisodeMetrics":
@@ -94,7 +84,6 @@ class EpisodeMetrics:
             swarm_cohesion=torch.zeros(num_envs, dtype=torch.float, device=device),
             agent_collision=torch.zeros(num_envs, dtype=torch.float, device=device),
             min_neighbor_distance=torch.full((num_envs,), float("inf"), dtype=torch.float, device=device),
-            pack_fraction=torch.zeros(num_envs, dtype=torch.float, device=device),
         )
 
     def reset(self, env_ids: torch.Tensor) -> None:
@@ -119,8 +108,6 @@ class EpisodeMetrics:
             self.agent_collision[env_ids] = 0.0
         if self.min_neighbor_distance is not None:
             self.min_neighbor_distance[env_ids] = float("inf")
-        if self.pack_fraction is not None:
-            self.pack_fraction[env_ids] = 0.0
 
     def to_log_dict(
         self,
@@ -196,11 +183,6 @@ class EpisodeMetrics:
             if finite.numel() > 0:
                 log_dict[f"{prefix}/min_neighbor_distance"] = finite.mean().item()
 
-        if self.pack_fraction is not None:
-            log_dict[f"{prefix}/pack_fraction"] = (
-                torch.mean(self.pack_fraction[env_ids]) / max_episode_length
-            ).item()
-
         return log_dict
 
     def update(
@@ -217,7 +199,6 @@ class EpisodeMetrics:
         swarm_cohesion: torch.Tensor = None,
         agent_collision: torch.Tensor = None,
         min_neighbor_distance: torch.Tensor = None,
-        pack_fraction: torch.Tensor = None,
     ) -> None:
         """Accumulate metrics (in-place addition).
 
@@ -250,8 +231,6 @@ class EpisodeMetrics:
         if min_neighbor_distance is not None and self.min_neighbor_distance is not None:
             # True running minimum, not accumulation -- see class docstring.
             self.min_neighbor_distance = torch.minimum(self.min_neighbor_distance, min_neighbor_distance)
-        if pack_fraction is not None and self.pack_fraction is not None:
-            self.pack_fraction += pack_fraction
 
     def get_mean(self, metric_name: str, env_ids: torch.Tensor = None) -> float:
         """Get mean value of a specific metric.

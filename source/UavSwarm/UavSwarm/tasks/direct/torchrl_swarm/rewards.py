@@ -55,15 +55,6 @@ ANG_VEL_PENALTY_SCALE = 0.0025
 # this one only penalizes violating min_safe_distance while converging to an assigned slot).
 K_FORM_SAFETY = 5.0
 
-# Swarm-gravity task (stage 8): per-agent dense bonus for holding a valid packed
-# position -- inside the containment sphere AND respecting R_nh from its nearest
-# neighbor, simultaneously. Without this, `attraction` (-distance, no saturation) gives
-# an "arrived" agent the same kind of signal as one still approaching, so nothing in the
-# reward distinguishes settling into the pack from merely passing through it. Sized to
-# be comparable to `attraction` near the containment boundary (~R_containment in
-# magnitude) so holding is clearly preferable to continuing to wander.
-K_PACK_BONUS = 2.0
-
 # Logging-only near-collision threshold (~2x a Crazyflie's rotor-to-rotor span, ~0.15m):
 # distinct from min_safe_distance (1.0m), which is a soft reward-shaping target, not a
 # physically-motivated contact threshold. Does not affect termination or the reward --
@@ -444,21 +435,7 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     safety_violation = torch.clamp(min_safe - neighbor_dists, min=0.0)
     safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
 
-    # Per-agent packing bonus: dense every step (not just at episode-terminating
-    # success), rewarding containment alone -- kept individual (a shared/env-broadcast
-    # bonus would reintroduce the team-averaged-reward credit-assignment dilution
-    # already fixed once this session, see [[formation-convergence-investigation]]).
-    # Deliberately NOT also gated on `neighbor_dists >= min_safe`: R_containment is only
-    # barely larger than R_nh itself (both ~2.0m by default), so requiring full R_nh
-    # spacing from every agent AND full containment simultaneously is right at the
-    # geometric packing limit and was measured to never actually fire in practice
-    # (Episode_Reward/pack_fraction was exactly 0.0 for an entire 200k-frame run) --
-    # spacing is already handled continuously and independently by safety_penalty above.
-    containment_radius = env.cfg.curriculum.get_containment_radius(env.num_drones, min_safe)
-    is_contained = distances <= containment_radius
-    packing_bonus = K_PACK_BONUS * is_contained.float()
-
-    per_drone_reward = attraction + safety_penalty + packing_bonus
+    per_drone_reward = attraction + safety_penalty
     # Guard against NaN/Inf from a diverged drone (tumbling after a hard collision --
     # same failure this task's collision termination is meant to catch before physics
     # actually blows up, but the reward is computed the same step). Not just cosmetic:
@@ -480,7 +457,6 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
         formation=distances.mean(dim=0),
         agent_collision=agent_collision,
         min_neighbor_distance=min_neighbor_distance_step,
-        pack_fraction=is_contained.float().mean(dim=0),
     )
 
     return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}
