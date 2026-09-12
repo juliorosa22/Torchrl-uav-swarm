@@ -436,6 +436,12 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
 
     per_drone_reward = attraction + safety_penalty
+    # Guard against NaN/Inf from a diverged drone (tumbling after a hard collision --
+    # same failure this task's collision termination is meant to catch before physics
+    # actually blows up, but the reward is computed the same step). Not just cosmetic:
+    # left unguarded, one NaN here permanently poisons the trainer's running
+    # reward-normalizer stats (see mappo_torchl._normalize_rewards_inplace).
+    per_drone_reward = torch.nan_to_num(per_drone_reward, nan=0.0, posinf=0.0, neginf=-1.0)
     mean_reward = per_drone_reward.mean(dim=0)  # logging only
 
     # True inter-agent collision (0.15m, distinct from R_nh's larger soft-avoidance

@@ -493,6 +493,10 @@ class MAPPO:
             r_t = rewards[:, t, :, 0]  # (num_envs, n_agents)
             d_t = dones[:, t]  # (num_envs, 1), broadcasts over n_agents
             self.returns = self.returns * self.gamma * (1.0 - d_t) + r_t
+            # NaN*0 is still NaN (IEEE754), so a single bad reward would otherwise poison
+            # this env's running return forever, even across the done-reset above -- and
+            # from there the shared reward_rms permanently, since it never resets itself.
+            self.returns = torch.nan_to_num(self.returns, nan=0.0, posinf=0.0, neginf=0.0)
             self.reward_rms.update(self.returns.reshape(-1))
             std = torch.sqrt(self.reward_rms.var + 1e-8)
             normed[:, t, :, 0] = r_t / std
