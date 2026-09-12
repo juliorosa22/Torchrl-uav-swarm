@@ -70,6 +70,22 @@ parser.add_argument(
     help="residual_rl: 'point' = plain P-controller toward desired_pos_w; 'apf' = adds "
          "inter-agent repulsion for the swarm-gravity task (SwarmGravity-TorchRL-UAVSwarm-Direct-v0).",
 )
+parser.add_argument(
+    "--min_safe_distance", type=float, default=None,
+    help="Overrides swarm_cfg.min_safe_distance (R_nh) -- the soft inter-agent avoidance "
+         "radius used by the swarm-gravity reward/APF baseline and stage 8's derived "
+         "containment radius. Default (config): 1.0m.",
+)
+parser.add_argument(
+    "--gravity_radius", type=float, default=None,
+    help="Overrides curriculum.stage8_gravity_radius (R_gv) -- how close the nearest "
+         "agent must get to the shared target to count as arrived. Default (config): 0.5m.",
+)
+parser.add_argument(
+    "--packing_density", type=float, default=None,
+    help="Overrides curriculum.stage8_packing_density used by the derived containment-"
+         "sphere radius. Default (config): 0.6.",
+)
 parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline attraction gain.")
 parser.add_argument("--residual_scale", type=float, default=0.3, help="residual_rl: policy correction weight.")
 parser.add_argument("--residual_repel_gain", type=float, default=0.5, help="residual_rl: apf baseline's repulsion strength.")
@@ -179,6 +195,12 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.curriculum.stage6_simple_reward = True
     if args_cli.entropy_coef is not None:
         config["algorithm"]["entropy_coef"] = args_cli.entropy_coef
+    if args_cli.min_safe_distance is not None:
+        env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
+    if args_cli.gravity_radius is not None:
+        env_cfg.curriculum.stage8_gravity_radius = args_cli.gravity_radius
+    if args_cli.packing_density is not None:
+        env_cfg.curriculum.stage8_packing_density = args_cli.packing_density
     if args_cli.num_agents is not None and args_cli.num_agents != env_cfg.num_agents:
         n = args_cli.num_agents
         env_cfg.num_agents = n
@@ -216,6 +238,11 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"  Agents:     {env_cfg.num_agents}")
     if env_cfg.curriculum.active_stage == 6:
         print(f"  Reward:     {'simple (pose-distance only)' if env_cfg.curriculum.stage6_simple_reward else 'full formation'}")
+    if env_cfg.curriculum.active_stage == 8:
+        r_nh = env_cfg.swarm_cfg.min_safe_distance
+        r_gv = env_cfg.curriculum.stage8_gravity_radius
+        r_containment = env_cfg.curriculum.get_containment_radius(env_cfg.num_agents, r_nh)
+        print(f"  R_nh:       {r_nh} m   R_gv: {r_gv} m   R_containment (derived): {r_containment:.3f} m")
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
