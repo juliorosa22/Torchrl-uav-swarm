@@ -86,6 +86,15 @@ parser.add_argument(
     help="Overrides curriculum.stage8_packing_density used by the derived containment-"
          "sphere radius. Default (config): 0.6.",
 )
+parser.add_argument(
+    "--frames_per_batch", type=int, default=None,
+    help="Overrides algorithm.frames_per_batch. Rollout length per env, T = "
+         "frames_per_batch/num_envs, is what actually matters for GAE bootstrapping -- "
+         "the remote profile's default (32768/256=128) is 4x shorter than local's "
+         "(8192/16=512), a live suspect for the 256-env regression (see "
+         "formation-convergence-investigation memory). E.g. 131072 preserves T=512 at "
+         "num_envs=256.",
+)
 parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline attraction gain.")
 parser.add_argument("--residual_scale", type=float, default=0.3, help="residual_rl: policy correction weight.")
 parser.add_argument("--residual_repel_gain", type=float, default=0.5, help="residual_rl: apf baseline's repulsion strength.")
@@ -195,6 +204,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.curriculum.stage6_simple_reward = True
     if args_cli.entropy_coef is not None:
         config["algorithm"]["entropy_coef"] = args_cli.entropy_coef
+    if args_cli.frames_per_batch is not None:
+        config["algorithm"]["frames_per_batch"] = args_cli.frames_per_batch
     if args_cli.min_safe_distance is not None:
         env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
     if args_cli.gravity_radius is not None:
@@ -251,6 +262,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"  Device:     {device}")
     print(f"  Seed:       {config['seed']}")
     print(f"  Envs:       {env_cfg.scene.num_envs}")
+    fpb = config["algorithm"]["frames_per_batch"]
+    print(f"  Frames/batch: {fpb}   T (rollout len) = {fpb / env_cfg.scene.num_envs:.0f}")
     print(f"  Log:        {log_dir}")
     print(f"{'='*80}\n")
 
