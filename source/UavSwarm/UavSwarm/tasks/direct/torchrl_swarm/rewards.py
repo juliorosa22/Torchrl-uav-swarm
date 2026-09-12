@@ -445,14 +445,18 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
 
     # Per-agent packing bonus: dense every step (not just at episode-terminating
-    # success), mirroring _check_swarm_gravity_reached's env-level condition but kept
-    # individual -- see [[formation-convergence-investigation]] on team-averaged reward
-    # being a real, previously-fixed credit-assignment bug; a shared/env-broadcast bonus
-    # here would reintroduce the same dilution.
+    # success), rewarding containment alone -- kept individual (a shared/env-broadcast
+    # bonus would reintroduce the team-averaged-reward credit-assignment dilution
+    # already fixed once this session, see [[formation-convergence-investigation]]).
+    # Deliberately NOT also gated on `neighbor_dists >= min_safe`: R_containment is only
+    # barely larger than R_nh itself (both ~2.0m by default), so requiring full R_nh
+    # spacing from every agent AND full containment simultaneously is right at the
+    # geometric packing limit and was measured to never actually fire in practice
+    # (Episode_Reward/pack_fraction was exactly 0.0 for an entire 200k-frame run) --
+    # spacing is already handled continuously and independently by safety_penalty above.
     containment_radius = env.cfg.curriculum.get_containment_radius(env.num_drones, min_safe)
     is_contained = distances <= containment_radius
-    is_well_spaced = neighbor_dists >= min_safe
-    packing_bonus = K_PACK_BONUS * (is_contained & is_well_spaced).float()
+    packing_bonus = K_PACK_BONUS * is_contained.float()
 
     per_drone_reward = attraction + safety_penalty + packing_bonus
     # Guard against NaN/Inf from a diverged drone (tumbling after a hard collision --
@@ -476,7 +480,7 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
         formation=distances.mean(dim=0),
         agent_collision=agent_collision,
         min_neighbor_distance=min_neighbor_distance_step,
-        pack_fraction=(is_contained & is_well_spaced).float().mean(dim=0),
+        pack_fraction=is_contained.float().mean(dim=0),
     )
 
     return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}

@@ -43,11 +43,13 @@ class EpisodeMetrics:
               real-hardware deployment, not just training-time reward shaping.
 
         Packing metric (stage 8):
-            - pack_fraction: fraction of the episode each agent spent simultaneously
-              inside the containment sphere AND respecting min_safe_distance from its
-              nearest neighbor (the per-step condition behind K_PACK_BONUS in
+            - pack_fraction: fraction of the episode each agent spent inside the
+              containment sphere (the per-step condition behind K_PACK_BONUS in
               get_swarm_gravity_rewards) -- distinguishes "settled into the pack" from
-              "reached goal_reached at the last instant".
+              "reached goal_reached at the last instant". Spacing is tracked separately
+              via min_neighbor_distance/agent_collision, not folded into this condition
+              -- an earlier version gated the bonus on both simultaneously and measured
+              it never firing, since R_containment is barely larger than R_nh itself.
     """
     # Basic metrics
     lin_vel: torch.Tensor
