@@ -73,8 +73,18 @@ parser.add_argument(
          "checkpoint was trained with for the APF baseline/containment radius to match.",
 )
 parser.add_argument("--gravity_radius", type=float, default=None, help="Overrides curriculum.stage8_gravity_radius (R_gv).")
+parser.add_argument(
+    "--video", action="store_true", default=False,
+    help="Record a single continuous video of the whole eval run (step 0 through "
+         "--num_steps) via Isaac Sim's built-in camera + gym.wrappers.RecordVideo, same "
+         "mechanism as mappo_train.py's --video. Saved under --video_dir.",
+)
+parser.add_argument("--video_dir", type=str, default="videos/eval", help="Output directory for --video.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+if args_cli.video:
+    args_cli.enable_cameras = True
 
 import sys  # noqa: E402
 
@@ -174,6 +184,14 @@ def main():
         env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
     if args_cli.gravity_radius is not None:
         env_cfg.curriculum.stage8_gravity_radius = args_cli.gravity_radius
+    if args_cli.video:
+        # Framed for --seed 0's specific spawn/target positions (spawn centroid ~
+        # (-0.5,-0.85,4.0), target ~(1.82,-4.53,3.07)) -- a one-off shot for this
+        # recording, not a general-purpose camera. Elevated 3/4 view from the side of
+        # the spawn->target line, close enough that the (small, 9cm) Crazyflies are
+        # actually visible rather than distant specks.
+        env_cfg.viewer.eye = (5.7, 0.5, 6.5)
+        env_cfg.viewer.lookat = (0.7, -2.7, 3.5)
 
     print(f"\n{'='*80}")
     print("  Formation Scalability Eval — zero-shot swarm-size generalization")
@@ -185,9 +203,24 @@ def main():
     print(f"  Steps:      {args_cli.num_steps}")
     print(f"{'='*80}\n")
 
-    base_env = gym.make(args_cli.task, cfg=env_cfg)
+    base_env = gym.make(
+        args_cli.task, cfg=env_cfg,
+        render_mode="rgb_array" if args_cli.video else None,
+    )
     if not isinstance(base_env.unwrapped, DirectMARLEnv):
         raise TypeError(f"Expected DirectMARLEnv, got {type(base_env.unwrapped)}")
+
+    if args_cli.video:
+        # step_trigger=lambda s: s == 0 records exactly one clip, starting at step 0,
+        # running video_length steps -- the whole eval run, not periodic re-triggering
+        # (mappo_train.py's --video_interval re-triggers every N steps during long
+        # training; here we just want one continuous take of the swarm converging).
+        base_env = gym.wrappers.RecordVideo(
+            base_env, args_cli.video_dir,
+            step_trigger=lambda s: s == 0,
+            video_length=args_cli.num_steps,
+            disable_logger=True,
+        )
 
     ckpt = torch.load(args_cli.checkpoint, map_location=device, weights_only=True)
     normalize_obs = "obs_rms" in ckpt
@@ -211,6 +244,9 @@ def main():
     policy.eval()
 
     tensordict = env.reset()
+    if args_cli.video:
+        print(f"[DEBUG] spawn positions:\n{torch.stack([rob.data.root_pos_w for rob in unwrapped._robots], dim=1)}")
+        print(f"[DEBUG] target position: {unwrapped._desired_pos_w[0, 0]}")
 
     def _all_positions() -> torch.Tensor:
         # (num_envs, num_agents, 3)
