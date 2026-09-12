@@ -87,6 +87,15 @@ parser.add_argument(
          "sphere radius. Default (config): 0.6.",
 )
 parser.add_argument(
+    "--stage8_episode_length", type=float, default=None,
+    help="Overrides curriculum.stage8_episode_length_s (default 120.0). The containment "
+         "condition (all agents inside R_containment, closest within R_gv) requires the "
+         "whole swarm to settle into a tight near-packing-limit arrangement, not just "
+         "approach a point -- time_out was 12.6%% of episodes in the R_nh=2.0/200k-frame "
+         "run's last third, second only to goal_reached itself, suggesting some episodes "
+         "are still settling when the clock runs out.",
+)
+parser.add_argument(
     "--frames_per_batch", type=int, default=None,
     help="Overrides algorithm.frames_per_batch. Rollout length per env, T = "
          "frames_per_batch/num_envs, is what actually matters for GAE bootstrapping -- "
@@ -210,6 +219,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
     if args_cli.gravity_radius is not None:
         env_cfg.curriculum.stage8_gravity_radius = args_cli.gravity_radius
+    if args_cli.stage8_episode_length is not None:
+        env_cfg.curriculum.stage8_episode_length_s = args_cli.stage8_episode_length
     if args_cli.packing_density is not None:
         env_cfg.curriculum.stage8_packing_density = args_cli.packing_density
     if args_cli.num_agents is not None and args_cli.num_agents != env_cfg.num_agents:
@@ -254,6 +265,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         r_gv = env_cfg.curriculum.stage8_gravity_radius
         r_containment = env_cfg.curriculum.get_containment_radius(env_cfg.num_agents, r_nh)
         print(f"  R_nh:       {r_nh} m   R_gv: {r_gv} m   R_containment (derived): {r_containment:.3f} m")
+        print(f"  Episode length: {env_cfg.curriculum.stage8_episode_length_s} s")
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
