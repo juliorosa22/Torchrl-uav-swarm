@@ -143,6 +143,32 @@ def make_policy(obs_dim: int, action_dim: int, config: dict, device: torch.devic
     )
 
 
+def _compute_camera_pose(spawn_centroid: torch.Tensor, target: torch.Tensor) -> tuple[list, list]:
+    """Elevated 3/4 view of the spawn->target line, close enough that the (9cm)
+    Crazyflies are actually visible rather than distant specks, framed automatically
+    from the actual episode geometry instead of hand-tuned per --seed.
+
+    eye = midpoint + (perpendicular horizontal offset) + (elevation), lookat = midpoint.
+    Offset/elevation scale with the spawn-target distance so framing stays reasonable
+    whether that episode's target landed close or far.
+    """
+    midpoint = (spawn_centroid + target) / 2
+    diff = (target - spawn_centroid)[:2]
+    dist = diff.norm().clamp(min=1e-3)
+    perp = torch.stack([-diff[1], diff[0]]) / dist  # unit horizontal perpendicular
+    # Floors sized so the containment sphere (~2m radius / 4m diameter) reads as a
+    # clearly-visible but non-dominating landmark rather than filling the frame --
+    # confirmed by extracting preview frames at the original (6.0, 3.0) floors, which
+    # made a 4m-diameter sphere occupy most of the frame from that distance.
+    offset = max(14.0, 1.3 * dist.item())
+    elevation = max(7.0, 0.6 * dist.item())
+    eye = midpoint.clone()
+    eye[0] += perp[0] * offset
+    eye[1] += perp[1] * offset
+    eye[2] += elevation
+    return eye.tolist(), midpoint.tolist()
+
+
 def build_eval_cfg(task: str, num_agents: int, num_envs: int, device: str, controller_type: str, stage: int | None):
     """Load the task's own registered cfg class (not hardcoded to Formation -- a checkpoint
     trained on FullTask-TorchRL-UAVSwarm-Direct-v0 has a different single_observation_space
@@ -185,13 +211,15 @@ def main():
     if args_cli.gravity_radius is not None:
         env_cfg.curriculum.stage8_gravity_radius = args_cli.gravity_radius
     if args_cli.video:
-        # Framed for --seed 0's specific spawn/target positions (spawn centroid ~
-        # (-0.5,-0.85,4.0), target ~(1.82,-4.53,3.07)) -- a one-off shot for this
-        # recording, not a general-purpose camera. Elevated 3/4 view from the side of
-        # the spawn->target line, close enough that the (small, 9cm) Crazyflies are
-        # actually visible rather than distant specks.
-        env_cfg.viewer.eye = (5.7, 0.5, 6.5)
-        env_cfg.viewer.lookat = (0.7, -2.7, 3.5)
+        # env_cfg.viewer.eye/lookat get their real values right after reset, via
+        # unwrapped.sim.set_camera_view -- confirmed that call (not just the pre-
+        # construction cfg) actually repositions the offscreen RecordVideo camera, by
+        # extracting preview frames. enable_translucency is needed for the containment-
+        # sphere marker's opacity to actually alpha-blend in the RTX capture -- off by
+        # default (PreviewSurfaceCfg.opacity's own docstring: "only affects appearance
+        # during interactive rendering" -- confirmed empirically, sphere rendered fully
+        # solid without this).
+        env_cfg.sim.render.enable_translucency = True
 
     print(f"\n{'='*80}")
     print("  Formation Scalability Eval — zero-shot swarm-size generalization")
@@ -244,13 +272,15 @@ def main():
     policy.eval()
 
     tensordict = env.reset()
-    if args_cli.video:
-        print(f"[DEBUG] spawn positions:\n{torch.stack([rob.data.root_pos_w for rob in unwrapped._robots], dim=1)}")
-        print(f"[DEBUG] target position: {unwrapped._desired_pos_w[0, 0]}")
 
     def _all_positions() -> torch.Tensor:
         # (num_envs, num_agents, 3)
         return torch.stack([rob.data.root_pos_w for rob in unwrapped._robots], dim=1)
+
+    prev_target = unwrapped._desired_pos_w[0, 0].clone()
+    if args_cli.video:
+        eye, lookat = _compute_camera_pose(_all_positions()[0].mean(dim=0), prev_target)
+        unwrapped.sim.set_camera_view(eye, lookat)
 
     def _dist_to_assigned_slot() -> torch.Tensor:
         # (num_envs, num_agents)
@@ -276,6 +306,17 @@ def main():
             active = ~finished
             path_length += torch.linalg.norm(cur_pos - prev_pos, dim=2) * active.unsqueeze(1).float()
             prev_pos = cur_pos.clone()
+
+            if args_cli.video:
+                # DirectMARLEnv auto-resets a terminated env on the very next step() call
+                # -- detect that (env 0's target jumped) and re-center the camera on the
+                # new episode's own spawn/target, so a long multi-episode recording stays
+                # well-framed throughout instead of only for episode 1.
+                cur_target = unwrapped._desired_pos_w[0, 0]
+                if torch.linalg.norm(cur_target - prev_target) > 0.5:
+                    eye, lookat = _compute_camera_pose(cur_pos[0].mean(dim=0), cur_target)
+                    unwrapped.sim.set_camera_view(eye, lookat)
+                prev_target = cur_target.clone()
 
             if hasattr(unwrapped, "_termination_reasons"):
                 newly_collided = unwrapped._termination_reasons["collision"] & active
