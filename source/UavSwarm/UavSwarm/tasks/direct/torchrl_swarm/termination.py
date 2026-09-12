@@ -54,9 +54,9 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     # Goal reached termination (curriculum-aware)
     goal_reached = _check_goal_reached(env)
 
-    # Inter-agent collision (stage 8 only -- see docstring point 5)
+    # Inter-agent collision (stage 8/9 only -- see docstring point 5)
     died_agent_collision = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if env.curriculum_stage == 8:
+    if env.curriculum_stage in (8, 9):
         from .sensing import ensure_cache_populated
 
         ensure_cache_populated(env)
@@ -114,7 +114,7 @@ def _check_goal_reached(env) -> torch.Tensor:
         return _check_individual_goals_reached(env)
     elif stage == 7:
         return _check_individual_goals_reached(env)
-    elif stage == 8:
+    elif stage in (8, 9):
         return _check_swarm_gravity_reached(env)
     else:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)

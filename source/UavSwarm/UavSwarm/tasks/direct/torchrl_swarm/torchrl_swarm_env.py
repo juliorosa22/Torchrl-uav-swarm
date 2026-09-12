@@ -20,6 +20,7 @@ from .torchrl_swarm_env_cfg import (
     FormationUAVSwarmEnvCfg,
     SingleGoalUAVSwarmEnvCfg,
     SwarmGravityUAVSwarmEnvCfg,
+    SwarmGravityV2UAVSwarmEnvCfg,
 )
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
@@ -331,7 +332,7 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_formation_positions(self, env_ids, env_origins)
         elif stage == 7:
             set_singlegoal_positions(self, env_ids, env_origins)
-        elif stage == 8:
+        elif stage in (8, 9):
             set_swarm_gravity_positions(self, env_ids, env_origins)
 
     # ------------------------------------------------------------------
@@ -412,7 +413,18 @@ class BaseSwarmEnv(DirectMARLEnv):
         )
 
         all_obs = all_obs.transpose(0, 1)  # (num_envs, num_drones, obs_dim)
-        return all_obs.reshape(self.num_envs, -1)
+        state = all_obs.reshape(self.num_envs, -1)
+
+        if self.cfg.include_distance_matrix_in_state:
+            # Privileged info only the centralized critic sees: true world-frame
+            # pairwise distance between every pair of agents (symmetric, zero diagonal)
+            # -- meant for mappo_torchl.GraphAttentionCritic's attention bias, but just
+            # extra flat input dims to any other critic.
+            diff = all_positions.unsqueeze(1) - all_positions.unsqueeze(0)  # (D, D, E, 3)
+            dist_matrix = diff.norm(dim=-1).permute(2, 0, 1)  # (E, D, D)
+            state = torch.cat([state, dist_matrix.reshape(self.num_envs, -1)], dim=-1)
+
+        return state
 
     # ------------------------------------------------------------------
     # Rewards and termination (delegated to module functions)
@@ -425,7 +437,7 @@ class BaseSwarmEnv(DirectMARLEnv):
             return get_formation_rewards(self)
         if self.curriculum_stage == 7:
             return get_formation_rewards_simple(self)
-        if self.curriculum_stage == 8:
+        if self.curriculum_stage in (8, 9):
             return get_swarm_gravity_rewards(self)
         return get_rewards(self)
 
@@ -466,20 +478,25 @@ def _build_obs_tensor(
     ).float()  # (num_drones, num_envs, 4)
 
     components = [
-        all_lin_vels,                                # 3   [0:3]
-        all_ang_vels,                                # 3   [3:6]
-        all_gravities,                               # 3   [6:9]
-        desired_pos_b,                               # 3   [9:12]
-        env._cached_obstacle_dists.unsqueeze(-1),    # 1   [12]
-        env._cached_obstacle_dir_b,                  # 3   [13:16]
-        env._cached_neighbor_rel_pos_b,              # 3   [16:19]
-        env._cached_neighbor_rel_vel_b,              # 3   [19:22]
-        env._cached_mean_neighbor_pos_b,             # 3   [22:25]
-        env._cached_mean_neighbor_vel_b,             # 3   [25:28]
+        all_lin_vels,                                # 3
+        all_ang_vels,                                # 3
+        all_gravities,                               # 3
+        desired_pos_b,                                # 3
+    ]
+    if env.cfg.include_obstacle_in_obs:
+        components += [
+            env._cached_obstacle_dists.unsqueeze(-1),  # 1
+            env._cached_obstacle_dir_b,                # 3
+        ]
+    components += [
+        env._cached_neighbor_rel_pos_b,              # 3
+        env._cached_neighbor_rel_vel_b,              # 3
+        env._cached_mean_neighbor_pos_b,             # 3
+        env._cached_mean_neighbor_vel_b,             # 3
     ]
 
     if env.cfg.include_rm_in_obs:
-        components.append(rm_state_onehot)            # 4   [28:32]
+        components.append(rm_state_onehot)            # 4
 
     return torch.cat(components, dim=-1)
 
@@ -515,3 +532,11 @@ class SwarmGravityUAVSwarmEnv(BaseSwarmEnv):
     attraction + inter-agent repulsion, no fixed formation shape."""
 
     cfg: SwarmGravityUAVSwarmEnvCfg
+
+
+class SwarmGravityV2UAVSwarmEnv(BaseSwarmEnv):
+    """SwarmGravity variant for the critic-architecture experiment: same task, simplified
+    24-dim obs (no obstacle fields), and an augmented 145-dim state (per-agent obs +
+    pairwise distance matrix) for mappo_torchl.GraphAttentionCritic to consume."""
+
+    cfg: SwarmGravityV2UAVSwarmEnvCfg

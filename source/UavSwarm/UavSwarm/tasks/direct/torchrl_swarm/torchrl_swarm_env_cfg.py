@@ -153,9 +153,10 @@ class CurriculumCfg:
             6: self.stage6_episode_length_s,
             7: self.stage7_episode_length_s,
             8: self.stage8_episode_length_s,
+            9: self.stage8_episode_length_s,  # SwarmGravityV2 reuses stage 8's tunables
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-8.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-9.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -230,6 +231,14 @@ class BaseSwarmEnvCfg(DirectMARLEnvCfg):
     """
 
     include_rm_in_obs: bool = True
+    # Obstacle fields (obstacle_dist + obstacle_dir_b, 4 dims) are sentinel/unused for
+    # any task with no obstacles -- default True keeps every existing task/checkpoint's
+    # obs schema unchanged; SwarmGravityV2 sets this False to drop them.
+    include_obstacle_in_obs: bool = True
+    # When True, _get_states() appends the flattened NxN world-frame pairwise-distance
+    # matrix after the usual per-agent obs concat -- privileged info only the centralized
+    # critic sees, meant for an attention-based critic (see mappo_torchl.GraphAttentionCritic).
+    include_distance_matrix_in_state: bool = False
 
     # Episode / stepping
     episode_length_s = 30.0
@@ -379,3 +388,32 @@ class SwarmGravityUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=8)
+
+
+@configclass
+class SwarmGravityV2UAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """SwarmGravity variant for the critic-architecture experiment: identical task
+    semantics (same shared-target reward/termination/position-setting, all stage8_*
+    tunables reused directly -- see get_swarm_gravity_rewards/_check_swarm_gravity_reached),
+    but with two changes aimed at the centralized critic rather than the task itself:
+
+    1. Simplified 24-dim observation -- drops the sentinel obstacle_dist/obstacle_dir_b
+       fields (this task has no obstacles) that were never actually informative.
+    2. Augmented 145-dim state -- _get_states() appends the flattened NxN world-frame
+       pairwise-distance matrix (25 dims for N=5) after the usual 5*24=120-dim per-agent
+       obs concat, privileged info meant for mappo_torchl.GraphAttentionCritic
+       (--critic_arch attention) to consume. Also works unchanged with the existing flat
+       CentralizedCritic, which just sees it as 25 extra input dims.
+
+    Uses curriculum stage 9 purely as an internal dispatch value, same pattern as every
+    other task here.
+    """
+
+    include_rm_in_obs: bool = False
+    include_obstacle_in_obs: bool = False
+    include_distance_matrix_in_state: bool = True
+    single_observation_space: int = 24
+    state_space: int = 145  # 5*24 (per-agent obs) + 5*5 (pairwise distance matrix)
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(24,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=9)

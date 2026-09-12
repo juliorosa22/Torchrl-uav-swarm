@@ -117,6 +117,15 @@ parser.add_argument(
     help="Overrides config algorithm.entropy_coef (default 0.01). Diagnostic switch for "
          "premature entropy collapse (see formation-convergence-investigation memory).",
 )
+parser.add_argument(
+    "--critic_arch", type=str, default="flat", choices=["flat", "attention"],
+    help="'flat' (default): plain MLP over the concatenated-obs state (CentralizedCritic). "
+         "'attention': self-attention over per-agent embeddings, biased by the true "
+         "pairwise agent distance (GraphAttentionCritic) -- permutation-invariant and "
+         "N-agnostic, unlike 'flat'. Requires a task whose state appends a trailing "
+         "NxN distance matrix after the per-agent obs concat (e.g. SwarmGravityV2 via "
+         "include_distance_matrix_in_state); will error on a task that doesn't.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -131,7 +140,7 @@ simulation_app = app_launcher.app
 """Rest follows."""
 
 from torchrl_wrapper import IsaacLabTorchRLWrapper
-from mappo_torchl import MAPPOPolicy, CentralizedCritic, MAPPO
+from mappo_torchl import MAPPOPolicy, CentralizedCritic, GraphAttentionCritic, MAPPO
 from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg
 from isaaclab.utils.io import dump_yaml
 from datetime import datetime
@@ -167,13 +176,24 @@ def make_policy(obs_dim: int, action_dim: int, config: dict, device: torch.devic
     )
 
 
-def make_critic(state_dim: int, config: dict, device: torch.device) -> TensorDictModule:
+def make_critic(
+    state_dim: int, config: dict, device: torch.device,
+    critic_arch: str = "flat", num_agents: int | None = None, obs_dim: int | None = None,
+) -> TensorDictModule:
     """Create centralized critic.
 
-    Reads ("state",) (concatenated all-agent observations),
-    writes ("state_value",).
+    Reads ("state",) (concatenated all-agent observations, optionally followed by extra
+    privileged dims a task appends -- see torchrl_swarm_env.py::_get_states), writes
+    ("state_value",). "attention" requires num_agents/obs_dim (to split state into
+    per-agent node features vs. the trailing pairwise-distance matrix) -- only tasks that
+    set include_distance_matrix_in_state (e.g. SwarmGravityV2) provide that trailing part.
     """
-    net = CentralizedCritic(state_dim, config["models"]["critic"]["hidden_sizes"]).to(device)
+    if critic_arch == "attention":
+        if num_agents is None or obs_dim is None:
+            raise ValueError("--critic_arch attention requires num_agents and obs_dim.")
+        net = GraphAttentionCritic(num_agents, obs_dim).to(device)
+    else:
+        net = CentralizedCritic(state_dim, config["models"]["critic"]["hidden_sizes"]).to(device)
     return TensorDictModule(
         module=net,
         in_keys=[("state",)],
@@ -269,6 +289,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
+    print(f"  Critic:     {args_cli.critic_arch}")
     if args_cli.residual_rl:
         print(f"  Residual RL: ON  (baseline={args_cli.residual_baseline}, kp={args_cli.residual_kp}, scale={args_cli.residual_scale}, repel={args_cli.residual_repel_gain})")
     print(f"  Device:     {device}")
@@ -313,7 +334,10 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
 
     # --- create networks ---
     policy = make_policy(obs_dim, action_dim, config, device)
-    critic = make_critic(state_dim, config, device)
+    critic = make_critic(
+        state_dim, config, device,
+        critic_arch=args_cli.critic_arch, num_agents=n_agents, obs_dim=obs_dim,
+    )
 
     n_policy = sum(p.numel() for p in policy.parameters())
     n_critic = sum(p.numel() for p in critic.parameters())

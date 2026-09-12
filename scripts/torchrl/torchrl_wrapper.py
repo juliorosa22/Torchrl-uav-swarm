@@ -229,17 +229,22 @@ class IsaacLabTorchRLWrapper(EnvBase):
         return normed.reshape(n_envs, n_agents, obs_dim)
 
     def _get_state(self) -> torch.Tensor:
-        """Centralized critic state -- per-agent observations concatenated. When obs
-        normalization is on, normalize it with the *same* obs_rms stats tiled across agents
-        (state is literally num_agents copies of the same 28-dim obs schema back to back),
-        not a second independently-tracked statistic.
+        """Centralized critic state -- per-agent observations concatenated, optionally
+        followed by extra privileged dims a task appends (e.g. SwarmGravityV2's pairwise
+        distance matrix -- see torchrl_swarm_env.py::_get_states). When obs normalization
+        is on, only the leading num_agents*obs_dim portion is normalized, with the *same*
+        obs_rms stats tiled across agents (that portion is literally num_agents copies of
+        the same obs schema back to back, not a second independently-tracked statistic) --
+        any trailing extra dims are left as-is, since they aren't obs-shaped.
         """
         state = self.unwrapped_env._get_states().to(self.device)
         obs_rms = self.obs_rms
         if self.normalize_obs and obs_rms is not None:
+            obs_span = self.num_agents * self.obs_dim
             tiled_mean = obs_rms.mean.repeat(self.num_agents)
             tiled_std = obs_rms.std.repeat(self.num_agents)
-            state = (state - tiled_mean) / (tiled_std + obs_rms.eps)
+            normed_obs_part = (state[..., :obs_span] - tiled_mean) / (tiled_std + obs_rms.eps)
+            state = torch.cat([normed_obs_part, state[..., obs_span:]], dim=-1)
         return state
 
     # -- env interface ---------------------------------------------------------

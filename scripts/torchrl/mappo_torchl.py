@@ -92,6 +92,57 @@ class CentralizedCritic(nn.Module):
         return self.net(state)
 
 
+class GraphAttentionCritic(nn.Module):
+    """Centralized critic with one self-attention layer over per-agent embeddings, biased
+    by the true pairwise distance between agents -- permutation-invariant (mean-pooled
+    output) and N-agnostic by construction (a fixed per-agent embed/attention/pool doesn't
+    bake num_agents into a flat input width the way CentralizedCritic's first Linear does),
+    unlike the plain flat-MLP critic.
+
+    Expects `state` laid out as [per-agent obs concat (num_agents*per_agent_dim)] followed
+    by [flattened NxN pairwise distance matrix (num_agents*num_agents)] -- see
+    torchrl_swarm_env.py::_get_states' include_distance_matrix_in_state. N=5 is tiny, so
+    this stays deliberately small (~22k params, comparable to CentralizedCritic's ~26k) --
+    one attention layer, not a deep transformer stack.
+    """
+
+    def __init__(self, num_agents: int, per_agent_dim: int, hidden_dim: int = 64, num_heads: int = 4):
+        super().__init__()
+        self.num_agents = num_agents
+        self.per_agent_dim = per_agent_dim
+        self.embed = nn.Sequential(nn.Linear(per_agent_dim, hidden_dim), nn.ReLU())
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+        # Learnable scale on -distance so the network calibrates how strongly proximity
+        # should bias attention, rather than a fixed hand-picked constant.
+        self.dist_scale = nn.Parameter(torch.tensor(1.0))
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, state: torch.Tensor):
+        """state: (*batch, num_agents*per_agent_dim + num_agents*num_agents) → (*batch, 1)."""
+        orig_shape = state.shape[:-1]
+        n = self.num_agents
+        obs_span = n * self.per_agent_dim
+        flat_state = state.reshape(-1, state.shape[-1])
+        B = flat_state.shape[0]
+
+        node_feats = flat_state[:, :obs_span].reshape(B, n, self.per_agent_dim)
+        dist_matrix = flat_state[:, obs_span:].reshape(B, n, n)
+
+        x = self.embed(node_feats)  # (B, n, hidden_dim)
+        attn_bias = -self.dist_scale * dist_matrix  # (B, n, n) -- closer agents, less penalty
+        num_heads = self.attn.num_heads
+        attn_mask = attn_bias.unsqueeze(1).expand(B, num_heads, n, n).reshape(B * num_heads, n, n)
+        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask)
+        x = self.norm(x + attn_out)
+
+        pooled = x.mean(dim=1)  # (B, hidden_dim) -- permutation-invariant
+        value = self.head(pooled)  # (B, 1)
+        return value.reshape(*orig_shape, 1)
+
+
 class MAPPO:
     """Shared-weight MAPPO trainer using TorchRL.
 
@@ -594,7 +645,24 @@ def _reshape_for_gae(td: TensorDict, n_agents: int) -> TensorDict:
             obs_dim = next_result["observation"].shape[-1]
             per_env_agent = next_result["observation"].reshape(num_envs, n_agents, T, obs_dim)
             concatenated = per_env_agent.permute(0, 2, 1, 3).reshape(num_envs, T, n_agents * obs_dim)
-            next_result["state"] = _centralized_to_gae_shape(concatenated)
+            reconstructed_obs_part = _centralized_to_gae_shape(concatenated)  # (B, T, n_agents*obs_dim)
+
+            # Some tasks (e.g. SwarmGravityV2) append extra privileged dims to "state"
+            # beyond the plain per-agent obs concat (see torchrl_swarm_env.py::_get_states'
+            # pairwise-distance-matrix tail) -- those can't be derived from next_observation
+            # alone. Since this B,T window is one continuous per-env trajectory (same
+            # invariant _reshape_for_gae itself relies on), result["state"][:, t+1] IS
+            # next_result["state"][:, t] exactly for t < T-1; only the final transition of
+            # the whole rollout window has no true next available and reuses its own
+            # current extra-portion as a one-step-stale approximation.
+            obs_span = reconstructed_obs_part.shape[-1]
+            full_state_dim = result["state"].shape[-1]
+            if full_state_dim > obs_span:
+                current_extra = result["state"][..., obs_span:]  # (B, T, extra_dim)
+                next_extra = torch.cat([current_extra[:, 1:], current_extra[:, -1:]], dim=1)
+                next_result["state"] = torch.cat([reconstructed_obs_part, next_extra], dim=-1)
+            else:
+                next_result["state"] = reconstructed_obs_part
 
         result["next"] = next_result
 
