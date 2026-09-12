@@ -6,6 +6,8 @@ checks. Also manages waypoint progression for stages 3 and 5.
 
 import torch
 
+from .rewards import AGENT_COLLISION_DISTANCE
+
 
 def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Check termination conditions with curriculum-aware logic.
@@ -15,6 +17,11 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     2. Out of bounds: Any drone too far from environment origin
     3. Goal reached: All agents reached their goals (stage-dependent)
     4. Timeout: Episode exceeds max_episode_length
+    5. Inter-agent collision (stage 8 only): any two agents closer than
+       AGENT_COLLISION_DISTANCE -- a hard safety boundary distinct from R_nh's larger soft-
+       avoidance radius, relevant for eventual real-hardware deployment. Not checked for
+       other stages (unlike 1-4, which apply everywhere) since no other stage's reward
+       currently tracks true pairwise inter-agent distance.
 
     Returns:
         Tuple of (terminated_dict, time_out_dict) where each is a dictionary
@@ -47,8 +54,17 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     # Goal reached termination (curriculum-aware)
     goal_reached = _check_goal_reached(env)
 
+    # Inter-agent collision (stage 8 only -- see docstring point 5)
+    died_agent_collision = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if env.curriculum_stage == 8:
+        from .sensing import ensure_cache_populated
+
+        ensure_cache_populated(env)
+        neighbor_dists = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)  # (D, E)
+        died_agent_collision = (neighbor_dists < AGENT_COLLISION_DISTANCE).any(dim=0)
+
     # Combine termination conditions
-    died = died_collision | died_out_of_bounds | goal_reached
+    died = died_collision | died_out_of_bounds | died_agent_collision | goal_reached
 
     # Store termination reasons for logging in _reset_idx
     env._last_terminated = died
@@ -59,11 +75,13 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
             'collision': torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
             'out_of_bounds': torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
             'goal_reached': torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+            'inter_agent_collision': torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
         }
 
     env._termination_reasons['collision'] = died_collision
     env._termination_reasons['out_of_bounds'] = died_out_of_bounds
     env._termination_reasons['goal_reached'] = goal_reached
+    env._termination_reasons['inter_agent_collision'] = died_agent_collision
 
     terminated_dict = {f"robot_{i}": died for i in range(env.num_drones)}
     time_out_dict = {f"robot_{i}": time_out for i in range(env.num_drones)}

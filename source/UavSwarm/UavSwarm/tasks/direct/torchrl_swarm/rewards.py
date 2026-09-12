@@ -438,11 +438,19 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     per_drone_reward = attraction + safety_penalty
     mean_reward = per_drone_reward.mean(dim=0)  # logging only
 
+    # True inter-agent collision (0.15m, distinct from R_nh's larger soft-avoidance
+    # radius) and worst-case closest approach this step -- neighbor_dists is already each
+    # agent's nearest-neighbor distance, so min over agents = the globally closest pair.
+    agent_collision = (neighbor_dists < AGENT_COLLISION_DISTANCE).any(dim=0).float()
+    min_neighbor_distance_step = neighbor_dists.min(dim=0).values
+
     env._metrics.update(
         distance_to_goal=distances.mean(dim=0),
         mean_reward=mean_reward,
         dist_component=attraction.mean(dim=0),
         formation=distances.mean(dim=0),
+        agent_collision=agent_collision,
+        min_neighbor_distance=min_neighbor_distance_step,
     )
 
     return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}

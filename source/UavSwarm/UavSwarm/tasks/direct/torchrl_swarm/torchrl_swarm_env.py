@@ -245,6 +245,10 @@ class BaseSwarmEnv(DirectMARLEnv):
             log_dict["Episode_Termination/goal_reached"] = torch.count_nonzero(
                 self._termination_reasons['goal_reached'][env_ids]
             ).item() / n_reset
+            if 'inter_agent_collision' in self._termination_reasons:
+                log_dict["Episode_Termination/inter_agent_collision"] = torch.count_nonzero(
+                    self._termination_reasons['inter_agent_collision'][env_ids]
+                ).item() / n_reset
 
         log_dict["Metrics/final_distance_to_goal"] = final_distance_to_goal.item()
         log_dict["Metrics/final_distance_to_goal_min"] = final_distance_to_goal_min.item()
