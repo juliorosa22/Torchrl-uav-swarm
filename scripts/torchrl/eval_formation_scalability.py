@@ -56,6 +56,23 @@ parser.add_argument(
     help="Sample actions (matches how SyncDataCollector actually rolled out during "
          "training) instead of using the deterministic mean action.",
 )
+parser.add_argument(
+    "--residual_rl", action="store_true", default=False,
+    help="Checkpoint was trained as a residual correction on top of a P-controller/APF "
+         "baseline (see mappo_train.py) -- must be set to reconstruct the same "
+         "baseline+scale*policy env-facing action, or playback shows only the small "
+         "raw correction term instead of the actual trained behavior.",
+)
+parser.add_argument("--residual_baseline", type=str, default="point", choices=["point", "apf"])
+parser.add_argument("--residual_kp", type=float, default=2.0)
+parser.add_argument("--residual_scale", type=float, default=0.3)
+parser.add_argument("--residual_repel_gain", type=float, default=0.5)
+parser.add_argument(
+    "--min_safe_distance", type=float, default=None,
+    help="Overrides swarm_cfg.min_safe_distance (R_nh) -- must match the value the "
+         "checkpoint was trained with for the APF baseline/containment radius to match.",
+)
+parser.add_argument("--gravity_radius", type=float, default=None, help="Overrides curriculum.stage8_gravity_radius (R_gv).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -153,6 +170,10 @@ def main():
     torch.manual_seed(args_cli.seed)
 
     env_cfg = build_eval_cfg(args_cli.task, args_cli.num_agents, args_cli.num_envs, str(device), args_cli.controller, args_cli.stage)
+    if args_cli.min_safe_distance is not None:
+        env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
+    if args_cli.gravity_radius is not None:
+        env_cfg.curriculum.stage8_gravity_radius = args_cli.gravity_radius
 
     print(f"\n{'='*80}")
     print("  Formation Scalability Eval — zero-shot swarm-size generalization")
@@ -170,7 +191,12 @@ def main():
 
     ckpt = torch.load(args_cli.checkpoint, map_location=device, weights_only=True)
     normalize_obs = "obs_rms" in ckpt
-    env = IsaacLabTorchRLWrapper(base_env, device=str(device), normalize_obs=normalize_obs)
+    env = IsaacLabTorchRLWrapper(
+        base_env, device=str(device), normalize_obs=normalize_obs,
+        residual_rl=args_cli.residual_rl, residual_baseline=args_cli.residual_baseline,
+        residual_kp=args_cli.residual_kp, residual_scale=args_cli.residual_scale,
+        residual_repel_gain=args_cli.residual_repel_gain,
+    )
     if normalize_obs:
         assert env.obs_rms is not None
         env.obs_rms.load_state_dict(ckpt["obs_rms"])
