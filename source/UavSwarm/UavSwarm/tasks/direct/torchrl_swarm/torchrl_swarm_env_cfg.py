@@ -239,6 +239,11 @@ class BaseSwarmEnvCfg(DirectMARLEnvCfg):
     # matrix after the usual per-agent obs concat -- privileged info only the centralized
     # critic sees, meant for an attention-based critic (see mappo_torchl.GraphAttentionCritic).
     include_distance_matrix_in_state: bool = False
+    # Continuous reset-phase re-staggering (see torchrl_swarm_env.py::_reset_idx) is on
+    # by default. Diagnostic-only toggle for the A/B multi-seed comparison in
+    # [[formation-convergence-investigation]] -- False reproduces the old behavior
+    # (only the initial full-batch reset is staggered).
+    disable_reset_jitter: bool = False
 
     # Episode / stepping
     episode_length_s = 30.0

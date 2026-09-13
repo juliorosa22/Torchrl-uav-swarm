@@ -118,6 +118,14 @@ parser.add_argument(
          "premature entropy collapse (see formation-convergence-investigation memory).",
 )
 parser.add_argument(
+    "--disable_reset_jitter", action="store_true", default=False,
+    help="Diagnostic-only: reproduces the old behavior where only the initial full-batch "
+         "reset staggers episode_length_buf phase, not every ordinary per-env reset. "
+         "For the A/B multi-seed comparison testing the 'staggered resets' hypothesis "
+         "(see formation-convergence-investigation memory / arXiv:2511.21011) -- default "
+         "(flag absent) keeps the fix on.",
+)
+parser.add_argument(
     "--critic_arch", type=str, default="flat", choices=["flat", "attention"],
     help="'flat' (default): plain MLP over the concatenated-obs state (CentralizedCritic). "
          "'attention': self-attention over per-agent embeddings, biased by the true "
@@ -241,6 +249,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.curriculum.stage8_gravity_radius = args_cli.gravity_radius
     if args_cli.stage8_episode_length is not None:
         env_cfg.curriculum.stage8_episode_length_s = args_cli.stage8_episode_length
+    if args_cli.disable_reset_jitter:
+        env_cfg.disable_reset_jitter = True
     if args_cli.packing_density is not None:
         env_cfg.curriculum.stage8_packing_density = args_cli.packing_density
     if args_cli.num_agents is not None and args_cli.num_agents != env_cfg.num_agents:

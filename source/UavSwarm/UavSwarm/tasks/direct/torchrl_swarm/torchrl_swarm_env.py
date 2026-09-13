@@ -308,7 +308,7 @@ class BaseSwarmEnv(DirectMARLEnv):
             self.episode_length_buf = torch.randint_like(
                 self.episode_length_buf, high=int(self.max_episode_length)
             )
-        else:
+        elif not self.cfg.disable_reset_jitter:
             # Continuous re-staggering: a small random jitter on every ordinary reset,
             # not just the initial full-batch one above. Base class hard-resets
             # episode_length_buf[env_ids] to exactly 0 on every reset (see
