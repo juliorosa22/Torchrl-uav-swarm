@@ -303,8 +303,31 @@ class BaseSwarmEnv(DirectMARLEnv):
         super()._reset_idx(env_ids)
 
         if len(env_ids) == self.num_envs:
+            # Startup staggering: spread the initial population widely across the full
+            # episode-length range so envs don't all begin in lockstep.
             self.episode_length_buf = torch.randint_like(
                 self.episode_length_buf, high=int(self.max_episode_length)
+            )
+        else:
+            # Continuous re-staggering: a small random jitter on every ordinary reset,
+            # not just the initial full-batch one above. Base class hard-resets
+            # episode_length_buf[env_ids] to exactly 0 on every reset (see
+            # DirectMARLEnv._reset_idx) -- fine in isolation, but it means any env that
+            # times out (a real, non-trivial fraction of episodes here) lands back here
+            # at a perfectly fixed interval (exactly max_episode_length later) with no
+            # re-randomization, so a subset of envs that happens to synchronize
+            # mid-training (e.g. via correlated policy behavior across envs) stays
+            # phase-locked for the rest of the run instead of drifting back apart --
+            # the exact mechanism "Staggered Environment Resets Improve Massively
+            # Parallel On-Policy RL" (arXiv:2511.21011) reports as increasingly harmful
+            # nonstationarity that intensifies with more parallel envs, a plausible
+            # explanation for [[formation-convergence-investigation]]'s still-unexplained
+            # num_envs-scaling degradation. Jitter is kept small (5% of episode length)
+            # so this doesn't meaningfully truncate episodes, just prevents perfect
+            # lock-in from persisting.
+            jitter_max = max(1, int(0.05 * self.max_episode_length))
+            self.episode_length_buf[env_ids] = torch.randint(
+                0, jitter_max, (len(env_ids),), device=self.device
             )
 
         self._actions[env_ids] = 0.0
