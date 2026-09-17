@@ -136,7 +136,7 @@ class CurriculumCfg:
     # (R_gv, "closest agent has arrived") is unused here: stage 10's success condition is
     # _check_packing_complete (every agent settled at its own slot), which subsumes it.
     stage10_slot_tolerance: float = 0.3
-    stage10_packing_iterations: int = 500
+    stage10_packing_iterations: int = 2000
 
     def get_containment_radius(self, num_drones: int, min_safe_distance: float) -> float:
         """Sphere radius that must contain every agent for a stage-8 episode to count as

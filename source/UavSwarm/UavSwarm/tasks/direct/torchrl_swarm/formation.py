@@ -20,33 +20,16 @@ def compute_swarm_centroid(env) -> None:
     env._swarm_centroid = swarm_positions.mean(dim=1)
 
 
-def compute_packing_slots(
-    num_drones: int,
-    radius: float,
-    min_safe_distance: float,
-    device: str,
-    iterations: int = 500,
-    lr: float = 0.05,
-) -> torch.Tensor:
-    """Compute N fixed 3D positions packed inside a ball of the given radius, via
-    electrostatic relaxation (same inverse-square repulsion spirit as the APF controller
-    used elsewhere in this project) -- a Thomson-problem-style solve, not just named after
-    one. Used once at env construction time (see SwarmGravityRM's stage-10 design) to
-    derive the "orbital slots" agents are assigned to by sphere-entry order, sorted so
-    slot 0 (assigned to the first agent to arrive) is innermost.
-
-    min_safe_distance (R_nh) isn't enforced as a hard constraint here -- the relaxation's
-    own repulsion naturally spreads N points apart, and radius is already derived from
-    get_containment_radius's R_nh-based volume argument, so points settle at a spacing on
-    that order without needing an explicit constraint.
-
-    Returns:
-        Tensor of shape (num_drones, 3), centered on the origin.
+def _relax_on_sphere(num_drones: int, radius: float, device: str, iterations: int, lr: float) -> torch.Tensor:
+    """One Thomson-problem relaxation from a random start: inverse-square pairwise
+    repulsion, projected back onto the sphere's surface after every step. Projecting
+    every step (not just clamping overshoots) is what keeps this from collapsing toward
+    the center -- the optimal packing for small N sits on the boundary, and an unconstrained
+    radial DOF gives plain gradient descent room to get stuck in a bad interior local
+    minimum instead of finding it.
     """
-    if num_drones <= 1:
-        return torch.zeros(max(num_drones, 0), 3, device=device)
-
-    positions = torch.randn(num_drones, 3, device=device) * (radius * 0.5)
+    positions = torch.randn(num_drones, 3, device=device)
+    positions = positions / positions.norm(dim=1, keepdim=True).clamp(min=1e-6) * radius
     eye_mask = ~torch.eye(num_drones, dtype=torch.bool, device=device)
 
     current_lr = lr
@@ -57,17 +40,56 @@ def compute_packing_slots(
         net_force = (repulsion * eye_mask.unsqueeze(-1)).sum(dim=1)
 
         positions = positions + current_lr * net_force
+        positions = positions / positions.norm(dim=1, keepdim=True).clamp(min=1e-6) * radius
+        current_lr *= 0.998
 
-        norms = positions.norm(dim=1, keepdim=True).clamp(min=1e-6)
-        over = norms > radius
-        positions = torch.where(over, positions / norms * radius, positions)
+    return positions
 
-        current_lr *= 0.995
+
+def compute_packing_slots(
+    num_drones: int,
+    radius: float,
+    min_safe_distance: float,
+    device: str,
+    iterations: int = 2000,
+    lr: float = 0.1,
+    restarts: int = 20,
+) -> torch.Tensor:
+    """Compute N fixed 3D positions packed inside a ball of the given radius, via
+    electrostatic relaxation (same inverse-square repulsion spirit as the APF controller
+    used elsewhere in this project) -- a Thomson-problem-style solve, not just named after
+    one. Used once at env construction time (see SwarmGravityRM's stage-10 design) to
+    derive the "orbital slots" agents are assigned to by sphere-entry order, sorted so
+    slot 0 (assigned to the first agent to arrive) is innermost.
+
+    Plain gradient-descent relaxation on this problem is prone to bad local minima
+    (verified: a single run often lands well under min_safe_distance/2 apart -- see
+    [[formation-convergence-investigation]]). Since this only runs once, cheaply, at env
+    construction, `restarts` independent relaxations are run and the one with the largest
+    achieved minimum pairwise distance is kept -- the standard fix for small-N Thomson-
+    problem instances. min_safe_distance isn't enforced as a hard constraint (radius is
+    already derived from get_containment_radius's R_nh-based volume argument to make a
+    spacing of that order achievable), only used to pick the best of the restarts.
+
+    Returns:
+        Tensor of shape (num_drones, 3), centered on the origin.
+    """
+    if num_drones <= 1:
+        return torch.zeros(max(num_drones, 0), 3, device=device)
+
+    best_positions, best_min_dist = None, -1.0
+    for _ in range(restarts):
+        positions = _relax_on_sphere(num_drones, radius, device, iterations, lr)
+        dists = torch.cdist(positions, positions)
+        dists.fill_diagonal_(float("inf"))
+        min_dist = dists.min().item()
+        if min_dist > best_min_dist:
+            best_min_dist, best_positions = min_dist, positions
 
     # Sort by distance from center ascending: slot 0 = innermost = assigned to whichever
     # agent enters the sphere first (see stage-10 entry-order assignment).
-    order = positions.norm(dim=1).argsort()
-    return positions[order]
+    order = best_positions.norm(dim=1).argsort()
+    return best_positions[order]
 
 
 def get_inverted_v_formation(
