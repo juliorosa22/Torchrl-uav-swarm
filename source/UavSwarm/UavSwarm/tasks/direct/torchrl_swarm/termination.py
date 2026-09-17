@@ -22,6 +22,9 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
        avoidance radius, relevant for eventual real-hardware deployment. Not checked for
        other stages (unlike 1-4, which apply everywhere) since no other stage's reward
        currently tracks true pairwise inter-agent distance.
+    6. Swarm-gravity-RM phase transition (stage 10 only, non-terminal): entering the
+       containment sphere assigns a packing slot and repoints _desired_pos_w instead of
+       ending the episode -- see the dedicated block below.
 
     Returns:
         Tuple of (terminated_dict, time_out_dict) where each is a dictionary
@@ -51,6 +54,13 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         distance_from_origin = torch.linalg.norm(agent_pos_xy - origin_xy, dim=1)
         died_out_of_bounds = died_out_of_bounds | (distance_from_origin > max_distance_from_origin)
 
+    # Swarm-gravity-RM phase transition (stage 10 only): per-agent, entering the
+    # containment sphere assigns a packing slot and repoints _desired_pos_w -- does NOT
+    # terminate. Must run before _check_goal_reached so packing-completion sees this
+    # step's just-assigned slots, not last step's.
+    if env.curriculum_stage == 10:
+        _update_swarm_gravity_rm_phase(env)
+
     # Goal reached termination (curriculum-aware)
     goal_reached = _check_goal_reached(env)
 
@@ -68,9 +78,9 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
             env._desired_pos_w[advancing] = next_targets.unsqueeze(1).expand(-1, env.num_drones, -1)
         goal_reached = goal_reached & is_last_waypoint
 
-    # Inter-agent collision (stage 8/9 only -- see docstring point 5)
+    # Inter-agent collision (stage 8/9/10 only -- see docstring point 5)
     died_agent_collision = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if env.curriculum_stage in (8, 9):
+    if env.curriculum_stage in (8, 9, 10):
         from .sensing import ensure_cache_populated
 
         ensure_cache_populated(env)
@@ -130,6 +140,8 @@ def _check_goal_reached(env) -> torch.Tensor:
         return _check_individual_goals_reached(env)
     elif stage in (8, 9):
         return _check_swarm_gravity_reached(env)
+    elif stage == 10:
+        return _check_packing_complete(env)
     else:
         return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
@@ -195,6 +207,74 @@ def _check_swarm_gravity_reached(env) -> torch.Tensor:
     closest_arrived = distances.min(dim=0).values < env.cfg.curriculum.stage8_gravity_radius
 
     return all_contained & closest_arrived
+
+
+def _update_swarm_gravity_rm_phase(env) -> None:
+    """Stage 10's RM transition: any agent still outside the containment sphere (phase 0)
+    whose distance to the shared target drops to/below get_containment_radius claims the
+    next packing slot in arrival order and has its _desired_pos_w repointed to it. Logged
+    as a non-terminal Episode_Termination/sphere_entered rate (see torchrl_swarm_env.py's
+    _reset_idx logging) -- distinct from goal_reached, which now means "fully packed".
+    """
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    target_w = env._desired_pos_w  # (E, D, 3) -- shared target is the same across D until entry
+    # Only agents still in phase 0 have a meaningful distance-to-target reading here --
+    # phase-1 agents' _desired_pos_w already points at their own slot, not the target.
+    distance_to_target = torch.linalg.norm(
+        target_w.transpose(0, 1) - all_positions, dim=2
+    )  # (D, E)
+
+    containment_radius = env.cfg.curriculum.get_containment_radius(
+        env.num_drones, env.cfg.swarm_cfg.min_safe_distance
+    )
+    phase_t = env._swarm_rm_phase.transpose(0, 1)  # (D, E)
+    entering = (distance_to_target <= containment_radius) & (phase_t == 0)  # (D, E)
+
+    if not entering.any():
+        env._metrics.update(
+            sphere_entered=torch.zeros(env.num_envs, device=env.device),
+        )
+        return
+
+    entering_env_drone = entering.nonzero(as_tuple=False)  # (K, 2) rows of (drone, env)
+    # Process envs one at a time so multiple agents entering the same env in the same
+    # step claim distinct, correctly-incrementing slots (num_drones is tiny, this is cheap).
+    entered_envs = torch.unique(entering_env_drone[:, 1])
+    for env_idx in entered_envs.tolist():
+        drone_idxs = entering_env_drone[entering_env_drone[:, 1] == env_idx, 0]
+        for drone_idx in drone_idxs.tolist():
+            slot = env._entry_order[env_idx].item()
+            env._assigned_slot[env_idx, drone_idx] = slot
+            env._swarm_rm_phase[env_idx, drone_idx] = 1
+            env._entry_order[env_idx] += 1
+
+            canonical_slot = env._canonical_packing_slots[slot]  # (3,)
+            rotated_slot = env._episode_slot_rotation[env_idx] @ canonical_slot
+            env._desired_pos_w[env_idx, drone_idx] = target_w[env_idx, drone_idx] + rotated_slot
+
+    sphere_entered = torch.zeros(env.num_envs, device=env.device)
+    sphere_entered[entered_envs] = 1.0
+    env._metrics.update(sphere_entered=sphere_entered)
+
+
+def _check_packing_complete(env) -> torch.Tensor:
+    """Stage 10 success: every agent has entered the containment sphere (phase 1) AND
+    settled within stage10_slot_tolerance of its individually assigned packing slot.
+
+    Returns:
+        Boolean tensor (num_envs,) -- True if both conditions hold for every agent.
+    """
+    all_phase_1 = (env._swarm_rm_phase == 1).all(dim=1)  # (E,)
+
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    desired_transposed = env._desired_pos_w.transpose(0, 1)  # (D, E, 3)
+    distance_to_slot = torch.linalg.norm(desired_transposed - all_positions, dim=2)  # (D, E)
+    all_settled = (distance_to_slot <= env.cfg.curriculum.stage10_slot_tolerance).all(dim=0)
+
+    pack_progress = env._swarm_rm_phase.float().mean(dim=1)  # (E,) fraction currently inside
+    env._metrics.update(pack_progress=pack_progress)
+
+    return all_phase_1 & all_settled
 
 
 def _check_waypoint_goals_reached(env) -> torch.Tensor:

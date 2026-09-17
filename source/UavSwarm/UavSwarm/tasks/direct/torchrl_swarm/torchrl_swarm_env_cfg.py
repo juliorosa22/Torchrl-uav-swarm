@@ -130,6 +130,14 @@ class CurriculumCfg:
     # hexagonal close-packing (~0.74); 0.6 is a reasonable loose-swarm default.
     stage8_packing_density: float = 0.6
 
+    # Stage 10 parameters (swarm-gravity + reward machine: same containment sphere as
+    # stage 8, but entering it doesn't terminate -- it assigns the agent a personal
+    # packing slot, computed once via formation.compute_packing_slots. stage8_gravity_radius
+    # (R_gv, "closest agent has arrived") is unused here: stage 10's success condition is
+    # _check_packing_complete (every agent settled at its own slot), which subsumes it.
+    stage10_slot_tolerance: float = 0.3
+    stage10_packing_iterations: int = 500
+
     def get_containment_radius(self, num_drones: int, min_safe_distance: float) -> float:
         """Sphere radius that must contain every agent for a stage-8 episode to count as
         successful (see docstring on stage8_packing_density). Derived from the
@@ -154,9 +162,10 @@ class CurriculumCfg:
             7: self.stage7_episode_length_s,
             8: self.stage8_episode_length_s,
             9: self.stage8_episode_length_s,  # SwarmGravityV2 reuses stage 8's tunables
+            10: self.stage8_episode_length_s,  # SwarmGravityRM reuses stage 8's tunables
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-9.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-10.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -244,6 +253,9 @@ class BaseSwarmEnvCfg(DirectMARLEnvCfg):
     # [[formation-convergence-investigation]] -- False reproduces the old behavior
     # (only the initial full-batch reset is staggered).
     disable_reset_jitter: bool = False
+    # SwarmGravityRM (stage 10) only: appends each agent's own RM phase (0=outside the
+    # containment sphere, 1=inside/packing) as a 1-dim observation component.
+    include_swarm_rm_phase_in_obs: bool = False
 
     # Episode / stepping
     episode_length_s = 30.0
@@ -422,3 +434,31 @@ class SwarmGravityV2UAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(24,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=9)
+
+
+@configclass
+class SwarmGravityRMUAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """Swarm-gravity + 2-state Reward Machine task, for the RM-evaluation paper: same
+    shared-target spawn/attraction/repulsion as stage 8 (set_swarm_gravity_positions,
+    get_swarm_gravity_rewards reused verbatim), but entering the containment sphere (see
+    CurriculumCfg.get_containment_radius) no longer terminates the episode. Instead it
+    assigns the agent a personal 3D "orbital slot" from a pre-computed, volume-packed
+    arrangement (formation.compute_packing_slots) by arrival order, and repoints that
+    agent's _desired_pos_w to it -- same reward law, now rewarding tight, collision-free
+    packing instead of raw containment. Success (_check_packing_complete) requires every
+    agent settled within stage10_slot_tolerance of its assigned slot.
+
+    28-dim obs (identical schema to stage 8) + 1 new dim (own RM phase, 0/1) = 29.
+    5*29 = 145-dim state (no distance-matrix augmentation, unlike SwarmGravityV2).
+
+    Uses curriculum stage 10 purely as an internal dispatch value, same pattern as every
+    other task here.
+    """
+
+    include_rm_in_obs: bool = False
+    include_swarm_rm_phase_in_obs: bool = True
+    single_observation_space: int = 29
+    state_space: int = 145
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(29,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=10)

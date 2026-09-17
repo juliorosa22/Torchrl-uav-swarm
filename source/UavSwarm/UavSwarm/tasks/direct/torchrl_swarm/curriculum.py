@@ -310,6 +310,36 @@ def set_swarm_gravity_positions(env, env_ids: torch.Tensor, env_origins: torch.T
         env._desired_pos_w[env_id_single, :, 2] = target_z
 
 
+def set_swarm_gravity_rm_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
+    """Stage 10 (SwarmGravityRM): identical spawn/target setup to set_swarm_gravity_positions
+    (reused verbatim), then resets the per-agent RM-phase/slot-assignment tensors and
+    samples a fresh random 3D rotation for this episode's packing-slot arrangement --
+    see torchrl_swarm_env.py's stage-10 tensor allocations and termination.py's stage-10
+    transition block for how these are consumed.
+    """
+    set_swarm_gravity_positions(env, env_ids, env_origins)
+
+    env._swarm_rm_phase[env_ids, :] = 0
+    env._entry_order[env_ids] = 0
+    env._assigned_slot[env_ids, :] = -1
+
+    num_reset_envs = len(env_ids)
+    # Random 3D rotation per env: QR-decompose a random Gaussian matrix to get a uniform
+    # orthonormal basis, then fix determinant to +1 (rotation, not reflection) -- same
+    # "prevent overfitting to one fixed arrangement" reasoning as
+    # get_inverted_v_formation's randomize_heading, extended from yaw-only to full 3D
+    # since packing slots aren't planar.
+    random_mat = torch.randn(num_reset_envs, 3, 3, device=env.device)
+    q, r = torch.linalg.qr(random_mat)
+    diag_sign = torch.sign(torch.diagonal(r, dim1=-2, dim2=-1))
+    diag_sign = torch.where(diag_sign == 0, torch.ones_like(diag_sign), diag_sign)
+    q = q * diag_sign.unsqueeze(-2)
+    det = torch.linalg.det(q)
+    q[:, :, -1] *= torch.sign(det).unsqueeze(-1)
+
+    env._episode_slot_rotation[env_ids] = q
+
+
 def set_stage3_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
     """Set individual obstacle course navigation with waypoint-based goals.
 

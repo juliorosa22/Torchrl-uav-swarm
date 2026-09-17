@@ -21,10 +21,11 @@ from .torchrl_swarm_env_cfg import (
     SingleGoalUAVSwarmEnvCfg,
     SwarmGravityUAVSwarmEnvCfg,
     SwarmGravityV2UAVSwarmEnvCfg,
+    SwarmGravityRMUAVSwarmEnvCfg,
 )
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
-from .formation import compute_swarm_centroid, get_inverted_v_formation
+from .formation import compute_swarm_centroid, get_inverted_v_formation, compute_packing_slots
 from .sensing import ensure_cache_populated
 from .rm_state import switch_rm_state
 from .obstacles import build_stage3_obstacles_at_origin, build_stage5_obstacles_at_origin
@@ -37,6 +38,7 @@ from .curriculum import (
     set_formation_positions,
     set_singlegoal_positions,
     set_swarm_gravity_positions,
+    set_swarm_gravity_rm_positions,
 )
 from .termination import (
     get_dones,
@@ -92,6 +94,31 @@ class BaseSwarmEnv(DirectMARLEnv):
         # RM state buffers: 0=H, 1=S, 2=C, 3=O
         self._rm_states = torch.zeros(self.num_envs, self.num_drones, dtype=torch.long, device=self.device)
         self._rm_state_names = ['H', 'S', 'C', 'O']
+
+        # Stage 10 (SwarmGravityRM) only: 2-state RM (0=outside containment sphere,
+        # 1=inside/packing) tracked per agent, plus arrival-order packing-slot assignment.
+        # See curriculum.py::set_swarm_gravity_rm_positions and
+        # termination.py::_update_swarm_gravity_rm_phase.
+        self._swarm_rm_phase = torch.zeros(self.num_envs, self.num_drones, dtype=torch.long, device=self.device)
+        self._entry_order = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._assigned_slot = torch.full(
+            (self.num_envs, self.num_drones), -1, dtype=torch.long, device=self.device
+        )
+        self._episode_slot_rotation = torch.eye(3, device=self.device).expand(self.num_envs, 3, 3).clone()
+        if self.curriculum_stage == 10:
+            # Computed once (tiny N, cheap electrostatic relaxation) -- see
+            # formation.compute_packing_slots. Centered on the origin; rotated + translated
+            # to the actual shared target per-agent at assignment time.
+            containment_radius = self.cfg.curriculum.get_containment_radius(
+                self.num_drones, self.cfg.swarm_cfg.min_safe_distance
+            )
+            self._canonical_packing_slots = compute_packing_slots(
+                self.num_drones,
+                containment_radius,
+                self.cfg.swarm_cfg.min_safe_distance,
+                self.device,
+                iterations=self.cfg.curriculum.stage10_packing_iterations,
+            )
 
         # Cache buffers
         self._cached_obstacle_dists = torch.zeros(self.num_drones, self.num_envs, device=self.device)
@@ -357,6 +384,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_singlegoal_positions(self, env_ids, env_origins)
         elif stage in (8, 9):
             set_swarm_gravity_positions(self, env_ids, env_origins)
+        elif stage == 10:
+            set_swarm_gravity_rm_positions(self, env_ids, env_origins)
 
     # ------------------------------------------------------------------
     # Observations
@@ -460,7 +489,7 @@ class BaseSwarmEnv(DirectMARLEnv):
             return get_formation_rewards(self)
         if self.curriculum_stage == 7:
             return get_formation_rewards_simple(self)
-        if self.curriculum_stage in (8, 9):
+        if self.curriculum_stage in (8, 9, 10):
             return get_swarm_gravity_rewards(self)
         return get_rewards(self)
 
@@ -521,6 +550,10 @@ def _build_obs_tensor(
     if env.cfg.include_rm_in_obs:
         components.append(rm_state_onehot)            # 4
 
+    if env.cfg.include_swarm_rm_phase_in_obs:
+        swarm_rm_phase_t = env._swarm_rm_phase.transpose(0, 1).float().unsqueeze(-1)  # (D, E, 1)
+        components.append(swarm_rm_phase_t)            # 1
+
     return torch.cat(components, dim=-1)
 
 
@@ -563,3 +596,12 @@ class SwarmGravityV2UAVSwarmEnv(BaseSwarmEnv):
     pairwise distance matrix) for mappo_torchl.GraphAttentionCritic to consume."""
 
     cfg: SwarmGravityV2UAVSwarmEnvCfg
+
+
+class SwarmGravityRMUAVSwarmEnv(BaseSwarmEnv):
+    """Swarm-gravity + 2-state Reward Machine task: entering the containment sphere
+    assigns a personal packing slot (electrostatic-relaxation-computed) by arrival order
+    instead of terminating the episode; success requires the whole swarm settled into
+    its packed arrangement. 29-dim obs (28 + own RM phase), 145-dim state."""
+
+    cfg: SwarmGravityRMUAVSwarmEnvCfg

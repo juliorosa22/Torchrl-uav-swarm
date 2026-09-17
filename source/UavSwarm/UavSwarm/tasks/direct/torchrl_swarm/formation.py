@@ -20,6 +20,56 @@ def compute_swarm_centroid(env) -> None:
     env._swarm_centroid = swarm_positions.mean(dim=1)
 
 
+def compute_packing_slots(
+    num_drones: int,
+    radius: float,
+    min_safe_distance: float,
+    device: str,
+    iterations: int = 500,
+    lr: float = 0.05,
+) -> torch.Tensor:
+    """Compute N fixed 3D positions packed inside a ball of the given radius, via
+    electrostatic relaxation (same inverse-square repulsion spirit as the APF controller
+    used elsewhere in this project) -- a Thomson-problem-style solve, not just named after
+    one. Used once at env construction time (see SwarmGravityRM's stage-10 design) to
+    derive the "orbital slots" agents are assigned to by sphere-entry order, sorted so
+    slot 0 (assigned to the first agent to arrive) is innermost.
+
+    min_safe_distance (R_nh) isn't enforced as a hard constraint here -- the relaxation's
+    own repulsion naturally spreads N points apart, and radius is already derived from
+    get_containment_radius's R_nh-based volume argument, so points settle at a spacing on
+    that order without needing an explicit constraint.
+
+    Returns:
+        Tensor of shape (num_drones, 3), centered on the origin.
+    """
+    if num_drones <= 1:
+        return torch.zeros(max(num_drones, 0), 3, device=device)
+
+    positions = torch.randn(num_drones, 3, device=device) * (radius * 0.5)
+    eye_mask = ~torch.eye(num_drones, dtype=torch.bool, device=device)
+
+    current_lr = lr
+    for _ in range(iterations):
+        diff = positions.unsqueeze(0) - positions.unsqueeze(1)  # diff[i, j] = pos_i - pos_j
+        dist = diff.norm(dim=-1, keepdim=True).clamp(min=1e-3)
+        repulsion = diff / dist**3  # inverse-square force, direction away from neighbor
+        net_force = (repulsion * eye_mask.unsqueeze(-1)).sum(dim=1)
+
+        positions = positions + current_lr * net_force
+
+        norms = positions.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        over = norms > radius
+        positions = torch.where(over, positions / norms * radius, positions)
+
+        current_lr *= 0.995
+
+    # Sort by distance from center ascending: slot 0 = innermost = assigned to whichever
+    # agent enters the sphere first (see stage-10 entry-order assignment).
+    order = positions.norm(dim=1).argsort()
+    return positions[order]
+
+
 def get_inverted_v_formation(
     env,
     env_ids: torch.Tensor,
