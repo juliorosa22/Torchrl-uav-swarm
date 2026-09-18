@@ -507,6 +507,15 @@ class BaseSwarmEnv(DirectMARLEnv):
         debug_vis_callback(self, event)
 
 
+def _clamp_magnitude(x: torch.Tensor, max_val: float) -> torch.Tensor:
+    """Scale down the last-dim vector in x so its norm never exceeds max_val, direction
+    preserved. Same torch.where pattern already used in sensing.py for the position/
+    neighbor-velocity clamps.
+    """
+    norm = x.norm(dim=-1, keepdim=True)
+    return torch.where(norm > max_val, x * (max_val / (norm + 1e-8)), x)
+
+
 def _build_obs_tensor(
     env: BaseSwarmEnv,
     *,
@@ -528,6 +537,13 @@ def _build_obs_tensor(
         rm_states_transposed,
         num_classes=env.cfg.reward_cfg.num_rm_states,
     ).float()  # (num_drones, num_envs, 4)
+
+    # Clamp own velocity magnitude to sensor range -- same protection as
+    # sensing.py's neighbor-relative velocity clamp, applied at the more direct source
+    # (a PhysX collision impulse hits root_lin_vel_b/root_ang_vel_b directly; the
+    # neighbor-relative fields are only derived from this).
+    all_lin_vels = _clamp_magnitude(all_lin_vels, env.cfg.swarm_cfg.max_own_lin_velocity)
+    all_ang_vels = _clamp_magnitude(all_ang_vels, env.cfg.swarm_cfg.max_own_ang_velocity)
 
     components = [
         all_lin_vels,                                # 3

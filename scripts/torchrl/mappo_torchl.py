@@ -173,6 +173,7 @@ class MAPPO:
         normalize_advantage: bool = True,
         normalize_rewards: bool = True,
         max_grad_norm: float = 1.0,
+        target_kl: Optional[float] = None,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.env = env
@@ -185,6 +186,15 @@ class MAPPO:
         # torchrl_mappo_cfg.yaml declares max_grad_norm but it was never threaded through --
         # clip_grad_norm_ below used a bare hardcoded 1.0 regardless of the config's value.
         self.max_grad_norm = max_grad_norm
+        # Standard PPO safety net (Spinning Up / CleanRL reference implementations both
+        # have this; it was absent here) -- stop taking further gradient steps THIS
+        # iteration once the epoch-mean approximate KL exceeds target_kl, instead of
+        # blindly running the full n_epochs regardless of how far the policy has already
+        # moved. None disables it (opt-in, default behavior unchanged for existing runs).
+        # Existing guards (clip_value, Huber critic loss, skip-on-non-finite) all sit on
+        # the critic or after loss computation; this is the first one that can actually
+        # curb a runaway *policy* update before it happens, rather than after.
+        self.target_kl = target_kl
         self.model_name = model_name
         self.gamma = gamma
 
@@ -371,8 +381,11 @@ class MAPPO:
             # stayed exactly 0.0000 for an entire 100-iteration validation run). A plain dict
             # accumulator (mutated in place, not reassigned) has no such issue.
             diag_totals = {"kl_approx": 0.0, "clip_fraction": 0.0, "ESS": 0.0, "explained_variance": 0.0, "entropy": 0.0}
+            epochs_completed = 0
 
             for _ in range(self.n_epochs):
+                epoch_kl_sum = 0.0
+                epoch_kl_count = 0
                 for _ in range(self._buffer_size // self.batch_size):
                     mini_batch = self.buffer.sample().to(self.device)
                     loss_vals = self.loss_module(mini_batch)
@@ -429,7 +442,26 @@ class MAPPO:
                         if key in loss_vals.keys():
                             diag_totals[key] += loss_vals[key].item()
 
+                    if "kl_approx" in loss_vals.keys():
+                        epoch_kl_sum += loss_vals["kl_approx"].item()
+                        epoch_kl_count += 1
+
                     num_updates += 1
+
+                epochs_completed += 1
+
+                # Standard PPO early-stopping (Spinning Up / CleanRL): once the policy has
+                # moved further than target_kl in THIS iteration's epochs so far, stop
+                # taking more gradient steps rather than blindly running the rest of
+                # n_epochs regardless -- see target_kl's docstring in __init__ for why.
+                if self.target_kl is not None and epoch_kl_count > 0:
+                    epoch_avg_kl = epoch_kl_sum / epoch_kl_count
+                    if epoch_avg_kl > self.target_kl:
+                        print(
+                            f"[INFO] Early-stopped at epoch {epochs_completed}/{self.n_epochs} "
+                            f"(KL {epoch_avg_kl:.4f} > target_kl {self.target_kl:.4f})"
+                        )
+                        break
 
             # Sync collector policy
             self.collector.update_policy_weights_()
@@ -466,6 +498,7 @@ class MAPPO:
             self.writer.add_scalar("Reward/Std", reward_std, collected_frames)
 
             self.writer.add_scalar("Diagnostics/kl_approx", avg_kl, collected_frames)
+            self.writer.add_scalar("Diagnostics/epochs_completed", epochs_completed, collected_frames)
             self.writer.add_scalar("Diagnostics/clip_fraction", avg_clip_frac, collected_frames)
             self.writer.add_scalar("Diagnostics/ESS", avg_ess, collected_frames)
             self.writer.add_scalar("Diagnostics/explained_variance", avg_ev, collected_frames)

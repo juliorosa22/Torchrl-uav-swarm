@@ -65,6 +65,16 @@ algorithm:
                              # GAE critic peak: 40960 * 256 hidden * 4 bytes ≈ 42 MB
   max_grad_norm: 1.0
 
+  # Standard PPO early-stopping (Spinning Up/CleanRL default range): once an iteration's
+  # epoch-mean approximate KL exceeds this, stop taking further gradient steps that
+  # iteration rather than blindly running the full n_epochs. Added as a direct guard on
+  # the ACTOR side -- every other stability mechanism here (clip_value, Huber critic
+  # loss, skip-on-non-finite) targets the critic or runs after loss computation; this is
+  # the first one that curbs a runaway policy update before it happens. See
+  # MAPPO.__init__'s target_kl docstring and the swarmgravity-rm-paper memory for the
+  # investigation that motivated it.
+  target_kl: 0.02
+
   # Batch-level advantage normalization (ClipPPOLoss's normalize_advantage kwarg).
   normalize_advantages: true
   # Reward normalization (running discounted-return std, OpenAI Baselines/CleanRL-style),

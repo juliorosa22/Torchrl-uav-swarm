@@ -118,6 +118,14 @@ parser.add_argument(
          "premature entropy collapse (see formation-convergence-investigation memory).",
 )
 parser.add_argument(
+    "--target_kl", type=float, default=None,
+    help="Standard PPO early-stopping (Spinning Up/CleanRL default ~0.01-0.02): once an "
+         "iteration's epoch-mean approximate KL exceeds this, stop taking further gradient "
+         "steps that iteration instead of blindly running the full n_epochs. None (default) "
+         "disables it -- see MAPPO.__init__'s target_kl docstring for why this was added "
+         "(swarmgravity-rm-paper memory: a runaway policy update with no other guard).",
+)
+parser.add_argument(
     "--disable_reset_jitter", action="store_true", default=False,
     help="Diagnostic-only: reproduces the old behavior where only the initial full-batch "
          "reset staggers episode_length_buf phase, not every ordinary per-env reset. "
@@ -241,6 +249,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.curriculum.stage6_simple_reward = True
     if args_cli.entropy_coef is not None:
         config["algorithm"]["entropy_coef"] = args_cli.entropy_coef
+    if args_cli.target_kl is not None:
+        config["algorithm"]["target_kl"] = args_cli.target_kl
     if args_cli.frames_per_batch is not None:
         config["algorithm"]["frames_per_batch"] = args_cli.frames_per_batch
     if args_cli.min_safe_distance is not None:
@@ -299,6 +309,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
+    target_kl = config["algorithm"].get("target_kl")
+    print(f"  Target KL:  {target_kl if target_kl is not None else 'off'}")
     print(f"  Critic:     {args_cli.critic_arch}")
     if args_cli.residual_rl:
         print(f"  Residual RL: ON  (baseline={args_cli.residual_baseline}, kp={args_cli.residual_kp}, scale={args_cli.residual_scale}, repel={args_cli.residual_repel_gain})")
@@ -381,6 +393,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         normalize_advantage=config["algorithm"].get("normalize_advantages", True),
         normalize_rewards=config["algorithm"].get("normalize_rewards", True),
         max_grad_norm=config["algorithm"].get("max_grad_norm", 1.0),
+        target_kl=config["algorithm"].get("target_kl"),
     )
 
     # --- resume ---

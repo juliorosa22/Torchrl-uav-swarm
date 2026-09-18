@@ -232,6 +232,13 @@ class SwarmParameterCfg:
     # max_neighbor_distance's existing clamp pattern -- the position fields already had
     # this protection, the velocity fields did not.
     max_neighbor_velocity: float = 15.0
+    # Same protection for each drone's OWN velocity observation (root_lin_vel_b/
+    # root_ang_vel_b, torchrl_swarm_env.py::_build_obs_tensor) -- the more direct source,
+    # since the neighbor-relative fields above are derived from these. 10x the
+    # controller's commanded ceiling (max_lin_vel_cmd=1.5, max_yaw_rate_cmd=1.0), same
+    # "generous but finite" reasoning as max_neighbor_velocity.
+    max_own_lin_velocity: float = 15.0
+    max_own_ang_velocity: float = 10.0
 
     # Inverted V formation parameters
     formation_base_separation = 0.8
