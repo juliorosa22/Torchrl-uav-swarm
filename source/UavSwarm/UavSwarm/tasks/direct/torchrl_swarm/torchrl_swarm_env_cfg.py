@@ -224,6 +224,14 @@ class SwarmParameterCfg:
     min_safe_distance: float = 1
     optimal_distance: float = 3.0
     max_formation_distance: float = 6.0
+    # Sensor ceiling for neighbor-relative velocity observations (sensing.py's
+    # nearest_rel_vel_w/mean_rel_vel_w) -- generous relative to the controller's commanded
+    # max_lin_vel_cmd (1.5 m/s) to allow normal overshoot, but still a hard bound against a
+    # PhysX contact-resolution impulse (an inter-agent collision) injecting an unbounded
+    # velocity spike straight into the observation the same step it happens. Mirrors
+    # max_neighbor_distance's existing clamp pattern -- the position fields already had
+    # this protection, the velocity fields did not.
+    max_neighbor_velocity: float = 15.0
 
     # Inverted V formation parameters
     formation_base_separation = 0.8

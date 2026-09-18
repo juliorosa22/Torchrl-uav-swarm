@@ -94,6 +94,18 @@ def _get_neighbor_data_vectorized(
 
     all_lin_vels_w = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
     nearest_rel_vel_w = all_lin_vels_w[nearest_idx, env_idx] - all_lin_vels_w  # (D, E, 3)
+    # Clamp magnitude to sensor range -- same protection the position field above already
+    # has (rn/max_dist clamp), now applied to velocity. Without this, a PhysX contact
+    # impulse from an inter-agent collision can inject an unbounded velocity spike
+    # straight into the observation the same step it happens (see
+    # [[swarmgravity-rm-paper]] memory for how this was traced).
+    max_vel = cfg.swarm_cfg.max_neighbor_velocity
+    rvn = nearest_rel_vel_w.norm(dim=2, keepdim=True)
+    nearest_rel_vel_w = torch.where(
+        rvn > max_vel,
+        nearest_rel_vel_w * (max_vel / (rvn + 1e-8)),
+        nearest_rel_vel_w,
+    )
 
     # --- Mean-pooled neighbours (swarm centroid signal) ---
     # -diff[i, j, e, :] = pos_j - pos_i; zero out self-pairs then mean over j
@@ -113,6 +125,15 @@ def _get_neighbor_data_vectorized(
         rm > max_dist,
         mean_rel_pos_w * (max_dist / (rm + 1e-8)),
         mean_rel_pos_w,
+    )
+
+    # Clamp mean velocity magnitude -- same reasoning as nearest_rel_vel_w above; averaging
+    # over neighbors dampens but does not eliminate a single collision-impulse outlier.
+    rvm = mean_rel_vel_w.norm(dim=2, keepdim=True)
+    mean_rel_vel_w = torch.where(
+        rvm > max_vel,
+        mean_rel_vel_w * (max_vel / (rvm + 1e-8)),
+        mean_rel_vel_w,
     )
 
     # --- Transform all four tensors to body frame ---
