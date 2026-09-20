@@ -22,6 +22,7 @@ from .torchrl_swarm_env_cfg import (
     SwarmGravityUAVSwarmEnvCfg,
     SwarmGravityV2UAVSwarmEnvCfg,
     SwarmGravityRMUAVSwarmEnvCfg,
+    PackingSwarmUAVSwarmEnvCfg,
 )
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
@@ -39,6 +40,7 @@ from .curriculum import (
     set_singlegoal_positions,
     set_swarm_gravity_positions,
     set_swarm_gravity_rm_positions,
+    set_packing_swarm_positions,
 )
 from .termination import (
     get_dones,
@@ -105,10 +107,12 @@ class BaseSwarmEnv(DirectMARLEnv):
             (self.num_envs, self.num_drones), -1, dtype=torch.long, device=self.device
         )
         self._episode_slot_rotation = torch.eye(3, device=self.device).expand(self.num_envs, 3, 3).clone()
-        if self.curriculum_stage == 10:
+        if self.curriculum_stage in (10, 11):
             # Computed once (tiny N, cheap electrostatic relaxation) -- see
             # formation.compute_packing_slots. Centered on the origin; rotated + translated
-            # to the actual shared target per-agent at assignment time.
+            # to the actual shared target per-agent at assignment time. Same slots/math
+            # for stage 10 (SwarmGravityRM) and stage 11 (PackingSwarm) -- depends only
+            # on num_drones/R_nh/packing_density, identical for both.
             containment_radius = self.cfg.curriculum.get_containment_radius(
                 self.num_drones, self.cfg.swarm_cfg.min_safe_distance
             )
@@ -283,12 +287,12 @@ class BaseSwarmEnv(DirectMARLEnv):
         log_dict["Metrics/final_distance_to_goal_max"] = final_distance_to_goal_max.item()
         log_dict["Metrics/curriculum_stage"] = self.curriculum_stage
 
-        if self.curriculum_stage == 6:
-            # Per-slot breakdown: distinguishes "one specific V-formation slot always
-            # lags" from "a random agent lags each episode" -- slot index is a stable
-            # geometric identity (0=apex, see get_inverted_v_formation) across episodes,
-            # unlike drone index, which is reshuffled every reset by the Hungarian
-            # assignment in set_formation_positions().
+        if self.curriculum_stage in (6, 11):
+            # Per-slot breakdown: distinguishes "one specific slot always lags" from "a
+            # random agent lags each episode" -- slot index is a stable geometric
+            # identity (0=apex for stage 6, innermost for stage 11's packing slots)
+            # across episodes, unlike drone index, which is reshuffled every reset by
+            # the Hungarian assignment in set_formation_positions/set_packing_swarm_positions.
             slot_ids = self._assigned_slot_idx[env_ids].t()  # (num_drones, num_reset_envs)
             for slot in range(self.num_drones):
                 slot_mask = slot_ids == slot
@@ -386,6 +390,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_swarm_gravity_positions(self, env_ids, env_origins)
         elif stage == 10:
             set_swarm_gravity_rm_positions(self, env_ids, env_origins)
+        elif stage == 11:
+            set_packing_swarm_positions(self, env_ids, env_origins)
 
     # ------------------------------------------------------------------
     # Observations
@@ -489,7 +495,7 @@ class BaseSwarmEnv(DirectMARLEnv):
             return get_formation_rewards(self)
         if self.curriculum_stage == 7:
             return get_formation_rewards_simple(self)
-        if self.curriculum_stage in (8, 9, 10):
+        if self.curriculum_stage in (8, 9, 10, 11):
             return get_swarm_gravity_rewards(self)
         return get_rewards(self)
 
@@ -621,3 +627,12 @@ class SwarmGravityRMUAVSwarmEnv(BaseSwarmEnv):
     its packed arrangement. 29-dim obs (28 + own RM phase), 145-dim state."""
 
     cfg: SwarmGravityRMUAVSwarmEnvCfg
+
+
+class PackingSwarmUAVSwarmEnv(BaseSwarmEnv):
+    """Packing objective isolated on its own: scatter-spawn near the target, Hungarian-
+    assign to electrostatic-relaxation-computed packing slots, learn to settle into them
+    without colliding -- SwarmGravityRM's phase-1 behavior, without the approach phase.
+    28-dim obs (identical schema to Formation/SwarmGravity), 140-dim state."""
+
+    cfg: PackingSwarmUAVSwarmEnvCfg

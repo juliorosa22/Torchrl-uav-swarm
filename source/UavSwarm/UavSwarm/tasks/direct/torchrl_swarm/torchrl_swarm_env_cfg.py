@@ -46,6 +46,9 @@ class CurriculumCfg:
     stage6_episode_length_s: float = 180.0
     stage7_episode_length_s: float = 90.0
     stage8_episode_length_s: float = 120.0
+    # Shorter than stage 8/10's 120s -- agents start already scattered near the target
+    # (see set_packing_swarm_positions), no long flight-in budget needed.
+    stage11_episode_length_s: float = 60.0
 
     # Stage 2 parameters
     stage2_goal_distance: float = 6.0
@@ -138,6 +141,18 @@ class CurriculumCfg:
     stage10_slot_tolerance: float = 0.3
     stage10_packing_iterations: int = 2000
 
+    # Stage 11 parameters (PackingSwarm: the packing objective isolated on its own, no
+    # approach phase -- agents scatter-spawn already near the target and Hungarian-assign
+    # to formation.compute_packing_slots, same as Formation/stage 6 but with the packing
+    # template instead of the V-formation one). See curriculum.py::set_packing_swarm_positions.
+    stage11_spawn_height_range: tuple = (2.0, 4.0)
+    stage11_target_height_range: tuple = (1.5, 4.0)
+    # Comparable to/slightly larger than the default containment radius (~1.0-1.3m for
+    # N=5, R_nh=1.0) -- large enough that the Hungarian assignment is a non-trivial
+    # problem and agents have real distance to close, small enough that this stays a
+    # "settle in" task rather than reintroducing stage 8's long-distance travel.
+    stage11_scatter_spacing_range: tuple = (1.0, 2.0)
+
     def get_containment_radius(self, num_drones: int, min_safe_distance: float) -> float:
         """Sphere radius that must contain every agent for a stage-8 episode to count as
         successful (see docstring on stage8_packing_density). Derived from the
@@ -163,9 +178,10 @@ class CurriculumCfg:
             8: self.stage8_episode_length_s,
             9: self.stage8_episode_length_s,  # SwarmGravityV2 reuses stage 8's tunables
             10: self.stage8_episode_length_s,  # SwarmGravityRM reuses stage 8's tunables
+            11: self.stage11_episode_length_s,
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-10.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-11.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -477,3 +493,36 @@ class SwarmGravityRMUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(29,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=10)
+
+
+@configclass
+class PackingSwarmUAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """Packing objective isolated on its own, no approach phase -- the same "pack tightly
+    into individually-assigned slots without colliding" behavior as SwarmGravityRM's
+    phase 1, but agents scatter-spawn already near the target instead of having to fly
+    in from far away first. Built for the RM-evaluation paper: SwarmGravityRM's coupled
+    2-state task showed a structurally high inter_agent_collision rate that didn't
+    improve with more training; this isolates the packing half so it can be iterated on
+    and proven convergent on its own before re-coupling via the RM.
+
+    Same spawn/assignment architecture as Formation (stage 6) -- scatter-spawn +
+    Hungarian assignment (curriculum.py::set_packing_swarm_positions) -- but assigns to
+    formation.compute_packing_slots's spherical-packing template instead of
+    get_inverted_v_formation's V-formation template. Reward
+    (get_swarm_gravity_rewards) and termination (_check_individual_goals_reached) are
+    both reused completely verbatim from existing tasks -- no new reward/termination
+    logic, just a new spawn pattern feeding the same, already-proven machinery.
+
+    28-dim obs / 140-dim state -- identical schema to Formation/SwarmGravity (no RM
+    one-hot, no RM-phase flag; this is a single, uncoupled task).
+
+    Uses curriculum stage 11 purely as an internal dispatch value, same pattern as every
+    other task here.
+    """
+
+    include_rm_in_obs: bool = False
+    single_observation_space: int = 28
+    state_space: int = 140
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=11)

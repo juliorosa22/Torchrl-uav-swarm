@@ -310,6 +310,23 @@ def set_swarm_gravity_positions(env, env_ids: torch.Tensor, env_origins: torch.T
         env._desired_pos_w[env_id_single, :, 2] = target_z
 
 
+def _sample_random_3d_rotation(num_envs: int, device: str) -> torch.Tensor:
+    """QR-decompose a random Gaussian matrix to get a uniform random orthonormal basis
+    per env, then fix determinant to +1 (rotation, not reflection). Same "prevent
+    overfitting to one fixed arrangement" reasoning as get_inverted_v_formation's
+    randomize_heading, extended from yaw-only to full 3D since packing slots aren't
+    planar. Returns (num_envs, 3, 3).
+    """
+    random_mat = torch.randn(num_envs, 3, 3, device=device)
+    q, r = torch.linalg.qr(random_mat)
+    diag_sign = torch.sign(torch.diagonal(r, dim1=-2, dim2=-1))
+    diag_sign = torch.where(diag_sign == 0, torch.ones_like(diag_sign), diag_sign)
+    q = q * diag_sign.unsqueeze(-2)
+    det = torch.linalg.det(q)
+    q[:, :, -1] *= torch.sign(det).unsqueeze(-1)
+    return q
+
+
 def set_swarm_gravity_rm_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
     """Stage 10 (SwarmGravityRM): identical spawn/target setup to set_swarm_gravity_positions
     (reused verbatim), then resets the per-agent RM-phase/slot-assignment tensors and
@@ -322,22 +339,7 @@ def set_swarm_gravity_rm_positions(env, env_ids: torch.Tensor, env_origins: torc
     env._swarm_rm_phase[env_ids, :] = 0
     env._entry_order[env_ids] = 0
     env._assigned_slot[env_ids, :] = -1
-
-    num_reset_envs = len(env_ids)
-    # Random 3D rotation per env: QR-decompose a random Gaussian matrix to get a uniform
-    # orthonormal basis, then fix determinant to +1 (rotation, not reflection) -- same
-    # "prevent overfitting to one fixed arrangement" reasoning as
-    # get_inverted_v_formation's randomize_heading, extended from yaw-only to full 3D
-    # since packing slots aren't planar.
-    random_mat = torch.randn(num_reset_envs, 3, 3, device=env.device)
-    q, r = torch.linalg.qr(random_mat)
-    diag_sign = torch.sign(torch.diagonal(r, dim1=-2, dim2=-1))
-    diag_sign = torch.where(diag_sign == 0, torch.ones_like(diag_sign), diag_sign)
-    q = q * diag_sign.unsqueeze(-2)
-    det = torch.linalg.det(q)
-    q[:, :, -1] *= torch.sign(det).unsqueeze(-1)
-
-    env._episode_slot_rotation[env_ids] = q
+    env._episode_slot_rotation[env_ids] = _sample_random_3d_rotation(len(env_ids), env.device)
 
 
 def set_stage3_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
@@ -645,5 +647,79 @@ def set_formation_positions(env, env_ids: torch.Tensor, env_origins: torch.Tenso
             rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
 
             assigned_slot = formation_slots[env_idx, col_ind[j]]
+            env._desired_pos_w[env_id_single, j, :] = assigned_slot
+            env._assigned_slot_idx[env_id_single, j] = int(col_ind[j])
+
+
+def set_packing_swarm_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
+    """Stage 11 (PackingSwarm): the packing objective isolated on its own -- same
+    scatter-spawn + Hungarian-assignment structure as set_formation_positions, but
+    assigns to formation.compute_packing_slots's spherical-packing template (rotated by
+    a fresh random 3D rotation each episode, env._episode_slot_rotation -- see
+    _sample_random_3d_rotation) instead of get_inverted_v_formation's V-formation
+    template. Agents spawn already near the target (stage11_scatter_spacing_range is
+    sized relative to the containment radius) -- no long flight-in phase, unlike stage 8.
+    """
+    from scipy.optimize import linear_sum_assignment
+
+    num_reset_envs = len(env_ids)
+    cfg_c = env.cfg.curriculum
+
+    grid_size = int(torch.ceil(torch.sqrt(torch.tensor(env.num_drones, dtype=torch.float32))))
+    spacing = torch.zeros(1, device=env.device).uniform_(
+        cfg_c.stage11_scatter_spacing_range[0],
+        cfg_c.stage11_scatter_spacing_range[1],
+    )
+
+    spawn_lo, spawn_hi = cfg_c.stage11_spawn_height_range
+    target_lo, target_hi = cfg_c.stage11_target_height_range
+
+    target_heights = torch.zeros(num_reset_envs, device=env.device).uniform_(target_lo, target_hi)
+    rotations = _sample_random_3d_rotation(num_reset_envs, env.device)
+    env._episode_slot_rotation[env_ids] = rotations
+    # Rotate the canonical packing template per env, then translate to each env's target
+    # (origin XY + randomized height) -- same "template rotated + translated to target"
+    # structure as get_inverted_v_formation, just full-3D instead of yaw-only.
+    # rotated[e, k, i] = sum_j rotations[e, i, j] * canonical_slots[k, j] -- (E, K, 3),
+    # matching packing_slots[env_idx, slot_idx, :]'s indexing below.
+    rotated_slots = torch.einsum("eij,kj->eki", rotations, env._canonical_packing_slots)
+    packing_slots = rotated_slots.clone()
+    packing_slots[:, :, 0] += env_origins[:, 0].unsqueeze(1)
+    packing_slots[:, :, 1] += env_origins[:, 1].unsqueeze(1)
+    packing_slots[:, :, 2] += target_heights.unsqueeze(1)
+
+    for env_idx in range(num_reset_envs):
+        env_id_single = env_ids[env_idx].unsqueeze(0)
+
+        # Randomized grid scatter around the target, same pattern as set_formation_positions.
+        perm = torch.randperm(env.num_drones, device=env.device)
+        heights = torch.zeros(env.num_drones, device=env.device).uniform_(spawn_lo, spawn_hi)
+        spawn_positions = torch.zeros(env.num_drones, 3, device=env.device)
+
+        for j in range(env.num_drones):
+            grid_idx = perm[j].item()
+            grid_x = (grid_idx % grid_size) * spacing - (grid_size * spacing / 2.0)
+            grid_y = (grid_idx // grid_size) * spacing - (grid_size * spacing / 2.0)
+            spawn_positions[j, 0] = env_origins[env_idx, 0] + grid_x
+            spawn_positions[j, 1] = env_origins[env_idx, 1] + grid_y
+            spawn_positions[j, 2] = heights[j]
+
+        # Hungarian assignment: minimize total distance from scattered spawn to packing slots.
+        cost_matrix = torch.cdist(
+            spawn_positions.unsqueeze(0), packing_slots[env_idx].unsqueeze(0)
+        ).squeeze(0).cpu().numpy()
+        _, col_ind = linear_sum_assignment(cost_matrix)
+
+        for j, rob in enumerate(env._robots):
+            joint_pos = rob.data.default_joint_pos[env_id_single]
+            joint_vel = rob.data.default_joint_vel[env_id_single]
+            default_root_state = rob.data.default_root_state[env_id_single].clone()
+            default_root_state[:, :3] = spawn_positions[j]
+
+            rob.write_root_pose_to_sim(default_root_state[:, :7], env_id_single)
+            rob.write_root_velocity_to_sim(default_root_state[:, 7:], env_id_single)
+            rob.write_joint_state_to_sim(joint_pos, joint_vel, None, env_id_single)
+
+            assigned_slot = packing_slots[env_idx, col_ind[j]]
             env._desired_pos_w[env_id_single, j, :] = assigned_slot
             env._assigned_slot_idx[env_id_single, j] = int(col_ind[j])

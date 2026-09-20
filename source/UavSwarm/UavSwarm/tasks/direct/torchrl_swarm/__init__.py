@@ -80,3 +80,13 @@ gym.register(
         "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="PackingSwarm-TorchRL-UAVSwarm-Direct-v0",
+    entry_point=f"{__name__}.torchrl_swarm_env:PackingSwarmUAVSwarmEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.torchrl_swarm_env_cfg:PackingSwarmUAVSwarmEnvCfg",
+        "skrl_mappo_cfg_entry_point": f"{agents.__name__}:skrl_mappo_cfg.yaml",
+    },
+)
