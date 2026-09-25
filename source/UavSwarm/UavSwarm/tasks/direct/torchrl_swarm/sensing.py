@@ -24,11 +24,14 @@ def ensure_cache_populated(env) -> None:
     env._cached_obstacle_dists, env._cached_obstacle_dir_b = \
         _get_nearest_obstacle_vectorized(env, all_positions, all_quats)
 
-    # Neighbour: nearest (pos + vel) and mean-pooled (pos + vel), all body frame
+    # Neighbour: nearest (pos + vel), mean-pooled (pos + vel), and (when
+    # cfg.include_k_neighbors_in_obs) the K nearest individually -- all body frame.
     (env._cached_neighbor_rel_pos_b,
      env._cached_neighbor_rel_vel_b,
      env._cached_mean_neighbor_pos_b,
-     env._cached_mean_neighbor_vel_b) = _get_neighbor_data_vectorized(env, all_positions, all_quats)
+     env._cached_mean_neighbor_vel_b,
+     env._cached_k_neighbor_pos_b,
+     env._cached_k_neighbor_vel_b) = _get_neighbor_data_vectorized(env, all_positions, all_quats)
 
     env._cache_valid = True
 
@@ -37,10 +40,10 @@ def _get_neighbor_data_vectorized(
     env,
     all_positions: torch.Tensor,  # (num_drones, num_envs, 3)
     all_quats: torch.Tensor,       # (num_drones, num_envs, 4)
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Vectorised nearest-neighbour and mean-neighbour computation.
 
-    Returns all four tensors in drone i's body frame so the policy never
+    Returns all tensors in drone i's body frame so the policy never
     needs to handle world-frame coordinates.
 
     Returns:
@@ -49,6 +52,12 @@ def _get_neighbor_data_vectorized(
         mean_pos_b:    (D, E, 3) — mean relative position of ALL other drones
                                    ≈ swarm-centroid offset in body frame
         mean_vel_b:    (D, E, 3) — mean relative velocity of ALL other drones
+        k_nearest_pos_b: (D, E, K, 3) or None — the K nearest neighbours individually
+                                   (nearest-first), only computed when
+                                   cfg.include_k_neighbors_in_obs (stage 12,
+                                   SwarmGravityAttn's attention policy). K =
+                                   cfg.swarm_cfg.num_observed_neighbors, assumed < num_drones.
+        k_nearest_vel_b: (D, E, K, 3) or None — matching relative velocities.
     """
     cfg = env.cfg
     num_drones = env.num_drones
@@ -69,7 +78,12 @@ def _get_neighbor_data_vectorized(
             all_quats.reshape(-1, 4), default_w.reshape(-1, 3)
         ).reshape(num_drones, num_envs, 3)
         zero_vel = torch.zeros_like(default_b)
-        return default_b, zero_vel, default_b.clone(), zero_vel.clone()
+        k_pos_b = k_vel_b = None
+        if getattr(cfg, "include_k_neighbors_in_obs", False):
+            k = cfg.swarm_cfg.num_observed_neighbors
+            k_pos_b = default_b.unsqueeze(2).expand(-1, -1, k, -1).clone()
+            k_vel_b = zero_vel.unsqueeze(2).expand(-1, -1, k, -1).clone()
+        return default_b, zero_vel, default_b.clone(), zero_vel.clone(), k_pos_b, k_vel_b
 
     # diff[i, j, e, :] = pos_i - pos_j  →  shape (D, D, E, 3)
     diff = all_positions.unsqueeze(1) - all_positions.unsqueeze(0)
@@ -155,7 +169,31 @@ def _get_neighbor_data_vectorized(
         q_flat, mean_rel_vel_w.reshape(-1, 3)
     ).reshape(num_drones, num_envs, 3)
 
-    return nearest_pos_b, nearest_vel_b, mean_pos_b, mean_vel_b
+    # --- K individual nearest neighbours (stage 12, SwarmGravityAttn's attention policy) ---
+    # Reuses distances_masked/all_lin_vels_w already computed above for the nearest-neighbour
+    # case. Only computed when needed -- cheap for tiny N, but no reason to pay it elsewhere.
+    k_nearest_pos_b = k_nearest_vel_b = None
+    if getattr(cfg, "include_k_neighbors_in_obs", False):
+        k = cfg.swarm_cfg.num_observed_neighbors
+        k_idx = torch.topk(distances_masked, k, dim=1, largest=False).indices  # (D, K, E)
+        k_idx = k_idx.permute(0, 2, 1)  # (D, E, K)
+        k_env_idx = env_idx.unsqueeze(-1).expand(-1, -1, k)  # (D, E, K)
+
+        neighbor_pos_w = all_positions[k_idx, k_env_idx]  # (D, E, K, 3)
+        k_rel_pos_w = neighbor_pos_w - all_positions.unsqueeze(2)
+        rk = k_rel_pos_w.norm(dim=3, keepdim=True)
+        k_rel_pos_w = torch.where(rk > max_dist, k_rel_pos_w * (max_dist / (rk + 1e-8)), k_rel_pos_w)
+
+        neighbor_vel_w = all_lin_vels_w[k_idx, k_env_idx]  # (D, E, K, 3)
+        k_rel_vel_w = neighbor_vel_w - all_lin_vels_w.unsqueeze(2)
+        rvk = k_rel_vel_w.norm(dim=3, keepdim=True)
+        k_rel_vel_w = torch.where(rvk > max_vel, k_rel_vel_w * (max_vel / (rvk + 1e-8)), k_rel_vel_w)
+
+        q_k = all_quats.unsqueeze(2).expand(-1, -1, k, -1).reshape(-1, 4)
+        k_nearest_pos_b = quat_apply_inverse(q_k, k_rel_pos_w.reshape(-1, 3)).reshape(num_drones, num_envs, k, 3)
+        k_nearest_vel_b = quat_apply_inverse(q_k, k_rel_vel_w.reshape(-1, 3)).reshape(num_drones, num_envs, k, 3)
+
+    return nearest_pos_b, nearest_vel_b, mean_pos_b, mean_vel_b, k_nearest_pos_b, k_nearest_vel_b
 
 
 def _get_nearest_obstacle_vectorized(

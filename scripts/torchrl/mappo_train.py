@@ -71,6 +71,18 @@ parser.add_argument(
          "inter-agent repulsion for the swarm-gravity task (SwarmGravity-TorchRL-UAVSwarm-Direct-v0).",
 )
 parser.add_argument(
+    "--collision_penalty", type=float, default=None,
+    help="Overrides reward_cfg.collision_penalty (default 0 = off): raw-unit penalty per agent "
+         "whose nearest neighbor is within AGENT_COLLISION_DISTANCE, swarm-gravity family "
+         "(stages 8-11). ~200 is on the order of the discounted cost of continuing, so colliding "
+         "no longer looks cheaper than finishing (see collision_avoidance_literature.md).",
+)
+parser.add_argument(
+    "--proximity_neighbors", type=int, default=None,
+    help="Overrides reward_cfg.proximity_neighbors (default 1 = nearest only): number of nearest "
+         "neighbors summed in the min_safe_distance proximity penalty (Huang et al.: K=2 best).",
+)
+parser.add_argument(
     "--min_safe_distance", type=float, default=None,
     help="Overrides swarm_cfg.min_safe_distance (R_nh) -- the soft inter-agent avoidance "
          "radius used by the swarm-gravity reward/APF baseline and stage 8's derived "
@@ -142,6 +154,16 @@ parser.add_argument(
          "NxN distance matrix after the per-agent obs concat (e.g. SwarmGravityV2 via "
          "include_distance_matrix_in_state); will error on a task that doesn't.",
 )
+parser.add_argument(
+    "--policy_arch", type=str, default="flat", choices=["flat", "attention"],
+    help="'flat' (default): plain MLP over the raw obs vector (MAPPOPolicy). 'attention': "
+         "self+neighbor encoders with cross-attention pooling over the K nearest "
+         "neighbors (AttentionMAPPOPolicy, Batra et al. -- see "
+         "collision_avoidance_literature.md) -- permutation-invariant in neighbor order, "
+         "unlike 'flat' concatenating the same raw features. Requires a task whose obs "
+         "appends a trailing per-neighbor block (e.g. SwarmGravityAttn via "
+         "include_k_neighbors_in_obs); will error on a task that doesn't.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -156,7 +178,7 @@ simulation_app = app_launcher.app
 """Rest follows."""
 
 from torchrl_wrapper import IsaacLabTorchRLWrapper
-from mappo_torchl import MAPPOPolicy, CentralizedCritic, GraphAttentionCritic, MAPPO
+from mappo_torchl import MAPPOPolicy, AttentionMAPPOPolicy, CentralizedCritic, GraphAttentionCritic, MAPPO
 from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg
 from isaaclab.utils.io import dump_yaml
 from datetime import datetime
@@ -170,12 +192,23 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def make_policy(obs_dim: int, action_dim: int, config: dict, device: torch.device) -> ProbabilisticActor:
+def make_policy(
+    obs_dim: int, action_dim: int, config: dict, device: torch.device,
+    policy_arch: str = "flat", num_neighbors: int | None = None,
+) -> ProbabilisticActor:
     """Create shared policy: TensorDictModule → ProbabilisticActor.
 
-    Reads ("agents", "observation"), writes ("agents", "action").
+    Reads ("agents", "observation"), writes ("agents", "action"). "attention" requires
+    num_neighbors (to split obs into own features vs. the trailing per-neighbor block) --
+    only tasks that set include_k_neighbors_in_obs (e.g. SwarmGravityAttn) provide it.
     """
-    net = MAPPOPolicy(obs_dim, action_dim, config["models"]["policy"]["hidden_sizes"]).to(device)
+    if policy_arch == "attention":
+        if num_neighbors is None:
+            raise ValueError("--policy_arch attention requires num_neighbors.")
+        own_obs_dim = obs_dim - num_neighbors * 6
+        net = AttentionMAPPOPolicy(own_obs_dim, num_neighbors, action_dim).to(device)
+    else:
+        net = MAPPOPolicy(obs_dim, action_dim, config["models"]["policy"]["hidden_sizes"]).to(device)
     module = TensorDictModule(
         module=net,
         in_keys=[("agents", "observation")],
@@ -255,6 +288,10 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         config["algorithm"]["frames_per_batch"] = args_cli.frames_per_batch
     if args_cli.min_safe_distance is not None:
         env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
+    if args_cli.collision_penalty is not None:
+        env_cfg.reward_cfg.collision_penalty = args_cli.collision_penalty
+    if args_cli.proximity_neighbors is not None:
+        env_cfg.reward_cfg.proximity_neighbors = args_cli.proximity_neighbors
     if args_cli.gravity_radius is not None:
         env_cfg.curriculum.stage8_gravity_radius = args_cli.gravity_radius
     if args_cli.stage8_episode_length is not None:
@@ -306,11 +343,13 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         r_containment = env_cfg.curriculum.get_containment_radius(env_cfg.num_agents, r_nh)
         print(f"  R_nh:       {r_nh} m   R_gv: {r_gv} m   R_containment (derived): {r_containment:.3f} m")
         print(f"  Episode length: {env_cfg.curriculum.stage8_episode_length_s} s")
+    print(f"  Collision:  penalty={env_cfg.reward_cfg.collision_penalty}  proximity_neighbors={env_cfg.reward_cfg.proximity_neighbors}")
     normalize_obs = args_cli.normalize_obs or config["algorithm"].get("normalize_observations", False)
     print(f"  Obs norm:   {'on' if normalize_obs else 'off'}")
     print(f"  Entropy:    {config['algorithm']['entropy_coef']}")
     target_kl = config["algorithm"].get("target_kl")
     print(f"  Target KL:  {target_kl if target_kl is not None else 'off'}")
+    print(f"  Policy:     {args_cli.policy_arch}")
     print(f"  Critic:     {args_cli.critic_arch}")
     if args_cli.residual_rl:
         print(f"  Residual RL: ON  (baseline={args_cli.residual_baseline}, kp={args_cli.residual_kp}, scale={args_cli.residual_scale}, repel={args_cli.residual_repel_gain})")
@@ -355,7 +394,10 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     print(f"[INFO] obs={obs_dim}  action={action_dim}  state={state_dim}  agents={n_agents}\n")
 
     # --- create networks ---
-    policy = make_policy(obs_dim, action_dim, config, device)
+    policy = make_policy(
+        obs_dim, action_dim, config, device,
+        policy_arch=args_cli.policy_arch, num_neighbors=env_cfg.swarm_cfg.num_observed_neighbors,
+    )
     critic = make_critic(
         state_dim, config, device,
         critic_arch=args_cli.critic_arch, num_agents=n_agents, obs_dim=obs_dim,

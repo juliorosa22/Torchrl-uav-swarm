@@ -74,6 +74,65 @@ class MAPPOPolicy(nn.Module):
         return mean, std.expand_as(mean)
 
 
+class AttentionMAPPOPolicy(nn.Module):
+    """Shared policy with an attention-pooled neighbor encoder (Batra et al., arXiv:
+    2109.07735 -- see collision_avoidance_literature.md): a self-encoder embeds the
+    agent's own state, a shared per-neighbor encoder embeds each of the K nearest
+    neighbors' (rel_pos, rel_vel) individually, and one cross-attention layer (self
+    embedding as query, neighbor embeddings as key/value) pools them into a single
+    neighbor-context vector -- permutation-invariant in neighbor order, unlike
+    concatenating the raw K-neighbor features through a plain MLP (which is what the
+    flat MAPPOPolicy does when pointed at the same task, for a fair architecture-only
+    comparison). Same "small MultiheadAttention + residual + LayerNorm" style as
+    GraphAttentionCritic below.
+
+    Expects obs laid out as [own_obs_dim own features] + [num_neighbors*6 trailing dims:
+    interleaved per-neighbor (rel_pos(3), rel_vel(3))] -- see
+    torchrl_swarm_env.py::_build_obs_tensor's include_k_neighbors_in_obs block.
+    """
+
+    def __init__(
+        self, own_obs_dim: int, num_neighbors: int, action_dim: int,
+        hidden_dim: int = 64, num_heads: int = 4, mlp_hidden=(128, 64),
+    ):
+        super().__init__()
+        self.own_obs_dim = own_obs_dim
+        self.num_neighbors = num_neighbors
+        self.self_encoder = nn.Sequential(nn.Linear(own_obs_dim, hidden_dim), nn.ReLU())
+        self.neighbor_encoder = nn.Sequential(nn.Linear(6, hidden_dim), nn.ReLU())
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+        layers = []
+        prev = hidden_dim * 2  # self-embedding + pooled neighbor-context, concatenated
+        for h in mlp_hidden:
+            layers.extend([nn.Linear(prev, h), nn.ReLU()])
+            prev = h
+        self.head = nn.Sequential(*layers)
+        self.mean_layer = nn.Linear(prev, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+
+    def forward(self, obs: torch.Tensor):
+        """obs: (*batch, own_obs_dim + num_neighbors*6) -> mean, std (*batch, action_dim)."""
+        orig_shape = obs.shape[:-1]
+        flat_obs = obs.reshape(-1, obs.shape[-1])
+
+        own = flat_obs[:, :self.own_obs_dim]
+        neighbors = flat_obs[:, self.own_obs_dim:].reshape(-1, self.num_neighbors, 6)
+
+        self_embed = self.self_encoder(own)  # (B, hidden_dim)
+        neighbor_embed = self.neighbor_encoder(neighbors)  # (B, K, hidden_dim)
+
+        query = self_embed.unsqueeze(1)  # (B, 1, hidden_dim)
+        attn_out, _ = self.attn(query, neighbor_embed, neighbor_embed)  # (B, 1, hidden_dim)
+        pooled = self.norm(query + attn_out).squeeze(1)  # (B, hidden_dim)
+
+        features = self.head(torch.cat([self_embed, pooled], dim=-1))
+        mean = self.mean_layer(features).reshape(*orig_shape, -1)
+        std = torch.exp(self.log_std.clamp(-20, 2)).expand_as(mean)
+        return mean, std
+
+
 class CentralizedCritic(nn.Module):
     """Centralized critic — sees concatenated state of all agents."""
 

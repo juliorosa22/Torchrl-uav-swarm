@@ -78,9 +78,9 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
             env._desired_pos_w[advancing] = next_targets.unsqueeze(1).expand(-1, env.num_drones, -1)
         goal_reached = goal_reached & is_last_waypoint
 
-    # Inter-agent collision (stage 8/9/10/11 only -- see docstring point 5)
+    # Inter-agent collision (stage 8/9/10/11/12 only -- see docstring point 5)
     died_agent_collision = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if env.curriculum_stage in (8, 9, 10, 11):
+    if env.curriculum_stage in (8, 9, 10, 11, 12):
         from .sensing import ensure_cache_populated
 
         ensure_cache_populated(env)
@@ -138,7 +138,7 @@ def _check_goal_reached(env) -> torch.Tensor:
         return _check_individual_goals_reached(env)
     elif stage == 7:
         return _check_individual_goals_reached(env)
-    elif stage in (8, 9):
+    elif stage in (8, 9, 12):
         return _check_swarm_gravity_reached(env)
     elif stage == 10:
         return _check_packing_complete(env)

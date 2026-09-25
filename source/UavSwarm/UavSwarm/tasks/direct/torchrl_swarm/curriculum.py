@@ -336,6 +336,7 @@ def set_swarm_gravity_rm_positions(env, env_ids: torch.Tensor, env_origins: torc
     """
     set_swarm_gravity_positions(env, env_ids, env_origins)
 
+    env._shared_target_w[env_ids] = env._desired_pos_w[env_ids, 0, :]
     env._swarm_rm_phase[env_ids, :] = 0
     env._entry_order[env_ids] = 0
     env._assigned_slot[env_ids, :] = -1

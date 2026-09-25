@@ -23,6 +23,7 @@ from .torchrl_swarm_env_cfg import (
     SwarmGravityV2UAVSwarmEnvCfg,
     SwarmGravityRMUAVSwarmEnvCfg,
     PackingSwarmUAVSwarmEnvCfg,
+    SwarmGravityAttnUAVSwarmEnvCfg,
 )
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
@@ -107,6 +108,9 @@ class BaseSwarmEnv(DirectMARLEnv):
             (self.num_envs, self.num_drones), -1, dtype=torch.long, device=self.device
         )
         self._episode_slot_rotation = torch.eye(3, device=self.device).expand(self.num_envs, 3, 3).clone()
+        # Stage 10 only: the true shared target (containment-sphere center). _desired_pos_w[:, 0]
+        # stops holding it once agent 0 switches to its own slot, so viz/eval can't read it there.
+        self._shared_target_w = torch.zeros(self.num_envs, 3, device=self.device)
         if self.curriculum_stage in (10, 11):
             # Computed once (tiny N, cheap electrostatic relaxation) -- see
             # formation.compute_packing_slots. Centered on the origin; rotated + translated
@@ -386,7 +390,7 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_formation_positions(self, env_ids, env_origins)
         elif stage == 7:
             set_singlegoal_positions(self, env_ids, env_origins)
-        elif stage in (8, 9):
+        elif stage in (8, 9, 12):
             set_swarm_gravity_positions(self, env_ids, env_origins)
         elif stage == 10:
             set_swarm_gravity_rm_positions(self, env_ids, env_origins)
@@ -495,7 +499,7 @@ class BaseSwarmEnv(DirectMARLEnv):
             return get_formation_rewards(self)
         if self.curriculum_stage == 7:
             return get_formation_rewards_simple(self)
-        if self.curriculum_stage in (8, 9, 10, 11):
+        if self.curriculum_stage in (8, 9, 10, 11, 12):
             return get_swarm_gravity_rewards(self)
         return get_rewards(self)
 
@@ -576,6 +580,16 @@ def _build_obs_tensor(
         swarm_rm_phase_t = env._swarm_rm_phase.transpose(0, 1).float().unsqueeze(-1)  # (D, E, 1)
         components.append(swarm_rm_phase_t)            # 1
 
+    if env.cfg.include_k_neighbors_in_obs:
+        # Interleaved per-neighbor [pos(3), vel(3)] blocks, nearest-first -- see
+        # sensing.py::_get_neighbor_data_vectorized and mappo_torchl.AttentionMAPPOPolicy,
+        # which reshapes this same trailing K*6 slice back into (*, K, 6) per-neighbor tokens.
+        k = env._cached_k_neighbor_pos_b.shape[2]
+        k_neighbors = torch.cat(
+            [env._cached_k_neighbor_pos_b, env._cached_k_neighbor_vel_b], dim=-1
+        ).reshape(env.num_drones, env.num_envs, k * 6)
+        components.append(k_neighbors)                 # K*6
+
     return torch.cat(components, dim=-1)
 
 
@@ -636,3 +650,12 @@ class PackingSwarmUAVSwarmEnv(BaseSwarmEnv):
     28-dim obs (identical schema to Formation/SwarmGravity), 140-dim state."""
 
     cfg: PackingSwarmUAVSwarmEnvCfg
+
+
+class SwarmGravityAttnUAVSwarmEnv(BaseSwarmEnv):
+    """SwarmGravity variant for the actor-architecture experiment: same task as stage 8,
+    but exposes each agent's K nearest neighbors individually instead of only the single
+    nearest + a mean-pooled summary, for mappo_torchl.AttentionMAPPOPolicy
+    (--policy_arch attention) to attend over. 40-dim obs (28 + K*6), 200-dim state."""
+
+    cfg: SwarmGravityAttnUAVSwarmEnvCfg

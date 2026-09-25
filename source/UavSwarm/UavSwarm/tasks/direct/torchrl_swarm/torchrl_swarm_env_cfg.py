@@ -179,9 +179,10 @@ class CurriculumCfg:
             9: self.stage8_episode_length_s,  # SwarmGravityV2 reuses stage 8's tunables
             10: self.stage8_episode_length_s,  # SwarmGravityRM reuses stage 8's tunables
             11: self.stage11_episode_length_s,
+            12: self.stage8_episode_length_s,  # SwarmGravityAttn reuses stage 8's tunables
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-11.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-12.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -230,6 +231,17 @@ class RewardMachineCfg:
     safe_obstacle_distance: float = 0.4
     optimal_neighbor_distance: float = 1
 
+    # Swarm-gravity family (stages 8-11) collision-avoidance reward shaping, both off by
+    # default (see collision_avoidance_literature.md for the motivation):
+    # Raw-unit penalty per agent whose nearest neighbor is within AGENT_COLLISION_DISTANCE.
+    # The reward is otherwise <= 0 every step and a collision terminates the episode, so
+    # without a penalty comparable to the discounted cost of continuing (~-140 from 4 m out,
+    # ~-300 from 6 m) ending the episode by colliding stops the accumulating negative reward.
+    collision_penalty: float = 0.0
+    # Number of nearest neighbors summed in the min_safe_distance proximity penalty (Batra et
+    # al. sum over all observed neighbors; Huang et al. found K=2 best). 1 = nearest only.
+    proximity_neighbors: int = 1
+
 
 @configclass
 class SwarmParameterCfg:
@@ -255,6 +267,11 @@ class SwarmParameterCfg:
     # "generous but finite" reasoning as max_neighbor_velocity.
     max_own_lin_velocity: float = 15.0
     max_own_ang_velocity: float = 10.0
+    # Number of nearest neighbors exposed individually to an attention-based policy (stage
+    # 12, SwarmGravityAttn) -- see sensing.py's k_nearest_pos_b/k_nearest_vel_b. Huang et
+    # al. (collision_avoidance_literature.md) found K=2 best; only takes effect when
+    # BaseSwarmEnvCfg.include_k_neighbors_in_obs is set, and must stay < num_agents.
+    num_observed_neighbors: int = 2
 
     # Inverted V formation parameters
     formation_base_separation = 0.8
@@ -287,6 +304,11 @@ class BaseSwarmEnvCfg(DirectMARLEnvCfg):
     # SwarmGravityRM (stage 10) only: appends each agent's own RM phase (0=outside the
     # containment sphere, 1=inside/packing) as a 1-dim observation component.
     include_swarm_rm_phase_in_obs: bool = False
+    # SwarmGravityAttn (stage 12) only: appends the K nearest neighbors' relative
+    # position/velocity individually (sensing.py's k_nearest_pos_b/k_nearest_vel_b,
+    # K = swarm_cfg.num_observed_neighbors), for an attention-based policy
+    # (mappo_torchl.AttentionMAPPOPolicy) to consume -- see collision_avoidance_literature.md.
+    include_k_neighbors_in_obs: bool = False
 
     # Episode / stepping
     episode_length_s = 30.0
@@ -526,3 +548,35 @@ class PackingSwarmUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=11)
+
+
+@configclass
+class SwarmGravityAttnUAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """SwarmGravity variant for the actor-architecture experiment (see
+    collision_avoidance_literature.md): identical task semantics to stage 8 (same
+    shared-target spawn/attraction/repulsion, get_swarm_gravity_rewards/
+    set_swarm_gravity_positions/_check_swarm_gravity_reached all reused verbatim), but
+    exposes each agent's K=swarm_cfg.num_observed_neighbors nearest neighbors
+    individually (sensing.py's k_nearest_pos_b/k_nearest_vel_b) instead of only the
+    single nearest + a mean-pooled summary, for mappo_torchl.AttentionMAPPOPolicy
+    (--policy_arch attention) to attend over -- Batra et al. and Huang et al. both found
+    this necessary specifically in the same-shared-target scenario stage 8 already is.
+
+    28-dim obs (identical schema to stage 8) + 2*K*3 dims (K nearest neighbors' relative
+    position + velocity, K=2 default) = 40. 5*40 = 200-dim state (no distance-matrix
+    augmentation -- critic-architecture experiments are tested separately on stage 9).
+    Also works unchanged with the existing flat MAPPOPolicy (--policy_arch flat), which
+    just sees the extra dims as more raw input -- this is what makes the flat-vs-attention
+    comparison on this task an architecture-only ablation, not a confounded one.
+
+    Uses curriculum stage 12 purely as an internal dispatch value, same pattern as every
+    other task here.
+    """
+
+    include_rm_in_obs: bool = False
+    include_k_neighbors_in_obs: bool = True
+    single_observation_space: int = 40
+    state_space: int = 200
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(40,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=12)

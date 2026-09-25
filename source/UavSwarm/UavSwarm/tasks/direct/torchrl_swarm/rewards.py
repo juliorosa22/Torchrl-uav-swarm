@@ -419,6 +419,9 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     _desired_pos_w is now the same point) plus get_formation_rewards's existing
     inter-agent safety penalty (repulsion below swarm_cfg.min_safe_distance = R_nh) --
     nothing else, so the reward only encodes the two effects the task is meant to test.
+    Two optional shaping terms, both off by default: reward_cfg.proximity_neighbors (sum the
+    proximity penalty over the K nearest neighbors) and reward_cfg.collision_penalty (per-agent
+    penalty on collision).
     """
     from .sensing import ensure_cache_populated
 
@@ -432,10 +435,22 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
 
     neighbor_dists = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)
     min_safe = env.cfg.swarm_cfg.min_safe_distance
-    safety_violation = torch.clamp(min_safe - neighbor_dists, min=0.0)
-    safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
+    proximity_k = min(env.cfg.reward_cfg.proximity_neighbors, env.num_drones - 1)
+    if proximity_k > 1:
+        pair_dists = torch.linalg.norm(all_positions.unsqueeze(1) - all_positions.unsqueeze(0), dim=3)  # (D, D, E)
+        self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).unsqueeze(-1)
+        pair_dists = pair_dists.masked_fill(self_mask, float("inf"))
+        k_nearest = torch.topk(pair_dists, proximity_k, dim=1, largest=False).values  # (D, K, E)
+        safety_violation = torch.clamp(min_safe - k_nearest, min=0.0)
+        safety_penalty = -K_FORM_SAFETY * (safety_violation ** 2).sum(dim=1)
+    else:
+        safety_violation = torch.clamp(min_safe - neighbor_dists, min=0.0)
+        safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
 
     per_drone_reward = attraction + safety_penalty
+    collision_penalty = env.cfg.reward_cfg.collision_penalty
+    if collision_penalty != 0.0:
+        per_drone_reward = per_drone_reward - collision_penalty * (neighbor_dists < AGENT_COLLISION_DISTANCE).float()
     # Guard against NaN/Inf from a diverged drone (tumbling after a hard collision --
     # same failure this task's collision termination is meant to catch before physics
     # actually blows up, but the reward is computed the same step). Not just cosmetic:
