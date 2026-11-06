@@ -724,3 +724,9 @@ def set_packing_swarm_positions(env, env_ids: torch.Tensor, env_origins: torch.T
             assigned_slot = packing_slots[env_idx, col_ind[j]]
             env._desired_pos_w[env_id_single, j, :] = assigned_slot
             env._assigned_slot_idx[env_id_single, j] = int(col_ind[j])
+
+
+def set_packing_mono_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
+    """Stage 13 (PackingMono): stage-8 spawn/target; goal stays the shared target (no phases)."""
+    set_swarm_gravity_positions(env, env_ids, env_origins)
+    env._shared_target_w[env_ids] = env._desired_pos_w[env_ids, 0, :]

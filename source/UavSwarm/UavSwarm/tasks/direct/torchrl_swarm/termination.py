@@ -80,7 +80,7 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
 
     # Inter-agent collision (stage 8/9/10/11/12 only -- see docstring point 5)
     died_agent_collision = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    if env.curriculum_stage in (8, 9, 10, 11, 12):
+    if env.curriculum_stage in (8, 9, 10, 11, 12, 13):
         from .sensing import ensure_cache_populated
 
         ensure_cache_populated(env)
@@ -140,7 +140,11 @@ def _check_goal_reached(env) -> torch.Tensor:
         return _check_individual_goals_reached(env)
     elif stage in (8, 9, 12):
         return _check_swarm_gravity_reached(env)
+    elif stage == 13:
+        return _check_packed_common(env)
     elif stage == 10:
+        if env.cfg.reward_cfg.shared_packing_reward:
+            return _check_packed_common(env)
         return _check_packing_complete(env)
     elif stage == 11:
         # PackingSwarm: _desired_pos_w holds each agent's Hungarian-assigned packing
@@ -256,10 +260,34 @@ def _update_swarm_gravity_rm_phase(env) -> None:
             canonical_slot = env._canonical_packing_slots[slot]  # (3,)
             rotated_slot = env._episode_slot_rotation[env_idx] @ canonical_slot
             env._desired_pos_w[env_idx, drone_idx] = target_w[env_idx, drone_idx] + rotated_slot
+            env._prev_potential[drone_idx, env_idx] = float('nan')
 
     sphere_entered = torch.zeros(env.num_envs, device=env.device)
     sphere_entered[entered_envs] = 1.0
     env._metrics.update(sphere_entered=sphere_entered)
+
+
+def _check_packed_common(env) -> torch.Tensor:
+    """Arm-agnostic packed success (stages 10/13 with shared_packing_reward): every agent
+    inside the containment sphere around the shared target, nearest-neighbor spacing
+    >= pack_min_sep_frac*R_nh, and speed <= pack_speed_threshold. Needs no RM state, so
+    the monolithic and RM arms terminate on the identical condition.
+    """
+    from .sensing import ensure_cache_populated
+
+    ensure_cache_populated(env)
+    rc = env.cfg.reward_cfg
+    pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    vel = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
+
+    radius = env.cfg.curriculum.get_containment_radius(env.num_drones, env.cfg.swarm_cfg.min_safe_distance)
+    inside = torch.linalg.norm(env._shared_target_w.unsqueeze(0) - pos, dim=2) <= radius  # (D, E)
+    nn_dist = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)
+    spaced = nn_dist >= rc.pack_min_sep_frac * env.cfg.swarm_cfg.min_safe_distance
+    slow = torch.linalg.norm(vel, dim=2) <= rc.pack_speed_threshold
+
+    env._metrics.update(pack_progress=inside.float().mean(dim=0))
+    return (inside & spaced & slow).all(dim=0)
 
 
 def _check_packing_complete(env) -> torch.Tensor:

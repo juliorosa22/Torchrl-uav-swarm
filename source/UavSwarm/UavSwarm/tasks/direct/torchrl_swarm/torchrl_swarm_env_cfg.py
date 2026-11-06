@@ -180,9 +180,10 @@ class CurriculumCfg:
             10: self.stage8_episode_length_s,  # SwarmGravityRM reuses stage 8's tunables
             11: self.stage11_episode_length_s,
             12: self.stage8_episode_length_s,  # SwarmGravityAttn reuses stage 8's tunables
+            13: self.stage8_episode_length_s,  # PackingMono reuses stage 8's tunables
         }
         if self.active_stage not in stage_lengths:
-            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-12.")
+            raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-13.")
         return stage_lengths[self.active_stage]
 
     def get_stage3_params(self) -> dict:
@@ -241,6 +242,21 @@ class RewardMachineCfg:
     # Number of nearest neighbors summed in the min_safe_distance proximity penalty (Batra et
     # al. sum over all observed neighbors; Huang et al. found K=2 best). 1 = nearest only.
     proximity_neighbors: int = 1
+
+    # get_packing_rewards (stages 10/13 with shared_packing_reward=True). Magnitudes are
+    # untuned starting points -- set from smoke tests, not derived.
+    shared_packing_reward: bool = False
+    use_progress_term: bool = True
+    shaping_gamma: float = 0.99  # must match the PPO gamma in torchrl_mappo_cfg_*.yaml
+    progress_scale: float = 20.0
+    settle_vel_penalty: float = 1.0
+    success_bonus: float = 50.0
+    failure_penalty: float = 50.0
+    # Common packed-success criterion (stages 10/13 when shared_packing_reward=True): all
+    # agents inside the containment sphere, nearest-neighbor >= pack_min_sep_frac*R_nh,
+    # speed <= pack_speed_threshold.
+    pack_min_sep_frac: float = 0.9
+    pack_speed_threshold: float = 0.2
 
 
 @configclass
@@ -580,3 +596,23 @@ class SwarmGravityAttnUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(40,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=12)
+
+
+@configclass
+class PackingMonoUAVSwarmEnvCfg(BaseSwarmEnvCfg):
+    """Monolithic (no-RM) control arm for the RM-vs-no-RM packing comparison against stage
+    10: identical spawn/target to stage 8, 28-dim obs, goal stays the shared target for
+    the whole episode (no slot assignment, no phase). Rewarded and terminated through the
+    same get_packing_rewards / common packed-success criterion as stage 10, so the arms
+    differ only in the RM's goal-switching. shared_packing_reward is forced on.
+
+    Uses curriculum stage 13 purely as an internal dispatch value.
+    """
+
+    include_rm_in_obs: bool = False
+    single_observation_space: int = 28
+    state_space: int = 140
+    observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
+
+    curriculum: CurriculumCfg = CurriculumCfg(active_stage=13)
+    reward_cfg: RewardMachineCfg = RewardMachineCfg(shared_packing_reward=True)

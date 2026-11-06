@@ -78,6 +78,14 @@ parser.add_argument(
          "no longer looks cheaper than finishing (see collision_avoidance_literature.md).",
 )
 parser.add_argument(
+    "--shared_packing_reward", action="store_true", default=False,
+    help="Stage 10: use get_packing_rewards + the common packed-success criterion (always on for stage 13).",
+)
+parser.add_argument(
+    "--no_progress_term", action="store_true", default=False,
+    help="get_packing_rewards ablation: drop the potential-based progress term.",
+)
+parser.add_argument(
     "--proximity_neighbors", type=int, default=None,
     help="Overrides reward_cfg.proximity_neighbors (default 1 = nearest only): number of nearest "
          "neighbors summed in the min_safe_distance proximity penalty (Huang et al.: K=2 best).",
@@ -290,6 +298,10 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
     if args_cli.collision_penalty is not None:
         env_cfg.reward_cfg.collision_penalty = args_cli.collision_penalty
+    if args_cli.shared_packing_reward:
+        env_cfg.reward_cfg.shared_packing_reward = True
+    if args_cli.no_progress_term:
+        env_cfg.reward_cfg.use_progress_term = False
     if args_cli.proximity_neighbors is not None:
         env_cfg.reward_cfg.proximity_neighbors = args_cli.proximity_neighbors
     if args_cli.gravity_radius is not None:

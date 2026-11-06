@@ -413,6 +413,22 @@ def get_formation_rewards_simple(env) -> dict[str, torch.Tensor]:
     return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}
 
 
+def _proximity_safety_penalty(env, all_positions: torch.Tensor, neighbor_dists: torch.Tensor) -> torch.Tensor:
+    """Quadratic penalty below swarm_cfg.min_safe_distance, summed over the K nearest
+    neighbors (reward_cfg.proximity_neighbors). Returns (num_drones, num_envs)."""
+    min_safe = env.cfg.swarm_cfg.min_safe_distance
+    proximity_k = min(env.cfg.reward_cfg.proximity_neighbors, env.num_drones - 1)
+    if proximity_k > 1:
+        pair_dists = torch.linalg.norm(all_positions.unsqueeze(1) - all_positions.unsqueeze(0), dim=3)  # (D, D, E)
+        self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).unsqueeze(-1)
+        pair_dists = pair_dists.masked_fill(self_mask, float("inf"))
+        k_nearest = torch.topk(pair_dists, proximity_k, dim=1, largest=False).values  # (D, K, E)
+        safety_violation = torch.clamp(min_safe - k_nearest, min=0.0)
+        return -K_FORM_SAFETY * (safety_violation ** 2).sum(dim=1)
+    safety_violation = torch.clamp(min_safe - neighbor_dists, min=0.0)
+    return -K_FORM_SAFETY * safety_violation ** 2
+
+
 def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     """Swarm-gravity reward (curriculum stage 8): individual attraction to the shared
     target (same pose-distance law as get_formation_rewards_simple, since every agent's
@@ -434,18 +450,7 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     attraction = torch.nan_to_num(-distances, nan=0.0, posinf=0.0, neginf=0.0)
 
     neighbor_dists = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)
-    min_safe = env.cfg.swarm_cfg.min_safe_distance
-    proximity_k = min(env.cfg.reward_cfg.proximity_neighbors, env.num_drones - 1)
-    if proximity_k > 1:
-        pair_dists = torch.linalg.norm(all_positions.unsqueeze(1) - all_positions.unsqueeze(0), dim=3)  # (D, D, E)
-        self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).unsqueeze(-1)
-        pair_dists = pair_dists.masked_fill(self_mask, float("inf"))
-        k_nearest = torch.topk(pair_dists, proximity_k, dim=1, largest=False).values  # (D, K, E)
-        safety_violation = torch.clamp(min_safe - k_nearest, min=0.0)
-        safety_penalty = -K_FORM_SAFETY * (safety_violation ** 2).sum(dim=1)
-    else:
-        safety_violation = torch.clamp(min_safe - neighbor_dists, min=0.0)
-        safety_penalty = -K_FORM_SAFETY * safety_violation ** 2
+    safety_penalty = _proximity_safety_penalty(env, all_positions, neighbor_dists)
 
     per_drone_reward = attraction + safety_penalty
     collision_penalty = env.cfg.reward_cfg.collision_penalty
@@ -472,6 +477,66 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
         formation=distances.mean(dim=0),
         agent_collision=agent_collision,
         min_neighbor_distance=min_neighbor_distance_step,
+    )
+
+    return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}
+
+
+def get_packing_rewards(env) -> dict[str, torch.Tensor]:
+    """Shared reward for the stage-10 (RM) and stage-13 (monolithic) packing arms: the same
+    function of state for both, so the arms differ only in what _desired_pos_w holds
+    (personal slot after sphere entry vs the shared target throughout).
+
+    progress: gamma*Phi(s') - Phi(s), Phi = -dist(agent, _desired_pos_w), scaled by
+              progress_scale. Potential-based (policy-invariant), no negative bias, so
+              ending the episode early is never rewarded. Disabled by use_progress_term=False.
+    safety:   same quadratic min_safe_distance penalty as get_swarm_gravity_rewards.
+    settle:   -settle_vel_penalty*|v|^2 while inside the containment sphere around the
+              shared target.
+    terminal: +success_bonus on goal_reached, -failure_penalty on any failure termination.
+    """
+    from .sensing import ensure_cache_populated
+
+    ensure_cache_populated(env)
+    rc = env.cfg.reward_cfg
+
+    all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    all_vels = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)  # (D, E, 3)
+    goal = env._desired_pos_w.transpose(0, 1)
+    distances = torch.nan_to_num(torch.linalg.norm(goal - all_positions, dim=2), nan=0.0, posinf=0.0, neginf=0.0)
+
+    potential = -distances
+    prev = env._prev_potential
+    if rc.use_progress_term:
+        progress = rc.progress_scale * torch.where(
+            torch.isnan(prev), torch.zeros_like(potential), rc.shaping_gamma * potential - prev
+        )
+    else:
+        progress = torch.zeros_like(potential)
+    env._prev_potential = potential.detach().clone()
+
+    neighbor_dists = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)
+    safety_penalty = _proximity_safety_penalty(env, all_positions, neighbor_dists)
+
+    containment_radius = env.cfg.curriculum.get_containment_radius(env.num_drones, env.cfg.swarm_cfg.min_safe_distance)
+    dist_to_target = torch.linalg.norm(env._shared_target_w.unsqueeze(0) - all_positions, dim=2)
+    inside = (dist_to_target <= containment_radius).float()
+    settle = -rc.settle_vel_penalty * inside * torch.nan_to_num(all_vels).pow(2).sum(dim=2)
+
+    reasons = env._termination_reasons
+    failed = reasons["collision"] | reasons["out_of_bounds"] | reasons["inter_agent_collision"]
+    terminal = rc.success_bonus * reasons["goal_reached"].float() - rc.failure_penalty * failed.float()
+
+    per_drone_reward = progress + safety_penalty + settle + terminal.unsqueeze(0)
+    per_drone_reward = torch.nan_to_num(per_drone_reward, nan=0.0, posinf=0.0, neginf=-1.0)
+
+    env._metrics.update(
+        distance_to_goal=distances.mean(dim=0),
+        mean_reward=per_drone_reward.mean(dim=0),
+        dist_component=progress.mean(dim=0),
+        formation=distances.mean(dim=0),
+        agent_collision=(neighbor_dists < AGENT_COLLISION_DISTANCE).any(dim=0).float(),
+        min_neighbor_distance=neighbor_dists.min(dim=0).values,
     )
 
     return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}

@@ -105,7 +105,7 @@ def set_debug_vis_impl(env, debug_vis: bool) -> None:
         # refract) produced real translucency in an offscreen RTX capture; solid
         # wireframe geometry sidesteps the problem entirely and still lets agents be
         # seen crossing into the volume through the gaps between segments.
-        if env.curriculum_stage in (8, 9, 10) and not hasattr(env, "containment_sphere_visualizer"):
+        if env.curriculum_stage in (8, 9, 10, 13) and not hasattr(env, "containment_sphere_visualizer"):
             radius = env.cfg.curriculum.get_containment_radius(
                 env.num_drones, env.cfg.swarm_cfg.min_safe_distance
             )
@@ -186,9 +186,9 @@ def debug_vis_callback(env, _event) -> None:
     # dedicated _shared_target_w instead. The wireframe pattern itself is fixed (computed
     # once in set_debug_vis_impl); only its center translates.
     if hasattr(env, "containment_sphere_visualizer"):
-        if env.curriculum_stage in (8, 9, 10):
+        if env.curriculum_stage in (8, 9, 10, 13):
             env.containment_sphere_visualizer.set_visibility(True)
-            target = env._shared_target_w if env.curriculum_stage == 10 else env._desired_pos_w[:, 0, :]  # (num_envs, 3)
+            target = env._shared_target_w if env.curriculum_stage in (10, 13) else env._desired_pos_w[:, 0, :]  # (num_envs, 3)
             local_pos = env._containment_wireframe_local_pos  # (S, 3)
             local_quat = env._containment_wireframe_local_quat  # (S, 4)
             translations = (target.unsqueeze(1) + local_pos.unsqueeze(0)).reshape(-1, 3)

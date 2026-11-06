@@ -24,6 +24,7 @@ from .torchrl_swarm_env_cfg import (
     SwarmGravityRMUAVSwarmEnvCfg,
     PackingSwarmUAVSwarmEnvCfg,
     SwarmGravityAttnUAVSwarmEnvCfg,
+    PackingMonoUAVSwarmEnvCfg,
 )
 from .controller import apply_controller
 from .metrics import EpisodeMetrics
@@ -42,13 +43,14 @@ from .curriculum import (
     set_swarm_gravity_positions,
     set_swarm_gravity_rm_positions,
     set_packing_swarm_positions,
+    set_packing_mono_positions,
 )
 from .termination import (
     get_dones,
     update_waypoint_goals,
     update_swarm_waypoint_goals,
 )
-from .rewards import get_rewards, get_formation_rewards, get_formation_rewards_simple, get_swarm_gravity_rewards
+from .rewards import get_rewards, get_formation_rewards, get_formation_rewards_simple, get_swarm_gravity_rewards, get_packing_rewards
 from .debug_viz import set_debug_vis_impl, debug_vis_callback
 
 
@@ -136,6 +138,8 @@ class BaseSwarmEnv(DirectMARLEnv):
         self._cached_mean_neighbor_pos_b = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
         self._cached_mean_neighbor_vel_b = torch.zeros(self.num_drones, self.num_envs, 3, device=self.device)
         self._prev_distances = torch.zeros(self.num_drones, self.num_envs, device=self.device)
+        # NaN = no previous potential (first step after reset / RM goal switch): progress is 0 that step
+        self._prev_potential = torch.full((self.num_drones, self.num_envs), float('nan'), device=self.device)
         self._prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         self._cache_valid = False
 
@@ -370,6 +374,7 @@ class BaseSwarmEnv(DirectMARLEnv):
         desired_transposed = self._desired_pos_w.transpose(0, 1)
         initial_distances = torch.linalg.norm(desired_transposed - all_positions, dim=2)
         self._prev_distances = initial_distances
+        self._prev_potential[:, env_ids] = float('nan')
         self._prev_actions[env_ids] = 0.0
         self._rm_states[env_ids, :] = 0
 
@@ -396,6 +401,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             set_swarm_gravity_rm_positions(self, env_ids, env_origins)
         elif stage == 11:
             set_packing_swarm_positions(self, env_ids, env_origins)
+        elif stage == 13:
+            set_packing_mono_positions(self, env_ids, env_origins)
 
     # ------------------------------------------------------------------
     # Observations
@@ -499,6 +506,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             return get_formation_rewards(self)
         if self.curriculum_stage == 7:
             return get_formation_rewards_simple(self)
+        if self.curriculum_stage == 13 or (self.curriculum_stage == 10 and self.cfg.reward_cfg.shared_packing_reward):
+            return get_packing_rewards(self)
         if self.curriculum_stage in (8, 9, 10, 11, 12):
             return get_swarm_gravity_rewards(self)
         return get_rewards(self)
@@ -659,3 +668,10 @@ class SwarmGravityAttnUAVSwarmEnv(BaseSwarmEnv):
     (--policy_arch attention) to attend over. 40-dim obs (28 + K*6), 200-dim state."""
 
     cfg: SwarmGravityAttnUAVSwarmEnvCfg
+
+
+class PackingMonoUAVSwarmEnv(BaseSwarmEnv):
+    """Monolithic no-RM control arm for stage 10: shared target for the whole episode, same
+    reward and packed-success criterion (get_packing_rewards / _check_packed_common)."""
+
+    cfg: PackingMonoUAVSwarmEnvCfg
