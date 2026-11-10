@@ -482,6 +482,17 @@ def get_swarm_gravity_rewards(env) -> dict[str, torch.Tensor]:
     return {f"robot_{i}": per_drone_reward[i] for i in range(env.num_drones)}
 
 
+def _radius_safety_penalty(env, all_positions: torch.Tensor) -> torch.Tensor:
+    """Quadratic penalty summed over EVERY neighbor within min(R_nh, max_neighbor_distance),
+    no cap -- independent of swarm size. Returns (num_drones, num_envs)."""
+    sc = env.cfg.swarm_cfg
+    radius = min(sc.min_safe_distance, sc.max_neighbor_distance)
+    pair_dists = torch.linalg.norm(all_positions.unsqueeze(1) - all_positions.unsqueeze(0), dim=3)  # (D, D, E)
+    self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).unsqueeze(-1)
+    violation = torch.clamp(radius - pair_dists, min=0.0).masked_fill(self_mask, 0.0)
+    return -K_FORM_SAFETY * (violation ** 2).sum(dim=1)
+
+
 def get_packing_rewards(env) -> dict[str, torch.Tensor]:
     """Shared reward for the stage-10 (RM) and stage-13 (monolithic) packing arms: the same
     function of state for both, so the arms differ only in what _desired_pos_w holds
@@ -516,7 +527,10 @@ def get_packing_rewards(env) -> dict[str, torch.Tensor]:
     env._prev_potential = potential.detach().clone()
 
     neighbor_dists = torch.linalg.norm(env._cached_neighbor_rel_pos_b, dim=2)
-    safety_penalty = _proximity_safety_penalty(env, all_positions, neighbor_dists)
+    if env.cfg.swarm_cfg.neighborhood_mode == "radius":
+        safety_penalty = _radius_safety_penalty(env, all_positions)
+    else:
+        safety_penalty = _proximity_safety_penalty(env, all_positions, neighbor_dists)
 
     containment_radius = env.cfg.curriculum.get_containment_radius(env.num_drones, env.cfg.swarm_cfg.min_safe_distance)
     dist_to_target = torch.linalg.norm(env._shared_target_w.unsqueeze(0) - all_positions, dim=2)

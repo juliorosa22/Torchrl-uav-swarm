@@ -346,6 +346,22 @@ def compute_baseline_action(env, kp: float) -> torch.Tensor:
     return baseline.transpose(0, 1)  # (E, D, 4)
 
 
+def _compute_radius_repulsion_b(env, repel_gain: float) -> torch.Tensor:
+    """Body-frame APF repulsion summed over every neighbor within
+    min(R_nh, max_neighbor_distance): each contributes (R - d)/R along the unit vector
+    away from it. Uncapped, so independent of swarm size. Returns (D, E, 3)."""
+    sc = env.cfg.swarm_cfg
+    radius = min(sc.min_safe_distance, sc.max_neighbor_distance)
+    pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
+    quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)  # (D, E, 4)
+    away = pos.unsqueeze(1) - pos.unsqueeze(0)  # (D, D, E, 3): pos_i - pos_j
+    dist = away.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (D, D, E, 1)
+    self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).view(env.num_drones, env.num_drones, 1, 1)
+    weight = ((radius - dist) / radius).clamp(min=0.0).masked_fill(self_mask, 0.0)
+    repel_w = (away / dist * weight).sum(dim=1) * repel_gain  # (D, E, 3)
+    return quat_apply_inverse(quats.reshape(-1, 4), repel_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
+
+
 def compute_swarm_gravity_baseline_action(env, kp: float, repel_gain: float) -> torch.Tensor:
     """Artificial-potential-field reference command for the swarm-gravity task (stage 8):
     attraction toward the shared target (same law as compute_baseline_action) plus a
@@ -364,6 +380,13 @@ def compute_swarm_gravity_baseline_action(env, kp: float, repel_gain: float) -> 
     ensure_cache_populated(env)
 
     attract_b = _compute_attraction_b(env, kp)  # (D, E, 3), unclamped
+
+    if env.cfg.swarm_cfg.neighborhood_mode == "radius":
+        repel_b = _compute_radius_repulsion_b(env, repel_gain)
+        cmd_b = (attract_b + repel_b).clamp(-1.0, 1.0)
+        baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
+        baseline[:, :, :3] = cmd_b
+        return baseline.transpose(0, 1)  # (E, D, 4)
 
     neighbor_rel_pos_b = env._cached_neighbor_rel_pos_b  # (D, E, 3), self -> nearest neighbor
     neighbor_dist = neighbor_rel_pos_b.norm(dim=-1, keepdim=True).clamp(min=1e-6)

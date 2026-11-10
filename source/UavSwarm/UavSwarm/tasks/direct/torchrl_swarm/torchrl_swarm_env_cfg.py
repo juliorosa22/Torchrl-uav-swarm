@@ -256,7 +256,7 @@ class RewardMachineCfg:
     # agents inside the containment sphere, nearest-neighbor >= pack_min_sep_frac*R_nh,
     # speed <= pack_speed_threshold.
     pack_min_sep_frac: float = 0.9
-    pack_speed_threshold: float = 0.2
+    pack_speed_threshold: float = 0.5
 
 
 @configclass
@@ -288,6 +288,11 @@ class SwarmParameterCfg:
     # al. (collision_avoidance_literature.md) found K=2 best; only takes effect when
     # BaseSwarmEnvCfg.include_k_neighbors_in_obs is set, and must stay < num_agents.
     num_observed_neighbors: int = 2
+    # "nearest": reward safety penalty / APF repulsion use only the single nearest neighbor
+    # (legacy). "radius": every neighbor within min(min_safe_distance, max_neighbor_distance)
+    # contributes, uncapped, so the term is independent of swarm size. Applies to
+    # get_packing_rewards and compute_swarm_gravity_baseline_action only.
+    neighborhood_mode: str = "nearest"
 
     # Inverted V formation parameters
     formation_base_separation = 0.8
@@ -615,4 +620,5 @@ class PackingMonoUAVSwarmEnvCfg(BaseSwarmEnvCfg):
     observation_spaces: dict = {f"robot_{i}": gym.spaces.Box(low=-float('inf'), high=float('inf'), shape=(28,)) for i in range(5)}
 
     curriculum: CurriculumCfg = CurriculumCfg(active_stage=13)
+    swarm_cfg: SwarmParameterCfg = SwarmParameterCfg(neighborhood_mode="radius")
     reward_cfg: RewardMachineCfg = RewardMachineCfg(shared_packing_reward=True)

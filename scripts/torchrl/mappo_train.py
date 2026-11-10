@@ -86,6 +86,11 @@ parser.add_argument(
     help="get_packing_rewards ablation: drop the potential-based progress term.",
 )
 parser.add_argument(
+    "--neighborhood_mode", type=str, default=None, choices=["nearest", "radius"],
+    help="Overrides swarm_cfg.neighborhood_mode: 'radius' = APF repulsion and get_packing_rewards "
+         "safety penalty sum over every neighbor within min(R_nh, max_neighbor_distance), uncapped.",
+)
+parser.add_argument(
     "--proximity_neighbors", type=int, default=None,
     help="Overrides reward_cfg.proximity_neighbors (default 1 = nearest only): number of nearest "
          "neighbors summed in the min_safe_distance proximity penalty (Huang et al.: K=2 best).",
@@ -298,6 +303,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
     if args_cli.collision_penalty is not None:
         env_cfg.reward_cfg.collision_penalty = args_cli.collision_penalty
+    if args_cli.neighborhood_mode is not None:
+        env_cfg.swarm_cfg.neighborhood_mode = args_cli.neighborhood_mode
     if args_cli.shared_packing_reward:
         env_cfg.reward_cfg.shared_packing_reward = True
     if args_cli.no_progress_term:
