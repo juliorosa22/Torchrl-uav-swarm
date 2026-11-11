@@ -85,6 +85,9 @@ parser.add_argument(
     "--no_progress_term", action="store_true", default=False,
     help="get_packing_rewards ablation: drop the potential-based progress term.",
 )
+parser.add_argument("--success_bonus", type=float, default=None, help="Overrides reward_cfg.success_bonus.")
+parser.add_argument("--failure_penalty", type=float, default=None, help="Overrides reward_cfg.failure_penalty.")
+parser.add_argument("--progress_scale", type=float, default=None, help="Overrides reward_cfg.progress_scale.")
 parser.add_argument(
     "--apf_damping_gain", type=float, default=None,
     help="Overrides swarm_cfg.apf_damping_gain: neighbor relative-velocity damping in the radius-mode APF baseline.",
@@ -316,6 +319,9 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         env_cfg.swarm_cfg.neighborhood_mode = args_cli.neighborhood_mode
     if args_cli.apf_damping_gain is not None:
         env_cfg.swarm_cfg.apf_damping_gain = args_cli.apf_damping_gain
+    for _k in ("success_bonus", "failure_penalty", "progress_scale"):
+        if getattr(args_cli, _k) is not None:
+            setattr(env_cfg.reward_cfg, _k, getattr(args_cli, _k))
     if args_cli.shared_packing_reward:
         env_cfg.reward_cfg.shared_packing_reward = True
     if args_cli.no_progress_term:

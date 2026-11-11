@@ -155,10 +155,11 @@ class IsaacLabTorchRLWrapper(EnvBase):
             device=self.device,
             dtype=torch.float32,
         )
-        self.observation_spec = Composite(
-            agents=Composite(observation=obs_spec, shape=B),
-            shape=B,
-        )
+        obs_items = {"agents": Composite(observation=obs_spec, shape=B)}
+        if self.centralized_critic:
+            # Must be an observation_spec key: undeclared, the collector never advances "state" and the critic sees the reset-time state all episode.
+            obs_items["state"] = Unbounded(shape=(*B, self.state_dim), device=self.device, dtype=torch.float32)
+        self.observation_spec = Composite(**obs_items, shape=B)
 
         # --- action spec ------------------------------------------------------
         act_space = self.action_spaces[self.possible_agents[0]]
@@ -198,16 +199,6 @@ class IsaacLabTorchRLWrapper(EnvBase):
             truncated=done_spec.clone(),
             shape=B,
         )
-
-        # --- centralized state spec -------------------------------------------
-        if self.centralized_critic:
-            self.state_spec = Composite(
-                state=Unbounded(
-                    shape=(*B, self.state_dim),
-                    device=self.device, dtype=torch.float32,
-                ),
-                shape=B,
-            )
 
     def _print_info(self, device: str, num_envs: int):
         print(f"\n{'='*80}")

@@ -420,6 +420,12 @@ class MAPPO:
 
                 reward_agent_frac = _agent_variance_fraction(reshaped["next", "reward"])
                 value_target_agent_frac = _agent_variance_fraction(reshaped["value_target"])
+                vt_mean, vt_std = reshaped["value_target"].mean().item(), reshaped["value_target"].std().item()
+                if os.environ.get("UAV_DUMP_ITER") == str(i + 1):
+                    dump = {"observation": reshaped["observation"], "state": reshaped["state"], "value_target": reshaped["value_target"],
+                            "reward": reshaped["next", "reward"], "done": reshaped["next", "done"],
+                            "state_value": reshaped["state_value"], "advantage": reshaped["advantage"]}
+                    torch.save({k: v.detach().cpu() for k, v in dump.items()}, os.environ["UAV_DUMP_PATH"])
 
             # --- Step 3: collapse to a flat batch for the PPO minibatch loop / buffer ---
             rollout_flat = _finalize_flat(reshaped)
@@ -562,6 +568,8 @@ class MAPPO:
             self.writer.add_scalar("Diagnostics/ESS", avg_ess, collected_frames)
             self.writer.add_scalar("Diagnostics/explained_variance", avg_ev, collected_frames)
             self.writer.add_scalar("Diagnostics/reward_agent_variance_fraction", reward_agent_frac, collected_frames)
+            self.writer.add_scalar("Diagnostics/value_target_mean", vt_mean, collected_frames)
+            self.writer.add_scalar("Diagnostics/value_target_std", vt_std, collected_frames)
             self.writer.add_scalar("Diagnostics/value_target_agent_variance_fraction", value_target_agent_frac, collected_frames)
             self.writer.add_scalar("Diagnostics/explained_variance_ceiling", 1.0 - value_target_agent_frac, collected_frames)
             self.writer.add_scalar("Diagnostics/entropy", avg_entropy, collected_frames)
