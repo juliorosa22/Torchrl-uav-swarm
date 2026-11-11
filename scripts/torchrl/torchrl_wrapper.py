@@ -68,6 +68,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         wp_lookahead: float = 0.3,
         wp_safety: bool = True,
         wp_goal_bias: bool = False,
+        wp_z_bias: bool = False,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
@@ -99,6 +100,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         self.wp_lookahead = wp_lookahead
         self.wp_safety = wp_safety
         self.wp_goal_bias = wp_goal_bias
+        self.wp_z_bias = wp_z_bias
         self._wp_prev = None
 
         if not isinstance(self.unwrapped_env, DirectMARLEnv):
@@ -322,8 +324,11 @@ class IsaacLabTorchRLWrapper(EnvBase):
             raw_plan = actions_stacked.clamp(-1.0, 1.0)
             step_max = self.unwrapped_env.cfg.controller.max_lin_vel_cmd * self.wp_dt
             incr = raw_plan.reshape(*raw_plan.shape[:2], K, 3)
-            if self.wp_goal_bias:
-                incr = (incr + compute_goal_bias(self.unwrapped_env, self.residual_kp).unsqueeze(2)).clamp(-1.0, 1.0)
+            if self.wp_goal_bias or self.wp_z_bias:
+                bias = compute_goal_bias(self.unwrapped_env, self.residual_kp)
+                if not self.wp_goal_bias:
+                    bias = bias * torch.tensor([0.0, 0.0, 1.0], device=bias.device)
+                incr = (incr + bias.unsqueeze(2)).clamp(-1.0, 1.0)
             plan_b = (step_max * incr).cumsum(dim=2)
             env_actions = compute_waypoint_plan_action(
                 self.unwrapped_env, plan_b, self.wp_dt, self.wp_lookahead, self.wp_safety, self.residual_repel_gain

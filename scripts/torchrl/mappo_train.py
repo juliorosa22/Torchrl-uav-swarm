@@ -144,6 +144,8 @@ parser.add_argument("--wp_horizon", type=int, default=0, help="Waypoint-plan mod
 parser.add_argument("--wp_dt", type=float, default=0.2, help="wp mode: time spacing between plan waypoints (s).")
 parser.add_argument("--wp_lookahead", type=float, default=0.3, help="wp mode: lookahead time on the plan used for the velocity command (s).")
 parser.add_argument("--wp_goal_bias", action="store_true", default=False, help="wp mode: add the APF attraction toward the target to every plan increment (zero policy output flies at the target).")
+parser.add_argument("--wp_z_bias", action="store_true", default=False, help="wp mode: like --wp_goal_bias but only on the z axis (altitude hold toward the target height).")
+parser.add_argument("--init_log_std", type=float, default=None, help="Overrides the policy's initial log-std (default 0.0, i.e. std 1).")
 parser.add_argument("--no_wp_safety", action="store_true", default=False, help="wp mode: disable the APF repulsion/damping safety filter.")
 parser.add_argument("--planner_alpha", type=float, default=0.3, help="planner mode: EMA weight on the new waypoint offset.")
 parser.add_argument("--residual_repel_gain", type=float, default=0.5, help="residual_rl: apf baseline's repulsion strength.")
@@ -237,6 +239,8 @@ def make_policy(
         net = AttentionMAPPOPolicy(own_obs_dim, num_neighbors, action_dim).to(device)
     else:
         net = MAPPOPolicy(obs_dim, action_dim, config["models"]["policy"]["hidden_sizes"]).to(device)
+    if args_cli.init_log_std is not None:
+        net.log_std.data.fill_(args_cli.init_log_std)
     module = TensorDictModule(
         module=net,
         in_keys=[("agents", "observation")],
@@ -426,7 +430,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         residual_repel_gain=args_cli.residual_repel_gain,
         planner_range=args_cli.planner_range, planner_alpha=args_cli.planner_alpha,
         wp_horizon=args_cli.wp_horizon, wp_dt=args_cli.wp_dt, wp_lookahead=args_cli.wp_lookahead,
-        wp_safety=not args_cli.no_wp_safety, wp_goal_bias=args_cli.wp_goal_bias,
+        wp_safety=not args_cli.no_wp_safety, wp_goal_bias=args_cli.wp_goal_bias, wp_z_bias=args_cli.wp_z_bias,
     )
 
     # --- dimensions ---
