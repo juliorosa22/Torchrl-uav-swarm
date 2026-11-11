@@ -136,6 +136,8 @@ parser.add_argument(
 )
 parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline attraction gain.")
 parser.add_argument("--residual_scale", type=float, default=0.3, help="residual_rl: policy correction weight.")
+parser.add_argument("--planner_range", type=float, default=0.0, help="Waypoint-planner mode (needs --residual_rl --residual_baseline apf): policy output (first 3 dims) is a body-frame offset in [-1,1]*planner_range metres added to the target error before APF attraction. 0 = off.")
+parser.add_argument("--planner_alpha", type=float, default=0.3, help="planner mode: EMA weight on the new waypoint offset.")
 parser.add_argument("--residual_repel_gain", type=float, default=0.5, help="residual_rl: apf baseline's repulsion strength.")
 parser.add_argument(
     "--experiment_directory", type=str, default=None,
@@ -411,6 +413,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         residual_rl=args_cli.residual_rl, residual_baseline=args_cli.residual_baseline,
         residual_kp=args_cli.residual_kp, residual_scale=args_cli.residual_scale,
         residual_repel_gain=args_cli.residual_repel_gain,
+        planner_range=args_cli.planner_range, planner_alpha=args_cli.planner_alpha,
     )
 
     # --- dimensions ---

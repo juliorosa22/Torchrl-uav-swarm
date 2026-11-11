@@ -56,6 +56,8 @@ class IsaacLabTorchRLWrapper(EnvBase):
         residual_kp: float = 2.0,
         residual_scale: float = 0.3,
         residual_repel_gain: float = 0.5,
+        planner_range: float = 0.0,
+        planner_alpha: float = 0.3,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
@@ -75,6 +77,11 @@ class IsaacLabTorchRLWrapper(EnvBase):
         self.residual_kp = residual_kp
         self.residual_scale = residual_scale
         self.residual_repel_gain = residual_repel_gain
+        self.planner_range = planner_range
+        self.planner_alpha = planner_alpha
+        if planner_range > 0.0 and not (residual_rl and residual_baseline == "apf"):
+            raise ValueError("planner_range > 0 requires residual_rl with residual_baseline='apf'")
+        self._planner_wp = None
 
         if not isinstance(self.unwrapped_env, DirectMARLEnv):
             raise TypeError(
@@ -284,7 +291,16 @@ class IsaacLabTorchRLWrapper(EnvBase):
         # entry is untouched, so ClipPPOLoss's log-prob ratio still reads the policy's
         # actual sampled residual, not the env-facing combined action.
         env_actions = actions_stacked
-        if self.residual_rl:
+        if self.residual_rl and self.planner_range > 0.0:
+            raw = actions_stacked[..., :3].clamp(-1.0, 1.0)
+            if self._planner_wp is None:
+                self._planner_wp = torch.zeros_like(raw)
+            self._planner_wp = (1.0 - self.planner_alpha) * self._planner_wp + self.planner_alpha * raw
+            env_actions = compute_swarm_gravity_baseline_action(
+                self.unwrapped_env, self.residual_kp, self.residual_repel_gain,
+                waypoint_offset_b=self.planner_range * self._planner_wp,
+            )
+        elif self.residual_rl:
             if self.residual_baseline == "apf":
                 baseline = compute_swarm_gravity_baseline_action(
                     self.unwrapped_env, self.residual_kp, self.residual_repel_gain
@@ -345,6 +361,9 @@ class IsaacLabTorchRLWrapper(EnvBase):
         td["done"] = done
         td["terminated"] = terminated
         td["truncated"] = truncated
+
+        if self._planner_wp is not None:
+            self._planner_wp[done.squeeze(-1)] = 0.0
 
         # extras["log"] is only freshly populated on a step where the env's own
         # _reset_idx ran (i.e. some env just terminated/truncated) -- gate on done so we

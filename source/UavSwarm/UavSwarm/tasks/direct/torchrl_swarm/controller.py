@@ -312,7 +312,7 @@ def compute_direct_controller(
 # Residual-RL baseline
 # ---------------------------------------------------------------------------
 
-def _compute_attraction_b(env, kp: float) -> torch.Tensor:
+def _compute_attraction_b(env, kp: float, offset_b: torch.Tensor | None = None) -> torch.Tensor:
     """Unclamped body-frame velocity proportional to the position error toward
     env._desired_pos_w. Shared by compute_baseline_action and
     compute_swarm_gravity_baseline_action -- see their docstrings.
@@ -327,6 +327,8 @@ def _compute_attraction_b(env, kp: float) -> torch.Tensor:
     error_b = quat_apply_inverse(
         all_quats.reshape(-1, 4), error_w.reshape(-1, 3)
     ).reshape(env.num_drones, env.num_envs, 3)
+    if offset_b is not None:
+        error_b = error_b + offset_b
     return kp * error_b / cfg.max_lin_vel_cmd
 
 
@@ -378,7 +380,9 @@ def _compute_radius_damping_b(env, kd: float) -> torch.Tensor:
     return quat_apply_inverse(quats.reshape(-1, 4), damp_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
 
-def compute_swarm_gravity_baseline_action(env, kp: float, repel_gain: float) -> torch.Tensor:
+def compute_swarm_gravity_baseline_action(
+    env, kp: float, repel_gain: float, waypoint_offset_b: torch.Tensor | None = None
+) -> torch.Tensor:
     """Artificial-potential-field reference command for the swarm-gravity task (stage 8):
     attraction toward the shared target (same law as compute_baseline_action) plus a
     linear repulsion from the nearest neighbor when closer than swarm_cfg.min_safe_distance
@@ -395,7 +399,8 @@ def compute_swarm_gravity_baseline_action(env, kp: float, repel_gain: float) -> 
 
     ensure_cache_populated(env)
 
-    attract_b = _compute_attraction_b(env, kp)  # (D, E, 3), unclamped
+    offset_b = None if waypoint_offset_b is None else waypoint_offset_b.transpose(0, 1)  # (E, D, 3) -> (D, E, 3)
+    attract_b = _compute_attraction_b(env, kp, offset_b)  # (D, E, 3), unclamped
 
     if env.cfg.swarm_cfg.neighborhood_mode == "radius":
         repel_b = _compute_radius_repulsion_b(env, repel_gain)
