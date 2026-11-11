@@ -286,7 +286,12 @@ def _check_packed_common(env) -> torch.Tensor:
     spaced = nn_dist >= rc.pack_min_sep_frac * env.cfg.swarm_cfg.min_safe_distance
     slow = torch.linalg.norm(vel, dim=2) <= rc.pack_speed_threshold
 
-    env._metrics.update(pack_progress=inside.float().mean(dim=0))
+    env._metrics.update(
+        pack_progress=inside.float().mean(dim=0),
+        pack_all_inside=inside.all(dim=0).float(),
+        pack_all_spaced=spaced.all(dim=0).float(),
+        pack_all_slow=slow.all(dim=0).float(),
+    )
     return (inside & spaced & slow).all(dim=0)
 
 

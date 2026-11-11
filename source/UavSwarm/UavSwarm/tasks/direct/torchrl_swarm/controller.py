@@ -362,6 +362,22 @@ def _compute_radius_repulsion_b(env, repel_gain: float) -> torch.Tensor:
     return quat_apply_inverse(quats.reshape(-1, 4), repel_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
 
+def _compute_radius_damping_b(env, kd: float) -> torch.Tensor:
+    """Body-frame relative-velocity damping: -kd * sum_j w(d_ij) * (v_i - v_j) over every
+    neighbor within min(R_nh, max_neighbor_distance), w = (R - d)/R. Returns (D, E, 3)."""
+    sc = env.cfg.swarm_cfg
+    radius = min(sc.min_safe_distance, sc.max_neighbor_distance)
+    pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
+    vel = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
+    quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
+    dist = (pos.unsqueeze(1) - pos.unsqueeze(0)).norm(dim=-1, keepdim=True)
+    self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).view(env.num_drones, env.num_drones, 1, 1)
+    weight = ((radius - dist) / radius).clamp(min=0.0).masked_fill(self_mask, 0.0)
+    rel_vel = vel.unsqueeze(1) - vel.unsqueeze(0)  # (D, D, E, 3): v_i - v_j
+    damp_w = -kd * (rel_vel * weight).sum(dim=1)
+    return quat_apply_inverse(quats.reshape(-1, 4), damp_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
+
+
 def compute_swarm_gravity_baseline_action(env, kp: float, repel_gain: float) -> torch.Tensor:
     """Artificial-potential-field reference command for the swarm-gravity task (stage 8):
     attraction toward the shared target (same law as compute_baseline_action) plus a
@@ -383,7 +399,11 @@ def compute_swarm_gravity_baseline_action(env, kp: float, repel_gain: float) -> 
 
     if env.cfg.swarm_cfg.neighborhood_mode == "radius":
         repel_b = _compute_radius_repulsion_b(env, repel_gain)
-        cmd_b = (attract_b + repel_b).clamp(-1.0, 1.0)
+        cmd_b = attract_b + repel_b
+        kd = env.cfg.swarm_cfg.apf_damping_gain
+        if kd > 0.0:
+            cmd_b = cmd_b + _compute_radius_damping_b(env, kd)
+        cmd_b = cmd_b.clamp(-1.0, 1.0)
         baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
         baseline[:, :, :3] = cmd_b
         return baseline.transpose(0, 1)  # (E, D, 4)

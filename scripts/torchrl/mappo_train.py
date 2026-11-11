@@ -86,6 +86,10 @@ parser.add_argument(
     help="get_packing_rewards ablation: drop the potential-based progress term.",
 )
 parser.add_argument(
+    "--apf_damping_gain", type=float, default=None,
+    help="Overrides swarm_cfg.apf_damping_gain: neighbor relative-velocity damping in the radius-mode APF baseline.",
+)
+parser.add_argument(
     "--neighborhood_mode", type=str, default=None, choices=["nearest", "radius"],
     help="Overrides swarm_cfg.neighborhood_mode: 'radius' = APF repulsion and get_packing_rewards "
          "safety penalty sum over every neighbor within min(R_nh, max_neighbor_distance), uncapped.",
@@ -120,6 +124,7 @@ parser.add_argument(
          "run's last third, second only to goal_reached itself, suggesting some episodes "
          "are still settling when the clock runs out.",
 )
+parser.add_argument("--batch_size", type=int, default=None, help="Overrides algorithm.batch_size (PPO minibatch size).")
 parser.add_argument(
     "--frames_per_batch", type=int, default=None,
     help="Overrides algorithm.frames_per_batch. Rollout length per env, T = "
@@ -299,12 +304,16 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         config["algorithm"]["target_kl"] = args_cli.target_kl
     if args_cli.frames_per_batch is not None:
         config["algorithm"]["frames_per_batch"] = args_cli.frames_per_batch
+    if args_cli.batch_size is not None:
+        config["algorithm"]["batch_size"] = args_cli.batch_size
     if args_cli.min_safe_distance is not None:
         env_cfg.swarm_cfg.min_safe_distance = args_cli.min_safe_distance
     if args_cli.collision_penalty is not None:
         env_cfg.reward_cfg.collision_penalty = args_cli.collision_penalty
     if args_cli.neighborhood_mode is not None:
         env_cfg.swarm_cfg.neighborhood_mode = args_cli.neighborhood_mode
+    if args_cli.apf_damping_gain is not None:
+        env_cfg.swarm_cfg.apf_damping_gain = args_cli.apf_damping_gain
     if args_cli.shared_packing_reward:
         env_cfg.reward_cfg.shared_packing_reward = True
     if args_cli.no_progress_term:

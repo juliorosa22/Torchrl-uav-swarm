@@ -293,6 +293,7 @@ class SwarmParameterCfg:
     # contributes, uncapped, so the term is independent of swarm size. Applies to
     # get_packing_rewards and compute_swarm_gravity_baseline_action only.
     neighborhood_mode: str = "nearest"
+    apf_damping_gain: float = 0.0
 
     # Inverted V formation parameters
     formation_base_separation = 0.8

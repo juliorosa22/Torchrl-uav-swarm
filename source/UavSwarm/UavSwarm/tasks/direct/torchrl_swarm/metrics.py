@@ -70,6 +70,10 @@ class EpisodeMetrics:
     min_neighbor_distance: torch.Tensor = None
     sphere_entered: torch.Tensor = None
     pack_progress: torch.Tensor = None
+    pack_all_inside: torch.Tensor = None
+    pack_all_spaced: torch.Tensor = None
+    pack_all_slow: torch.Tensor = None
+    _PACK_COND = ("pack_all_inside", "pack_all_spaced", "pack_all_slow")
 
     @classmethod
     def create(cls, num_envs: int, device: str) -> "EpisodeMetrics":
@@ -97,6 +101,9 @@ class EpisodeMetrics:
             min_neighbor_distance=torch.full((num_envs,), float("inf"), dtype=torch.float, device=device),
             sphere_entered=torch.zeros(num_envs, dtype=torch.float, device=device),
             pack_progress=torch.zeros(num_envs, dtype=torch.float, device=device),
+            pack_all_inside=torch.zeros(num_envs, dtype=torch.float, device=device),
+            pack_all_spaced=torch.zeros(num_envs, dtype=torch.float, device=device),
+            pack_all_slow=torch.zeros(num_envs, dtype=torch.float, device=device),
         )
 
     def reset(self, env_ids: torch.Tensor) -> None:
@@ -125,6 +132,9 @@ class EpisodeMetrics:
             self.sphere_entered[env_ids] = 0.0
         if self.pack_progress is not None:
             self.pack_progress[env_ids] = 0.0
+        for k in self._PACK_COND:
+            if getattr(self, k) is not None:
+                getattr(self, k)[env_ids] = 0.0
 
     def to_log_dict(
         self,
@@ -209,6 +219,9 @@ class EpisodeMetrics:
             log_dict[f"{prefix}/pack_progress"] = (
                 torch.mean(self.pack_progress[env_ids]) / max_episode_length
             ).item()
+        for k in self._PACK_COND:
+            if getattr(self, k) is not None:
+                log_dict[f"{prefix}/{k}"] = (torch.mean(getattr(self, k)[env_ids]) / max_episode_length).item()
 
         return log_dict
 
@@ -228,6 +241,9 @@ class EpisodeMetrics:
         min_neighbor_distance: torch.Tensor = None,
         sphere_entered: torch.Tensor = None,
         pack_progress: torch.Tensor = None,
+        pack_all_inside: torch.Tensor = None,
+        pack_all_spaced: torch.Tensor = None,
+        pack_all_slow: torch.Tensor = None,
     ) -> None:
         """Accumulate metrics (in-place addition).
 
@@ -264,6 +280,13 @@ class EpisodeMetrics:
             self.sphere_entered += sphere_entered
         if pack_progress is not None and self.pack_progress is not None:
             self.pack_progress += pack_progress
+        for k, v in (
+            ("pack_all_inside", pack_all_inside),
+            ("pack_all_spaced", pack_all_spaced),
+            ("pack_all_slow", pack_all_slow),
+        ):
+            if v is not None and getattr(self, k) is not None:
+                setattr(self, k, getattr(self, k) + v)
 
     def get_mean(self, metric_name: str, env_ids: torch.Tensor = None) -> float:
         """Get mean value of a specific metric.
