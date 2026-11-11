@@ -426,6 +426,36 @@ def compute_swarm_gravity_baseline_action(
     return baseline.transpose(0, 1)  # (E, D, 4)
 
 
+def compute_goal_bias(env, kp: float) -> torch.Tensor:
+    """Per-drone APF attraction toward the shared target as a clamped [-1, 1] body-frame
+    vector, shape (E, D, 3). Added to every plan increment so a zero policy output flies at the target."""
+    return _compute_attraction_b(env, kp).clamp(-1.0, 1.0).transpose(0, 1)
+
+
+def compute_waypoint_plan_action(
+    env, plan_b: torch.Tensor, dt: float, lookahead: float, safety: bool, repel_gain: float
+) -> torch.Tensor:
+    """Pure-pursuit tracking of a K-waypoint plan: plan_b (E, D, K, 3) holds body-frame
+    positions relative to the current position at times dt, 2dt, ..., K*dt. The command is
+    the velocity reaching the plan's point at `lookahead` seconds (piecewise-linear from the
+    origin), optionally plus radius repulsion/damping as a safety filter. Returns (E, D, 4)."""
+    E, D, K, _ = plan_b.shape
+    pts = torch.cat([torch.zeros(E, D, 1, 3, device=plan_b.device), plan_b], dim=2)
+    s = min(lookahead / dt, float(K))
+    i0 = min(int(s), K - 1)
+    frac = s - i0
+    target = (1.0 - frac) * pts[:, :, i0] + frac * pts[:, :, i0 + 1]
+    cmd_b = (target / (s * dt) / env.cfg.controller.max_lin_vel_cmd).transpose(0, 1)
+    if safety:
+        cmd_b = cmd_b + _compute_radius_repulsion_b(env, repel_gain)
+        kd = env.cfg.swarm_cfg.apf_damping_gain
+        if kd > 0.0:
+            cmd_b = cmd_b + _compute_radius_damping_b(env, kd)
+    action = torch.zeros(D, E, 4, device=plan_b.device)
+    action[:, :, :3] = cmd_b.clamp(-1.0, 1.0)
+    return action.transpose(0, 1)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch entry point
 # ---------------------------------------------------------------------------

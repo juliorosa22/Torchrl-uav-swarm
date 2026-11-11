@@ -18,7 +18,12 @@ from torchrl.data import (
 import gymnasium as gym
 
 from isaaclab.envs import DirectMARLEnv
-from UavSwarm.tasks.direct.torchrl_swarm.controller import compute_baseline_action, compute_swarm_gravity_baseline_action
+from UavSwarm.tasks.direct.torchrl_swarm.controller import (
+    compute_baseline_action,
+    compute_goal_bias,
+    compute_swarm_gravity_baseline_action,
+    compute_waypoint_plan_action,
+)
 try:
     # Newer rsl_rl: normalization.py lives under networks/.
     from rsl_rl.networks.normalization import EmpiricalNormalization
@@ -58,6 +63,11 @@ class IsaacLabTorchRLWrapper(EnvBase):
         residual_repel_gain: float = 0.5,
         planner_range: float = 0.0,
         planner_alpha: float = 0.3,
+        wp_horizon: int = 0,
+        wp_dt: float = 0.2,
+        wp_lookahead: float = 0.3,
+        wp_safety: bool = True,
+        wp_goal_bias: bool = False,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
@@ -82,6 +92,14 @@ class IsaacLabTorchRLWrapper(EnvBase):
         if planner_range > 0.0 and not (residual_rl and residual_baseline == "apf"):
             raise ValueError("planner_range > 0 requires residual_rl with residual_baseline='apf'")
         self._planner_wp = None
+        if wp_horizon > 0 and planner_range > 0.0:
+            raise ValueError("wp_horizon and planner_range are mutually exclusive")
+        self.wp_horizon = wp_horizon
+        self.wp_dt = wp_dt
+        self.wp_lookahead = wp_lookahead
+        self.wp_safety = wp_safety
+        self.wp_goal_bias = wp_goal_bias
+        self._wp_prev = None
 
         if not isinstance(self.unwrapped_env, DirectMARLEnv):
             raise TypeError(
@@ -126,6 +144,13 @@ class IsaacLabTorchRLWrapper(EnvBase):
         # the failure in side-by-side testing.
         self.normalize_obs = normalize_obs
         self.obs_rms = EmpiricalNormalization(shape=(self.obs_dim,), eps=1e-2).to(device) if normalize_obs else None
+
+        self._env_obs_dim = self.obs_dim
+        if self.wp_horizon > 0:
+            self.obs_dim += 3 * self.wp_horizon
+            self.state_dim += self.num_agents * 3 * self.wp_horizon
+            self.action_dim = 3 * self.wp_horizon
+            self._wp_prev = torch.zeros(num_envs, self.num_agents, self.action_dim, device=self.device)
 
         self._make_specs()
         self._print_info(device, num_envs)
@@ -238,11 +263,17 @@ class IsaacLabTorchRLWrapper(EnvBase):
         state = self.unwrapped_env._get_states().to(self.device)
         obs_rms = self.obs_rms
         if self.normalize_obs and obs_rms is not None:
-            obs_span = self.num_agents * self.obs_dim
+            obs_span = self.num_agents * self._env_obs_dim
             tiled_mean = obs_rms.mean.repeat(self.num_agents)
             tiled_std = obs_rms.std.repeat(self.num_agents)
             normed_obs_part = (state[..., :obs_span] - tiled_mean) / (tiled_std + obs_rms.eps)
             state = torch.cat([normed_obs_part, state[..., obs_span:]], dim=-1)
+        return state
+
+    def _get_state_aug(self) -> torch.Tensor:
+        state = self._get_state()
+        if self.wp_horizon > 0:
+            state = torch.cat([state, self._wp_prev.reshape(state.shape[0], -1)], dim=-1)
         return state
 
     # -- env interface ---------------------------------------------------------
@@ -263,8 +294,12 @@ class IsaacLabTorchRLWrapper(EnvBase):
             device=self.device,
         )
 
+        if self.wp_horizon > 0:
+            self._wp_prev.zero_()
+            td["agents", "observation"] = torch.cat([obs_stacked, self._wp_prev], dim=-1)
+
         if self.centralized_critic:
-            td["state"] = self._get_state()
+            td["state"] = self._get_state_aug()
 
         td["done"] = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
         td["terminated"] = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
@@ -282,7 +317,19 @@ class IsaacLabTorchRLWrapper(EnvBase):
         # entry is untouched, so ClipPPOLoss's log-prob ratio still reads the policy's
         # actual sampled residual, not the env-facing combined action.
         env_actions = actions_stacked
-        if self.residual_rl and self.planner_range > 0.0:
+        if self.wp_horizon > 0:
+            K = self.wp_horizon
+            raw_plan = actions_stacked.clamp(-1.0, 1.0)
+            step_max = self.unwrapped_env.cfg.controller.max_lin_vel_cmd * self.wp_dt
+            incr = raw_plan.reshape(*raw_plan.shape[:2], K, 3)
+            if self.wp_goal_bias:
+                incr = (incr + compute_goal_bias(self.unwrapped_env, self.residual_kp).unsqueeze(2)).clamp(-1.0, 1.0)
+            plan_b = (step_max * incr).cumsum(dim=2)
+            env_actions = compute_waypoint_plan_action(
+                self.unwrapped_env, plan_b, self.wp_dt, self.wp_lookahead, self.wp_safety, self.residual_repel_gain
+            )
+            self._wp_prev = raw_plan.detach().clone()
+        elif self.residual_rl and self.planner_range > 0.0:
             raw = actions_stacked[..., :3].clamp(-1.0, 1.0)
             if self._planner_wp is None:
                 self._planner_wp = torch.zeros_like(raw)
@@ -331,7 +378,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         )
 
         if self.centralized_critic:
-            td["state"] = self._get_state()
+            td["state"] = self._get_state_aug()
 
         # Aggregate done flags — episode done if ANY agent is done
         done = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
@@ -355,6 +402,12 @@ class IsaacLabTorchRLWrapper(EnvBase):
 
         if self._planner_wp is not None:
             self._planner_wp[done.squeeze(-1)] = 0.0
+
+        if self.wp_horizon > 0:
+            self._wp_prev[done.squeeze(-1)] = 0.0
+            td["agents", "observation"] = torch.cat([obs_stacked, self._wp_prev], dim=-1)
+            if self.centralized_critic:
+                td["state"] = self._get_state_aug()
 
         # extras["log"] is only freshly populated on a step where the env's own
         # _reset_idx ran (i.e. some env just terminated/truncated) -- gate on done so we
