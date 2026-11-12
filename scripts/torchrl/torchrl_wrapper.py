@@ -162,6 +162,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         # only sees the TensorDict from _step, so we capture them here and let the trainer
         # drain/average them once per rollout instead of losing them entirely.
         self.episode_logs: list[dict] = []
+        self._last_obs: Optional[torch.Tensor] = None
 
     # -- properties for the trainer to discover keys ---------------------------
     @property
@@ -280,6 +281,18 @@ class IsaacLabTorchRLWrapper(EnvBase):
 
     # -- env interface ---------------------------------------------------------
     def _reset(self, tensordict: Optional[TensorDict] = None, **kwargs) -> TensorDict:
+        if self._last_obs is not None and tensordict is not None and any(
+            (k if isinstance(k, str) else k[-1]) == "_reset" for k in tensordict.keys(True)
+        ):
+            # Isaac Lab already auto-reset the finished envs inside step(); a full env.reset() here
+            # would restart every env whenever any one finishes.
+            td = TensorDict({}, batch_size=self.batch_size, device=self.device)
+            td["agents"] = TensorDict({"observation": self._last_obs}, batch_size=self.batch_size, device=self.device)
+            if self.centralized_critic:
+                td["state"] = self._get_state_aug()
+            for key in ("done", "terminated", "truncated"):
+                td[key] = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
+            return td
         obs_dict, _info = self.env.reset()
 
         # Stack per-agent observations → (num_envs, n_agents, obs_dim)
@@ -307,6 +320,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         td["terminated"] = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
         td["truncated"] = torch.zeros((*self.batch_size, 1), dtype=torch.bool, device=self.device)
 
+        self._last_obs = td["agents", "observation"].clone()
         return td
 
     def _step(self, tensordict: TensorDict) -> TensorDict:
@@ -413,6 +427,8 @@ class IsaacLabTorchRLWrapper(EnvBase):
             td["agents", "observation"] = torch.cat([obs_stacked, self._wp_prev], dim=-1)
             if self.centralized_critic:
                 td["state"] = self._get_state_aug()
+
+        self._last_obs = td["agents", "observation"].clone()
 
         # extras["log"] is only freshly populated on a step where the env's own
         # _reset_idx ran (i.e. some env just terminated/truncated) -- gate on done so we
