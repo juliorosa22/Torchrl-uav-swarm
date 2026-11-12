@@ -1,0 +1,4 @@
+{"tag": "grid", "kp": 2.0, "repel": 2.0, "kd": 1.0, "fit": 1.0, "goal_reached": 1.0, "inter_agent_collision": 0.0, "collision": 0.0, "out_of_bounds": 0.0, "timeout": 0.0, "n": 128, "steps": 1888, "secs": 28.2}
+{"tag": "grid", "kp": 2.0, "repel": 2.0, "kd": 1.0, "fit": 0.0, "goal_reached": 0.0, "inter_agent_collision": 0.0, "collision": 0.0, "out_of_bounds": 0.0, "timeout": 1.0, "n": 66, "steps": 7210, "secs": 164.4}
+{"tag": "grid", "kp": 2.0, "repel": 2.0, "kd": 1.0, "fit": -0.11428571428571428, "goal_reached": 0.0, "inter_agent_collision": 0.05714285714285714, "collision": 0.0, "out_of_bounds": 0.0, "timeout": 0.9428571428571428, "n": 70, "steps": 7113, "secs": 184.6}
+{"tag": "grid", "kp": 2.0, "repel": 2.0, "kd": 1.0, "fit": -0.14084507042253522, "goal_reached": 0.0, "inter_agent_collision": 0.07042253521126761, "collision": 0.0, "out_of_bounds": 0.0, "timeout": 0.9295774647887324, "n": 71, "steps": 7109, "secs": 249.4}

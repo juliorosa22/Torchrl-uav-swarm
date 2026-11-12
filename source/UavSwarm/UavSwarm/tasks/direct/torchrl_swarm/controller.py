@@ -348,18 +348,51 @@ def compute_baseline_action(env, kp: float) -> torch.Tensor:
     return baseline.transpose(0, 1)  # (E, D, 4)
 
 
+def _pair_state(env):
+    """Pairwise neighbour state as the controller sees it: (pos_i - pos_j, v_i - v_j) each (D, D, E, 3),
+    plus an optional link-availability mask (D, D, E, 1). Perturbed only when apf_sense_update ran."""
+    sense = getattr(env, "_apf_sense", None)
+    if sense is not None and "cache" in sense:
+        return sense["cache"]
+    pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
+    vel = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
+    return pos.unsqueeze(1) - pos.unsqueeze(0), vel.unsqueeze(1) - vel.unsqueeze(0), None
+
+
+def apf_sense_update(env) -> None:
+    """Refresh the perturbed neighbour measurements for this step. env._apf_sense holds
+    pos_noise/vel_noise (std, m and m/s), dropout (per-link probability), delay (steps), buf (list)."""
+    s = env._apf_sense
+    pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
+    vel = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
+    s["buf"].append((pos, vel))
+    del s["buf"][: -(s["delay"] + 1)]
+    pos_d, vel_d = s["buf"][0]
+    away = pos.unsqueeze(1) - pos_d.unsqueeze(0)
+    rel_vel = vel.unsqueeze(1) - vel_d.unsqueeze(0)
+    if s["pos_noise"] > 0:
+        away = away + s["pos_noise"] * torch.randn_like(away)
+    if s["vel_noise"] > 0:
+        rel_vel = rel_vel + s["vel_noise"] * torch.randn_like(rel_vel)
+    mask = None
+    if s["dropout"] > 0:
+        mask = (torch.rand(*away.shape[:3], 1, device=away.device) >= s["dropout"]).float()
+    s["cache"] = (away, rel_vel, mask)
+
+
 def _compute_radius_repulsion_b(env, repel_gain: float) -> torch.Tensor:
     """Body-frame APF repulsion summed over every neighbor within
     min(R_nh, max_neighbor_distance): each contributes (R - d)/R along the unit vector
     away from it. Uncapped, so independent of swarm size. Returns (D, E, 3)."""
     sc = env.cfg.swarm_cfg
     radius = min(sc.min_safe_distance, sc.max_neighbor_distance)
-    pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
     quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)  # (D, E, 4)
-    away = pos.unsqueeze(1) - pos.unsqueeze(0)  # (D, D, E, 3): pos_i - pos_j
+    away, _, mask = _pair_state(env)  # (D, D, E, 3)
     dist = away.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (D, D, E, 1)
     self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).view(env.num_drones, env.num_drones, 1, 1)
     weight = ((radius - dist) / radius).clamp(min=0.0).masked_fill(self_mask, 0.0)
+    if mask is not None:
+        weight = weight * mask
     repel_w = (away / dist * weight).sum(dim=1) * repel_gain  # (D, E, 3)
     return quat_apply_inverse(quats.reshape(-1, 4), repel_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
@@ -369,13 +402,13 @@ def _compute_radius_damping_b(env, kd: float) -> torch.Tensor:
     neighbor within min(R_nh, max_neighbor_distance), w = (R - d)/R. Returns (D, E, 3)."""
     sc = env.cfg.swarm_cfg
     radius = min(sc.min_safe_distance, sc.max_neighbor_distance)
-    pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
-    vel = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
     quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
-    dist = (pos.unsqueeze(1) - pos.unsqueeze(0)).norm(dim=-1, keepdim=True)
+    away, rel_vel, mask = _pair_state(env)
+    dist = away.norm(dim=-1, keepdim=True)
     self_mask = torch.eye(env.num_drones, dtype=torch.bool, device=env.device).view(env.num_drones, env.num_drones, 1, 1)
     weight = ((radius - dist) / radius).clamp(min=0.0).masked_fill(self_mask, 0.0)
-    rel_vel = vel.unsqueeze(1) - vel.unsqueeze(0)  # (D, D, E, 3): v_i - v_j
+    if mask is not None:
+        weight = weight * mask
     damp_w = -kd * (rel_vel * weight).sum(dim=1)
     return quat_apply_inverse(quats.reshape(-1, 4), damp_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
