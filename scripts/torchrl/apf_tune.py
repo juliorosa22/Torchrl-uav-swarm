@@ -35,6 +35,9 @@ parser.add_argument("--move_planar", action="store_true")
 parser.add_argument("--move_paths", type=str, nargs="+", default=None, help="Path families (paths.py): line curve slalom arc hairpin spline figure8 coaster helix; 'train' / 'held' / 'all' shortcuts.")
 parser.add_argument("--move_profiles", type=str, nargs="+", default=["const"], help="Speed profiles: const ramp stopgo.")
 parser.add_argument("--move_path_len", type=float, default=10.0)
+parser.add_argument("--move_speed_range", type=float, nargs=2, default=None, metavar=("LO", "HI"), help="Per-episode speed range (m/s) in family mode.")
+parser.add_argument("--move_path_lens", type=float, nargs="+", default=None, help="Per-episode path-length buckets (m) in family mode.")
+parser.add_argument("--move_a_max", type=float, default=3.0, help="Path acceleration budget (m/s^2): curvature floor is speed^2 / a_max.")
 parser.add_argument("--move_z_max", type=float, default=4.0, help="Top of the sphere-centre altitude band in family mode (m).")
 parser.add_argument("--move_helix", type=float, nargs=3, default=None, metavar=("RADIUS", "CLIMB", "TURNS"), help="Helical sphere path instead of the chord.")
 parser.add_argument("--move_distance", type=float, default=6.0)
@@ -60,6 +63,7 @@ parser.add_argument("--obs_sense", type=str, default="oracle", choices=["oracle"
 parser.add_argument("--obs_k", type=int, default=8)
 parser.add_argument("--residual_scale", type=float, default=0.5)
 parser.add_argument("--zero_policy", action="store_true", help="With --policy_ckpt-style obs: apply no residual (pure APF through the moving-obs env).")
+parser.add_argument("--kv", type=float, default=None, help="Overrides controller.Kv (outer-loop velocity P gain).")
 parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
 parser.add_argument("--wp_horizon", type=int, default=0, help="Evaluate a waypoint-plan policy (K body-frame increments per drone).")
 parser.add_argument("--wp_dt", type=float, default=0.2)
@@ -109,6 +113,8 @@ class Evaluator:
         cfg.controller.type = "geometric"
         if args_cli.max_vel is not None:
             cfg.controller.max_lin_vel_cmd = args_cli.max_vel
+        if args_cli.kv is not None:
+            cfg.controller.Kv = args_cli.kv
         cfg.seed = args_cli.seed
         if args_cli.stage is not None:
             cfg.curriculum.active_stage = args_cli.stage
@@ -270,7 +276,7 @@ class Evaluator:
         u.episode_length_buf[:] = 0
         rows, step = [], 0
         while len(rows) < episodes and step < max(12000, int(6 * u.cfg.episode_length_s / self.step_dt)):
-            fam_prev, prof_prev = u._path_fam.clone(), u._path_prof.clone()
+            fam_prev, prof_prev, spd_prev = u._path_fam.clone(), u._path_prof.clone(), u._path_speed.clone()
             self._step(kp, repel, ff)
             step += 1
             done = u._last_terminated | u._last_timed_out
@@ -313,7 +319,7 @@ class Evaluator:
                     packed_all = (g("pk_mv") + g("pk_st")) / n_all
                     rows.append(dict(
                         tag=tag, v=move_speed, ff=ff, fam=(_pf.ALL_FAMILIES[int(fam_prev[e])] if u.cfg.curriculum.move_paths else "legacy"),
-                        prof=(_pf.PROFILES[int(prof_prev[e])] if u.cfg.curriculum.move_paths else "const"), n_agents=D, sep=sep, coll=coll, timeout=bool(u._last_timed_out[e]),
+                        prof=(_pf.PROFILES[int(prof_prev[e])] if u.cfg.curriculum.move_paths else "const"), spd=float(spd_prev[e]), n_agents=D, sep=sep, coll=coll, timeout=bool(u._last_timed_out[e]),
                         steps=n_all, packed_all=packed_all, packed_mv=g("pk_mv") / n_mv, packed_st=g("pk_st") / n_st,
                         inside_mv=g("ins_mv") / n_mv, inside_st=g("ins_st") / n_st,
                         min_nn=g("min_nn"), mean_nn_mv=g("sum_nn_mv") / n_mv, mean_nn_st=g("sum_nn_st") / n_st,
@@ -500,7 +506,12 @@ def main():
             fams = tuple(f for name in args_cli.move_paths for f in short.get(name, (name,)))
             c_ = ev.u.cfg.curriculum
             c_.move_paths, c_.move_profiles, c_.move_path_len = fams, tuple(args_cli.move_profiles), args_cli.move_path_len
-            c_.move_z_max = args_cli.move_z_max
+            c_.move_z_max, c_.move_a_max = args_cli.move_z_max, args_cli.move_a_max
+            if args_cli.move_path_lens:
+                c_.move_path_lens = tuple(args_cli.move_path_lens)
+            if args_cli.move_speed_range:
+                c_.move_speed_range = tuple(args_cli.move_speed_range)
+                args_cli.move_speeds = args_cli.tune_speeds = [args_cli.move_speed_range[1]]
         if args_cli.move_helix:
             cur_ = ev.u.cfg.curriculum
             cur_.move_helix_radius, cur_.move_helix_climb, cur_.move_helix_turns = args_cli.move_helix

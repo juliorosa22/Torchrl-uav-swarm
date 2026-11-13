@@ -147,6 +147,8 @@ class CurriculumCfg:
     move_paths: tuple = ()  # path-family names (paths.py); non-empty overrides the single-path modes above
     move_profiles: tuple = ("const",)  # speed profiles drawn per episode: const | ramp | stopgo
     move_path_len: float = 10.0  # m of path per episode in family mode
+    move_speed_range: tuple = ()  # (lo, hi) m/s: per-episode speed in family mode; overrides move_target_speed
+    move_path_lens: tuple = ()  # per-episode path-length buckets (m); overrides move_path_len
     move_z_max: float = 4.0  # m; top of the altitude band the sphere centre may use in family mode
     move_a_max: float = 3.0  # m/s^2; curvature floor is speed^2 / move_a_max
     move_pause_budget_s: float = 6.0  # extra episode time for ramps and pauses in family mode
@@ -185,11 +187,12 @@ class CurriculumCfg:
 
     def moving_episode_s(self) -> float:
         extra = self.move_pause_budget_s if self.move_paths else 0.0
-        return self.moving_path_length() / self.move_target_speed + extra + self.move_settle_s + 0.5
+        v = self.move_speed_range[0] if (self.move_paths and self.move_speed_range) else self.move_target_speed
+        return self.moving_path_length() / v + extra + self.move_settle_s + 0.5
 
     def moving_path_length(self) -> float:
         if self.move_paths:
-            return self.move_path_len
+            return max(self.move_path_lens) if self.move_path_lens else self.move_path_len
         if self.move_helix_radius > 0:
             n, w = 2048, 2.0 * 3.141592653589793 * self.move_helix_turns * self.move_helix_radius
             return sum((w**2 + (self.move_helix_climb * 6.0 * u * (1.0 - u)) ** 2) ** 0.5 for u in ((i + 0.5) / n for i in range(n))) / n

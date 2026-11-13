@@ -852,16 +852,31 @@ def _set_path_family(env, env_ids: torch.Tensor, env_origins: torch.Tensor, sphe
     profs = torch.tensor([paths.PROFILES.index(p) for p in cur.move_profiles], device=dev)
     fam = fams[torch.randint(len(fams), (n,), device=dev)]
     prof = profs[torch.randint(len(profs), (n,), device=dev)]
+    if cur.move_speed_range:
+        lo_v, hi_v = cur.move_speed_range
+        speeds = lo_v + (hi_v - lo_v) * torch.rand(n, device=dev)
+    else:
+        speeds = torch.full((n,), cur.move_target_speed, device=dev)
+    lens = cur.move_path_lens or (cur.move_path_len,)
     z_lo = max(cur.stage8_target_height_range[0], sphere_radius + 0.3)
-    env.cfg.reward_cfg.max_distance_from_origin = max(15.0, cur.move_path_len / 2.0 + sphere_radius + 5.0)
-    traj, moving, _ = paths.generate(fam, prof, cur.move_target_speed, dt, n_steps, cur.move_path_len, cur.move_a_max,
-                                     z_lo, max(cur.move_z_max, z_lo + 1.0))
+    env.cfg.reward_cfg.max_distance_from_origin = max(15.0, max(lens) / 2.0 + sphere_radius + 5.0)
+    len_idx = torch.randint(len(lens), (n,), device=dev)
+    traj = torch.zeros(n, n_steps, 3, device=dev)
+    moving = torch.zeros(n, dtype=torch.long, device=dev)
+    for i, length in enumerate(lens):
+        sel = (len_idx == i).nonzero().flatten()
+        if sel.numel() == 0:
+            continue
+        traj[sel], moving[sel], _ = paths.generate(fam[sel], prof[sel], speeds[sel], dt, n_steps, float(length), cur.move_a_max,
+                                                   z_lo, max(cur.move_z_max, z_lo + 1.0))
     traj = traj + torch.cat([env_origins[:, :2], torch.zeros(n, 1, device=dev)], dim=1).unsqueeze(1)
     env._traj[env_ids] = traj
     env._traj_k[env_ids] = 0
     env._traj_end[env_ids] = moving
     env._path_fam[env_ids] = fam
     env._path_prof[env_ids] = prof
+    env._path_speed[env_ids] = speeds
+    env._ep_len_steps[env_ids] = moving + int(cur.move_settle_s / dt) + 1
     c0 = traj[:, 0]
     env._desired_pos_w[env_ids] = c0.unsqueeze(1).expand(-1, env.num_drones, -1)
     env._target_left[env_ids] = moving.float() * dt

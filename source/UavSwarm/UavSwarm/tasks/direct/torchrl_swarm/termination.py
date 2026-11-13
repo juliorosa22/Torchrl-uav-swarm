@@ -32,6 +32,8 @@ def get_dones(env) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """
     # Timeout termination (all stages)
     time_out = env.episode_length_buf >= env.max_episode_length - 1
+    if env.cfg.curriculum.move_paths:
+        time_out = time_out | (env.episode_length_buf >= env._ep_len_steps)
 
     # Collision termination (all stages)
     died_collision = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)

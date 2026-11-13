@@ -13,23 +13,26 @@ p.add_argument("--cells", type=str, default="oracle5,lidar5,oracle20,lidar20", h
 p.add_argument("--rl_cells", type=str, default="lidar20")
 p.add_argument("--out", type=str, default="results/apf_moving/lab")
 p.add_argument("--config", type=str, default="scripts/torchrl/torchrl_mappo_cfg_remote.yaml")
-p.add_argument("--max_vel", type=float, default=3.0)
-p.add_argument("--tune_speeds", type=str, nargs="+", default=["1.0", "1.5", "2.0"])
-p.add_argument("--eval_speeds", type=str, nargs="+", default=["1.0", "1.5", "2.0"])
+p.add_argument("--max_vel", type=float, default=4.0)
+p.add_argument("--speed_range", type=str, nargs=2, default=["1.0", "3.0"])
+p.add_argument("--path_lens", type=str, nargs="+", default=["20", "30"])
+p.add_argument("--eval_episodes", type=int, default=288)
 p.add_argument("--iterations", type=int, default=6)
-p.add_argument("--rl_speed", type=float, default=1.5)
 p.add_argument("--rl_iters", type=int, default=300)
 p.add_argument("--rl_envs", type=int, default=32)
 p.add_argument("--rl_fpb", type=int, default=16384)
 p.add_argument("--rl_batch", type=int, default=2048)
-p.add_argument("--residual_scale", type=float, default=0.25)
+p.add_argument("--residual_scale", type=float, default=0.2)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--dry", action="store_true")
 a = p.parse_args()
 
 PY = sys.executable
-CURVE = ["--move_planar", "--move_distance", "8", "--move_curve_amp", "1.0"]
-HELIX = ["--move_helix", "1.5", "1.5", "1.0"]
+def dist(paths):
+    return ["--move_paths", paths, "--move_profiles", "const", "ramp", "stopgo", "--move_path_lens", *a.path_lens,
+            "--move_z_max", "8", "--move_a_max", "3", "--move_speed_range", *a.speed_range]
+
+
 os.makedirs(a.out, exist_ok=True)
 
 
@@ -54,30 +57,29 @@ for cell in a.cells.split(","):
     tune = f"{a.out}/{cell}_tune.jsonl"
     if os.path.exists(tune):
         os.remove(tune)
-    run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *CURVE, "--tune_move", "--tune_speeds", *a.tune_speeds,
-         "--episodes", 64, "--iterations", a.iterations, "--popsize", 8, "--init", *init, "--seed", a.seed, "--out", tune])
+    run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("train"), "--tune_move", "--episodes", 96,
+         "--iterations", a.iterations, "--popsize", 8, "--init", *init, "--seed", a.seed, "--out", tune])
     g = best(tune) if not a.dry else [1, 1, 1, 1, 1]
     print(f"[chain] {cell} best gains {g}", flush=True)
-    for name, path in (("curve", CURVE), ("helix", HELIX)):
-        out = f"{a.out}/{cell}_{name}_final.jsonl"
-        if os.path.exists(out):
-            os.remove(out)
-        run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *path, "--move_speeds", *a.eval_speeds, "--episodes", 128,
-             "--final_params", *g, "--seed", a.seed, "--out", out])
+    out = f"{a.out}/{cell}_apf_final.jsonl"
+    if os.path.exists(out):
+        os.remove(out)
+    run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("all"), "--episodes", a.eval_episodes,
+         "--final_params", *g, "--seed", a.seed, "--out", out])
     if cell not in a.rl_cells.split(","):
         continue
     exp = f"rl_{cell}"
+    k = 12 if n >= 10 else 8
     run([PY, "-u", "scripts/torchrl/mappo_train.py", "--task", "PackingMono-TorchRL-UAVSwarm-Direct-v0", "--stage", 13, "--headless",
          "--config", a.config, "--num_agents", n, "--max_vel", a.max_vel, "--num_envs", a.rl_envs, "--max_iterations", a.rl_iters,
          "--frames_per_batch", a.rl_fpb, "--batch_size", a.rl_batch, "--seed", a.seed, "--moving", "--obs_sense", sense,
-         "--obs_k", 12 if n >= 10 else 8, "--move_speed", a.rl_speed, *CURVE, "--policy_arch", "attention", "--residual_rl",
+         "--obs_k", k, *dist("train"), "--policy_arch", "attention", "--residual_rl",
          "--residual_baseline", "apf", "--residual_kp", g[0], "--residual_repel_gain", g[1], "--apf_damping_gain", g[2],
          "--residual_ff", g[3], "--apf_rscale", g[4], "--residual_scale", a.residual_scale, "--init_log_std", -1.5,
          "--entropy_coef", 0.001, "--experiment_directory", exp, "--model_name", cell])
     ckpts = sorted(glob.glob(f"logs/torchrl/{exp}/*/checkpoints/checkpoint_{cell}_iter_{a.rl_iters}.pt"))
-    ev = ["--headless", "--config", a.config, "--num_agents", n, "--max_vel", a.max_vel, "--num_envs", 64, *CURVE,
-          "--move_speeds", a.rl_speed, "--episodes", 128, "--final_params", *g, "--obs_sense", sense,
-          "--obs_k", 12 if n >= 10 else 8, "--residual_scale", a.residual_scale, "--seed", a.seed]
+    ev = [*base, *dist("all"), "--episodes", a.eval_episodes, "--final_params", *g, "--obs_sense", sense, "--obs_k", k,
+          "--residual_scale", a.residual_scale, "--seed", a.seed]
     if ckpts or a.dry:
         run([PY, "-u", "scripts/torchrl/apf_tune.py", *ev, "--policy_ckpt", ckpts[-1] if ckpts else "CKPT",
              "--out", f"{a.out}/{cell}_rl_eval.jsonl"])

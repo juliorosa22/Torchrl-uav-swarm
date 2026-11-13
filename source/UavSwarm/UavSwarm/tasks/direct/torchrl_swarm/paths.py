@@ -137,7 +137,7 @@ def _max_curvature(pts: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return (kappa * valid[:, h:-h]).max(dim=1).values
 
 
-def _finalise(pts, sigma, L, rho_min, z_lo, z_hi, m):
+def _finalise(pts, sigma, L, rho_min, z_lo, z_hi, m):  # rho_min: (n,) curvature floors
     n, dev = pts.shape[0], pts.device
     pts, total = _resample(pts, m)
     pts = _smooth(pts, sigma)
@@ -186,11 +186,13 @@ def speed_multiplier(prof: torch.Tensor, n_steps: int, dt: float) -> torch.Tenso
     return torch.where((prof == 2).unsqueeze(1), stopgo, m)
 
 
-def generate(fam_ids: torch.Tensor, prof_ids: torch.Tensor, speed: float, dt: float, n_steps: int, L: float,
+def generate(fam_ids: torch.Tensor, prof_ids: torch.Tensor, speed, dt: float, n_steps: int, L: float,
              a_max: float, z_lo: float, z_hi: float):
-    """Sphere-centre trajectories (n, n_steps, 3) at control rate, moving-step count (n,), path length (n,)."""
+    """Sphere-centre trajectories (n, n_steps, 3) at control rate, moving-step count (n,), path length (n,).
+    speed: scalar or (n,) nominal speeds."""
     n, dev = fam_ids.shape[0], fam_ids.device
-    rho_min = max(0.8, speed**2 / a_max)
+    speed = torch.as_tensor(speed, device=dev, dtype=torch.float32).expand(n)
+    rho_min = (speed**2 / a_max).clamp(min=0.8)
     M, m0 = _sizes(L)
     pts = torch.zeros(n, M, 3, device=dev)
     length = torch.zeros(n, device=dev)
@@ -198,10 +200,10 @@ def generate(fam_ids: torch.Tensor, prof_ids: torch.Tensor, speed: float, dt: fl
         sel = (fam_ids == f).nonzero().flatten()
         if sel.numel() == 0:
             continue
-        dense, sigma = _gen(name, sel.numel(), dev, L, rho_min, m0)
-        pts[sel], length[sel] = _finalise(dense, sigma, L, rho_min, z_lo, z_hi, M)
-    s = torch.cumsum(speed * speed_multiplier(prof_ids, n_steps, dt) * dt, dim=1)
-    s = torch.minimum(s - speed * dt, length.unsqueeze(1)).clamp(min=0.0)
+        dense, sigma = _gen(name, sel.numel(), dev, L, float(rho_min[sel].mean()), m0)
+        pts[sel], length[sel] = _finalise(dense, sigma, L, rho_min[sel], z_lo, z_hi, M)
+    s = torch.cumsum(speed.unsqueeze(1) * speed_multiplier(prof_ids, n_steps, dt) * dt, dim=1)
+    s = torch.minimum(s - speed.unsqueeze(1) * dt, length.unsqueeze(1)).clamp(min=0.0)
     pos = (s / DS).clamp(max=M - 1.001)
     i0 = pos.floor().long()
     w = (pos - i0).unsqueeze(-1)

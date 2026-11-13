@@ -129,6 +129,8 @@ class BaseSwarmEnv(DirectMARLEnv):
         self._traj = None
         self._traj_k = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._traj_end = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._path_speed = torch.zeros(self.num_envs, device=self.device)
+        self._ep_len_steps = torch.full((self.num_envs,), 10**9, dtype=torch.long, device=self.device)
         self._path_fam = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._path_prof = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._helix_phi0 = torch.zeros(self.num_envs, device=self.device)

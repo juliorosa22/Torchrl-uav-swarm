@@ -206,6 +206,9 @@ parser.add_argument("--move_planar", action="store_true")
 parser.add_argument("--move_paths", type=str, nargs="+", default=None, help="Path families for per-episode switching: names from paths.py or 'train'/'held'/'all'.")
 parser.add_argument("--move_profiles", type=str, nargs="+", default=["const"])
 parser.add_argument("--move_path_len", type=float, default=10.0)
+parser.add_argument("--move_speed_range", type=float, nargs=2, default=None, metavar=("LO", "HI"), help="Per-episode speed range (m/s) in family mode.")
+parser.add_argument("--move_path_lens", type=float, nargs="+", default=None, help="Per-episode path-length buckets (m) in family mode.")
+parser.add_argument("--move_a_max", type=float, default=3.0, help="Path acceleration budget (m/s^2): curvature floor is speed^2 / a_max.")
 parser.add_argument("--move_z_max", type=float, default=4.0, help="Top of the sphere-centre altitude band in family mode (m).")
 parser.add_argument("--move_helix", type=float, nargs=3, default=None, metavar=("RADIUS", "CLIMB", "TURNS"))
 parser.add_argument("--lidar_az", type=int, default=16)
@@ -398,7 +401,11 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
             short = {"train": _paths.TRAIN_FAMILIES, "held": _paths.HELD_OUT_FAMILIES, "all": _paths.ALL_FAMILIES}
             cur.move_paths = tuple(f for name in args_cli.move_paths for f in short.get(name, (name,)))
             cur.move_profiles, cur.move_path_len = tuple(args_cli.move_profiles), args_cli.move_path_len
-            cur.move_z_max = args_cli.move_z_max
+            cur.move_z_max, cur.move_a_max = args_cli.move_z_max, args_cli.move_a_max
+            if args_cli.move_path_lens:
+                cur.move_path_lens = tuple(args_cli.move_path_lens)
+            if args_cli.move_speed_range:
+                cur.move_speed_range = tuple(args_cli.move_speed_range)
         env_cfg.episode_length_s = cur.moving_episode_s()
         step_dt = env_cfg.sim.dt * env_cfg.decimation
         lidar_cfg = dict(
