@@ -360,24 +360,41 @@ def _pair_state(env):
 
 
 def apf_sense_update(env) -> None:
-    """Refresh the perturbed neighbour measurements for this step. env._apf_sense holds
-    pos_noise/vel_noise (std, m and m/s), dropout (per-link probability), delay (steps), buf (list)."""
+    """Refresh the neighbour measurements this step. env._apf_sense keys: pos_noise/pos_noise_slope (sigma = a + b*d, m),
+    vel_noise (m/s), dropout/dropout_slope (link-loss probability = a + b*d), range (m), period (steps between
+    refreshes, measurement held in between), delay (steps), buf, t, held."""
     s = env._apf_sense
     pos = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)
     vel = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
+    fresh = (env.episode_length_buf == 0).view(1, -1, 1)
+    if s["buf"]:
+        s["buf"] = [(torch.where(fresh, pos, p0), torch.where(fresh, vel, v0)) for p0, v0 in s["buf"]]
     s["buf"].append((pos, vel))
     del s["buf"][: -(s["delay"] + 1)]
+    period = s.get("period", 1)
+    t = s.get("t", 0)
+    s["t"] = t + 1
+    refresh = (t % period == 0) or "held" not in s
+    refresh_e = fresh.view(1, 1, -1, 1) if not refresh else torch.ones_like(fresh).view(1, 1, -1, 1)
+    if not bool(refresh_e.any()):
+        s["cache"] = s["held"]
+        return
     pos_d, vel_d = s["buf"][0]
     away = pos.unsqueeze(1) - pos_d.unsqueeze(0)
     rel_vel = vel.unsqueeze(1) - vel_d.unsqueeze(0)
-    if s["pos_noise"] > 0:
-        away = away + s["pos_noise"] * torch.randn_like(away)
-    if s["vel_noise"] > 0:
+    d = away.norm(dim=-1, keepdim=True)
+    sig = s.get("pos_noise", 0.0) + s.get("pos_noise_slope", 0.0) * d
+    away = away + sig * torch.randn_like(away)
+    if s.get("vel_noise", 0.0) > 0:
         rel_vel = rel_vel + s["vel_noise"] * torch.randn_like(rel_vel)
-    mask = None
-    if s["dropout"] > 0:
-        mask = (torch.rand(*away.shape[:3], 1, device=away.device) >= s["dropout"]).float()
-    s["cache"] = (away, rel_vel, mask)
+    p_drop = s.get("dropout", 0.0) + s.get("dropout_slope", 0.0) * d
+    mask = (torch.rand_like(d) >= p_drop).float()
+    if s.get("range", 0.0) > 0:
+        mask = mask * (d <= s["range"]).float()
+    new = (away, rel_vel, mask)
+    if "held" in s and not refresh:
+        new = tuple(torch.where(refresh_e, n, h) for n, h in zip(new, s["held"]))
+    s["held"] = s["cache"] = new
 
 
 def _compute_radius_repulsion_b(env, repel_gain: float) -> torch.Tensor:
@@ -413,6 +430,25 @@ def _compute_radius_damping_b(env, kd: float) -> torch.Tensor:
     return quat_apply_inverse(quats.reshape(-1, 4), damp_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
 
+def _compute_scan_repulsion_b(env, repel_gain: float) -> torch.Tensor:
+    """Body-frame repulsion from lidar returns only: each hit at range r pushes along the beam, weight (R - r)/R."""
+    sc = env.cfg.swarm_cfg
+    radius = min(sc.min_safe_distance, sc.max_neighbor_distance) * getattr(env, "_apf_radius_scale", 1.0)
+    rng, dirs = env._lidar["scan"]
+    w = ((radius - rng) / radius).clamp(min=0.0).nan_to_num(nan=0.0)
+    repel_w = -(dirs * w.unsqueeze(-1)).sum(dim=2) * repel_gain
+    quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
+    return quat_apply_inverse(quats.reshape(-1, 4), repel_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
+
+
+def _compute_self_damping_b(env, kd: float) -> torch.Tensor:
+    """Damping of the drone's own velocity error relative to the known sphere velocity (no neighbour velocity)."""
+    quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
+    vel = torch.stack([rob.data.root_lin_vel_w for rob in env._robots], dim=0)
+    err = (vel - env._target_vel_w.unsqueeze(0)).reshape(-1, 3)
+    return -kd * quat_apply_inverse(quats.reshape(-1, 4), err).reshape(env.num_drones, env.num_envs, 3)
+
+
 def _target_vel_b(env) -> torch.Tensor:
     quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
     vel = env._target_vel_w.unsqueeze(0).expand(env.num_drones, -1, -1)
@@ -442,13 +478,14 @@ def compute_swarm_gravity_baseline_action(
     attract_b = _compute_attraction_b(env, kp, offset_b)  # (D, E, 3), unclamped
 
     if env.cfg.swarm_cfg.neighborhood_mode == "radius":
-        repel_b = _compute_radius_repulsion_b(env, repel_gain)
+        lidar = getattr(env, "_lidar", None) is not None
+        repel_b = _compute_scan_repulsion_b(env, repel_gain) if lidar else _compute_radius_repulsion_b(env, repel_gain)
         cmd_b = attract_b + repel_b
         if ff_gain > 0.0:
             cmd_b = cmd_b + ff_gain * _target_vel_b(env) / env.cfg.controller.max_lin_vel_cmd
         kd = env.cfg.swarm_cfg.apf_damping_gain
         if kd > 0.0:
-            cmd_b = cmd_b + _compute_radius_damping_b(env, kd)
+            cmd_b = cmd_b + (_compute_self_damping_b(env, kd) if lidar else _compute_radius_damping_b(env, kd))
         cmd_b = cmd_b.clamp(-1.0, 1.0)
         baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
         baseline[:, :, :3] = cmd_b

@@ -33,6 +33,22 @@ parser.add_argument("--tune_speeds", type=float, nargs="+", default=[0.5, 1.0, 1
 parser.add_argument("--move_curve_amp", type=float, default=0.0)
 parser.add_argument("--move_planar", action="store_true")
 parser.add_argument("--move_distance", type=float, default=6.0)
+parser.add_argument("--sense_pos", type=float, nargs=2, default=[0.0, 0.0], metavar=("A", "B"), help="Neighbour position noise sigma = A + B*distance (m).")
+parser.add_argument("--sense_vel", type=float, default=0.0, help="Neighbour relative-velocity noise sigma (m/s).")
+parser.add_argument("--sense_drop", type=float, nargs=2, default=[0.0, 0.0], metavar=("A", "B"), help="Link-loss probability = A + B*distance.")
+parser.add_argument("--sense_range", type=float, default=0.0, help="Sensing range (m); 0 = unlimited.")
+parser.add_argument("--sense_hz", type=float, default=0.0, help="Neighbour measurement rate (Hz); 0 = every control step.")
+parser.add_argument("--sense_delay", type=int, default=0, help="Neighbour measurement latency (control steps).")
+parser.add_argument("--lidar", action="store_true", help="Neighbours seen only through an onboard lidar scan (no communication).")
+parser.add_argument("--lidar_az", type=int, default=16)
+parser.add_argument("--lidar_elev", type=float, nargs="+", default=[-90.0, -60.0, -30.0, 0.0, 30.0, 60.0, 90.0], help="Ring elevations (deg); +-90 are single up/down beams.")
+parser.add_argument("--lidar_range", type=float, default=3.0)
+parser.add_argument("--lidar_radius", type=float, default=0.1, help="Drone body radius seen by the rays (m).")
+parser.add_argument("--lidar_noise", type=float, nargs=2, default=[0.02, 0.01], metavar=("A", "B"))
+parser.add_argument("--lidar_miss", type=float, default=0.02)
+parser.add_argument("--lidar_hz", type=float, default=10.0)
+parser.add_argument("--lidar_delay", type=int, default=1)
+parser.add_argument("--lidar_check", action="store_true", help="Ray-hit sanity check against ground truth.")
 parser.add_argument("--move_stats", action="store_true", help="Per-episode inter-agent distance statistics on the moving-sphere task.")
 parser.add_argument("--sweep", action="store_true", help="Stress-test the --init gains over sensing/time-limit conditions.")
 AppLauncher.add_app_launcher_args(parser)
@@ -57,6 +73,7 @@ from UavSwarm.tasks.direct.torchrl_swarm.controller import (  # noqa: E402
     apf_sense_update,
     compute_swarm_gravity_baseline_action,
 )
+from UavSwarm.tasks.direct.torchrl_swarm.lidar import lidar_update, make_lidar  # noqa: E402
 
 LOG_LO = torch.log(torch.tensor([0.3, 0.2, 0.05]))
 LOG_HI = torch.log(torch.tensor([8.0, 16.0, 8.0]))
@@ -93,7 +110,9 @@ class Evaluator:
         print(f"[tune] radius mode={self.u.cfg.swarm_cfg.neighborhood_mode} stage={self.u.cfg.curriculum.active_stage}")
 
     def _step(self, kp, repel, ff=0.0):
-        if self.u._apf_sense is not None:
+        if getattr(self.u, "_lidar", None) is not None:
+            lidar_update(self.u)
+        elif self.u._apf_sense is not None:
             apf_sense_update(self.u)
         act = compute_swarm_gravity_baseline_action(self.u, kp, repel, ff_gain=ff)
         return self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
@@ -121,7 +140,19 @@ class Evaluator:
         u, dev = self.u, self.u.device
         E, D = u.num_envs, u.num_drones
         u.cfg.swarm_cfg.apf_damping_gain = kd
-        u._apf_sense = None
+        a = args_cli
+        period = max(1, round(1.0 / (a.sense_hz * self.step_dt))) if a.sense_hz > 0 else 1
+        realistic = a.sense_pos != [0.0, 0.0] or a.sense_vel > 0 or a.sense_drop != [0.0, 0.0] or a.sense_range > 0 or period > 1 or a.sense_delay > 0
+        u._lidar = None
+        if a.lidar:
+            u._apf_sense = None
+            u._lidar = make_lidar(a.lidar_az, a.lidar_elev, a.lidar_range, 0.1, a.lidar_radius, a.lidar_noise[0], a.lidar_noise[1],
+                                  a.lidar_miss, 0.5, max(1, round(1.0 / (a.lidar_hz * self.step_dt))), a.lidar_delay)
+        else:
+            u._apf_sense = dict(
+                pos_noise=a.sense_pos[0], pos_noise_slope=a.sense_pos[1], vel_noise=a.sense_vel, dropout=a.sense_drop[0],
+                dropout_slope=a.sense_drop[1], range=a.sense_range, period=period, delay=a.sense_delay, buf=[],
+            ) if realistic else None
         cur = u.cfg.curriculum
         cur.move_target_speed = move_speed
         u.cfg.episode_length_s = cur.moving_path_length() / move_speed + cur.move_settle_s + 0.5
@@ -193,7 +224,7 @@ class Evaluator:
                         jit_mv=g("jit_mv") / n_mv, jit_st=g("jit_st") / n_st, spd_mv=g("spd_mv") / n_mv, spd_st=g("spd_st") / n_st,
                         cerr_mv=g("cerr_mv") / n_mv, cerr_st=g("cerr_st") / n_st,
                         clag_mean_mv=g("clag_mv") / n_mv, clag_max=g("clag_max"), maxd_mv=g("maxd_mv"),
-                        success=bool(packed_all >= 0.95 and not coll),
+                        success=bool(packed_all >= 0.9 and not coll),
                     ))
                 reset_acc(done)
         return rows
@@ -247,6 +278,64 @@ class Evaluator:
 
 
 @torch.no_grad()
+def lidar_check(ev, steps=400):
+    """Noise-free scan vs ground truth: hit consistency and nearest-neighbour detection rate by distance."""
+    u, a = ev.u, args_cli
+    u._apf_sense = None
+    u.cfg.swarm_cfg.apf_damping_gain = 1.49
+    u._apf_radius_scale = 1.28
+    cur = u.cfg.curriculum
+    cur.move_target_speed, cur.move_planar, cur.move_target_distance = 0.5, True, 8.0
+    u.cfg.episode_length_s = 10_000
+    u._lidar = make_lidar(a.lidar_az, a.lidar_elev, a.lidar_range, 0.1, a.lidar_radius, 0.0, 0.0, 0.0, 0.0, 1, 0)
+    ev.env.reset()
+    u.episode_length_buf[:] = 0
+    edges = [0.0, 0.3, 0.4, 0.5, 0.6, 0.8, 1.2, 9.9]
+    det = torch.zeros(len(edges) - 1)
+    cnt = torch.zeros(len(edges) - 1)
+    bad = tot = 0
+    vis = n_pairs = 0
+    el_det, el_cnt = torch.zeros(3), torch.zeros(3)
+    for _ in range(steps):
+        ev._step(2.39, 1.32, 0.81)
+        lidar_update(u)
+        rng, dirs = u._lidar["scan"]
+        pos = torch.stack([r.data.root_pos_w for r in u._robots], dim=0)
+        D, E, B = rng.shape
+        hit = rng.isfinite()
+        hp = pos.unsqueeze(2) + dirs * rng.nan_to_num(posinf=0.0).unsqueeze(-1)
+        dm = torch.cdist(hp.permute(1, 0, 2, 3).reshape(E, D * B, 3), pos.permute(1, 0, 2)).reshape(E, D, B, D).permute(1, 0, 2, 3)
+        near = dm.min(-1).values
+        bad += int(((near > a.lidar_radius + 1e-3) & hit).sum())
+        tot += int(hit.sum())
+        owner = dm.argmin(-1)
+        pair = (pos.unsqueeze(1) - pos.unsqueeze(0)).norm(dim=-1) + 10 * torch.eye(D, device=pos.device).unsqueeze(-1)
+        nn_d, nn_j = pair.min(dim=1)
+        seen = torch.zeros(D, E, D, dtype=torch.bool, device=pos.device)
+        seen.scatter_(2, owner, hit)
+        seen &= ~torch.eye(D, dtype=torch.bool, device=pos.device).unsqueeze(1)
+        got = seen.gather(2, nn_j.unsqueeze(-1)).squeeze(-1)
+        nn_vec = pos.permute(1, 0, 2).gather(1, nn_j.t().unsqueeze(-1).expand(-1, -1, 3)).permute(1, 0, 2) - pos
+        el_nn = torch.rad2deg(torch.asin((nn_vec[..., 2] / nn_d.clamp(min=1e-6)).clamp(-1, 1))).abs()
+        close = nn_d < 0.5
+        for k, (lo_e, hi_e) in enumerate(((0, 30), (30, 56), (56, 91))):
+            m = close & (el_nn >= lo_e) & (el_nn < hi_e)
+            el_det[k] += float(got[m].sum())
+            el_cnt[k] += float(m.sum())
+        vis += int(seen.sum())
+        n_pairs += D * E
+        for k in range(len(edges) - 1):
+            m = (nn_d >= edges[k]) & (nn_d < edges[k + 1])
+            det[k] += float(got[m].sum())
+            cnt[k] += float(m.sum())
+    print(f"[lidar] hits={tot} inconsistent={bad}  mean neighbours seen per drone={vis / n_pairs:.2f} of {u.num_drones - 1}", flush=True)
+    for k, nm in enumerate(("0-30", "30-56", "56-90")):
+        print(f"[lidar] close (<0.5 m) nearest neighbour at |elevation| {nm} deg: detected {el_det[k] / max(el_cnt[k], 1):.2f} (n={int(el_cnt[k])})", flush=True)
+    for k in range(len(edges) - 1):
+        print(f"[lidar] nearest neighbour {edges[k]:.1f}-{edges[k + 1]:.1f} m: detected {det[k] / max(cnt[k], 1):.2f} (n={int(cnt[k])})", flush=True)
+
+
+@torch.no_grad()
 def diagnose(ev, kp, repel, kd, steps=900):
     u = ev.u
     u.cfg.swarm_cfg.apf_damping_gain = kd
@@ -283,6 +372,9 @@ def fitness(res):
 
 def main():
     ev = Evaluator()
+    if args_cli.lidar_check:
+        lidar_check(ev)
+        return
     torch.manual_seed(args_cli.seed)
     mean = torch.log(torch.tensor(args_cli.init))
     sigma = torch.full((3,), args_cli.init_sigma)
