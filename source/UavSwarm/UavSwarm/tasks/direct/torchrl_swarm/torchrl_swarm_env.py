@@ -44,6 +44,7 @@ from .curriculum import (
     set_swarm_gravity_rm_positions,
     set_packing_swarm_positions,
     set_packing_mono_positions,
+    advance_moving_target,
 )
 from .termination import (
     get_dones,
@@ -113,6 +114,13 @@ class BaseSwarmEnv(DirectMARLEnv):
         # Stage 10 only: the true shared target (containment-sphere center). _desired_pos_w[:, 0]
         # stops holding it once agent 0 switches to its own slot, so viz/eval can't read it there.
         self._shared_target_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._target_dir_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._target_vel_w = torch.zeros(self.num_envs, 3, device=self.device)
+        self._target_left = torch.zeros(self.num_envs, device=self.device)
+        self._target_len = torch.ones(self.num_envs, device=self.device)
+        self._target_c0 = torch.zeros(self.num_envs, 3, device=self.device)
+        self._target_perp = torch.zeros(self.num_envs, 3, device=self.device)
+        self._target_sign = torch.ones(self.num_envs, device=self.device)
         if self.curriculum_stage in (10, 11):
             # Computed once (tiny N, cheap electrostatic relaxation) -- see
             # formation.compute_packing_slots. Centered on the origin; rotated + translated
@@ -217,6 +225,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             update_waypoint_goals(self)
         elif self.curriculum_stage == 5:
             update_swarm_waypoint_goals(self)
+        elif self.curriculum_stage == 13 and self.cfg.curriculum.move_target_speed > 0:
+            advance_moving_target(self)
 
         if self.curriculum_stage in [4, 5, 6]:
             compute_swarm_centroid(self)

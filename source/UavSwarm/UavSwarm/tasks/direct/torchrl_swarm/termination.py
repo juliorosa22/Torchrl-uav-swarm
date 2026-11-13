@@ -141,7 +141,10 @@ def _check_goal_reached(env) -> torch.Tensor:
     elif stage in (8, 9, 12):
         return _check_swarm_gravity_reached(env)
     elif stage == 13:
-        return _check_packed_common(env)
+        packed = _check_packed_common(env)
+        if env.cfg.curriculum.move_target_speed > 0:
+            packed = torch.zeros_like(packed)
+        return packed
     elif stage == 10:
         if env.cfg.reward_cfg.shared_packing_reward:
             return _check_packed_common(env)

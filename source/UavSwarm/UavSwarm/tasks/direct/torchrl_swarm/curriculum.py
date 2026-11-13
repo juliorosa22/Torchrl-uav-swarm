@@ -729,4 +729,66 @@ def set_packing_swarm_positions(env, env_ids: torch.Tensor, env_origins: torch.T
 def set_packing_mono_positions(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
     """Stage 13 (PackingMono): stage-8 spawn/target; goal stays the shared target (no phases)."""
     set_swarm_gravity_positions(env, env_ids, env_origins)
+    if env.cfg.curriculum.move_target_speed > 0:
+        _set_moving_sphere(env, env_ids, env_origins)
     env._shared_target_w[env_ids] = env._desired_pos_w[env_ids, 0, :]
+
+
+def _set_moving_sphere(env, env_ids: torch.Tensor, env_origins: torch.Tensor) -> None:
+    """Moving-sphere mode: the sphere centre runs a straight line of move_target_distance through the
+    env origin; the swarm spawns packed (random 3D rotation) inside the sphere at the start of the line."""
+    from .formation import compute_packing_slots
+
+    cur = env.cfg.curriculum
+    n, dev = len(env_ids), env.device
+    radius = cur.get_containment_radius(env.num_drones, env.cfg.swarm_cfg.min_safe_distance)
+    if not hasattr(env, "_move_slots"):
+        env._move_slots = compute_packing_slots(
+            env.num_drones, 0.85 * radius, env.cfg.swarm_cfg.min_safe_distance, str(dev)
+        )
+    theta = torch.rand(n, device=dev) * 2.0 * torch.pi
+    half = cur.move_target_distance / 2.0
+    lo, hi = cur.stage8_target_height_range
+    z = lo + (hi - lo) * torch.rand(n, 2, device=dev)
+    rim = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1) * half
+    if cur.move_planar:
+        z[:, 1:] = z[:, :1]
+    c0 = torch.cat([env_origins[:, :2] + rim, z[:, :1]], dim=1)
+    c1 = torch.cat([env_origins[:, :2] - rim, z[:, 1:]], dim=1)
+    delta = c1 - c0
+    dist = delta.norm(dim=1)
+    env._desired_pos_w[env_ids] = c0.unsqueeze(1).expand(-1, env.num_drones, -1)
+    env._target_dir_w[env_ids] = delta / dist.unsqueeze(1)
+    env._target_left[env_ids] = dist
+    env._target_len[env_ids] = dist
+    env._target_c0[env_ids] = c0
+    horiz = torch.stack([-env._target_dir_w[env_ids, 1], env._target_dir_w[env_ids, 0], torch.zeros(n, device=dev)], dim=1)
+    env._target_perp[env_ids] = horiz / horiz.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    env._target_sign[env_ids] = torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
+    env._target_vel_w[env_ids] = env._target_dir_w[env_ids] * cur.move_target_speed
+    rot = _sample_random_3d_rotation(n, str(dev))
+    offsets = torch.einsum("nij,kj->nki", rot, env._move_slots)
+    for j, rob in enumerate(env._robots):
+        state = rob.data.default_root_state[env_ids].clone()
+        state[:, :3] = c0 + offsets[:, j]
+        state[:, 7:] = 0.0
+        rob.write_root_pose_to_sim(state[:, :7], env_ids)
+        rob.write_root_velocity_to_sim(state[:, 7:], env_ids)
+
+
+def advance_moving_target(env) -> None:
+    """Move the sphere centre at constant path speed along chord + A*sin(2*pi*s/len) lateral swing."""
+    cur = env.cfg.curriculum
+    dt = env.step_dt
+    amp = cur.move_curve_amp
+    k = 2.0 * torch.pi / env._target_len
+    s_now = env._target_len - env._target_left
+    slope = env._target_sign * amp * k * torch.cos(k * s_now)
+    ds = torch.minimum(cur.move_target_speed * dt / torch.sqrt(1.0 + slope**2), env._target_left)
+    s_new = s_now + ds
+    lateral = env._target_sign * amp * torch.sin(k * s_new)
+    new_pos = env._target_c0 + env._target_dir_w * s_new.unsqueeze(1) + env._target_perp * lateral.unsqueeze(1)
+    env._target_vel_w = (new_pos - env._shared_target_w) / dt
+    env._shared_target_w = new_pos
+    env._target_left = env._target_len - s_new
+    env._desired_pos_w[:] = env._shared_target_w.unsqueeze(1)

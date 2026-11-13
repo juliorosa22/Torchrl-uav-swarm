@@ -133,6 +133,15 @@ class CurriculumCfg:
     # hexagonal close-packing (~0.74); 0.6 is a reasonable loose-swarm default.
     stage8_packing_density: float = 0.6
 
+    # Stage 13 moving-sphere mode (0 = static target, original behaviour): the swarm spawns packed
+    # inside the sphere, whose centre travels move_target_distance m at move_target_speed m/s;
+    # success is packed state after it stops.
+    move_target_speed: float = 0.0
+    move_target_distance: float = 6.0
+    move_settle_s: float = 6.0
+    move_planar: bool = False  # True: constant-altitude (2D) sphere path
+    move_curve_amp: float = 0.0  # m; >0 adds one full left/right (random order) sine swing over the chord
+
     # Stage 10 parameters (swarm-gravity + reward machine: same containment sphere as
     # stage 8, but entering it doesn't terminate -- it assigns the agent a personal
     # packing slot, computed once via formation.compute_packing_slots. stage8_gravity_radius
@@ -165,6 +174,10 @@ class CurriculumCfg:
         r_nh_half = min_safe_distance / 2.0
         return r_nh_half * (num_drones / self.stage8_packing_density) ** (1.0 / 3.0)
 
+    def moving_path_length(self) -> float:
+        k = 2.0 * 3.141592653589793 / self.move_target_distance
+        return self.move_target_distance * (1.0 + (self.move_curve_amp * k) ** 2 / 4.0)
+
     def get_episode_length(self) -> float:
         """Return episode length based on active stage."""
         stage_lengths = {
@@ -180,7 +193,11 @@ class CurriculumCfg:
             10: self.stage8_episode_length_s,  # SwarmGravityRM reuses stage 8's tunables
             11: self.stage11_episode_length_s,
             12: self.stage8_episode_length_s,  # SwarmGravityAttn reuses stage 8's tunables
-            13: self.stage8_episode_length_s,  # PackingMono reuses stage 8's tunables
+            13: (
+                self.moving_path_length() / self.move_target_speed + self.move_settle_s + 0.5
+                if self.move_target_speed > 0
+                else self.stage8_episode_length_s
+            ),  # PackingMono reuses stage 8's tunables
         }
         if self.active_stage not in stage_lengths:
             raise ValueError(f"Invalid active_stage: {self.active_stage}. Must be 1-13.")

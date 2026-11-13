@@ -385,7 +385,7 @@ def _compute_radius_repulsion_b(env, repel_gain: float) -> torch.Tensor:
     min(R_nh, max_neighbor_distance): each contributes (R - d)/R along the unit vector
     away from it. Uncapped, so independent of swarm size. Returns (D, E, 3)."""
     sc = env.cfg.swarm_cfg
-    radius = min(sc.min_safe_distance, sc.max_neighbor_distance)
+    radius = min(sc.min_safe_distance, sc.max_neighbor_distance) * getattr(env, "_apf_radius_scale", 1.0)
     quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)  # (D, E, 4)
     away, _, mask = _pair_state(env)  # (D, D, E, 3)
     dist = away.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (D, D, E, 1)
@@ -401,7 +401,7 @@ def _compute_radius_damping_b(env, kd: float) -> torch.Tensor:
     """Body-frame relative-velocity damping: -kd * sum_j w(d_ij) * (v_i - v_j) over every
     neighbor within min(R_nh, max_neighbor_distance), w = (R - d)/R. Returns (D, E, 3)."""
     sc = env.cfg.swarm_cfg
-    radius = min(sc.min_safe_distance, sc.max_neighbor_distance)
+    radius = min(sc.min_safe_distance, sc.max_neighbor_distance) * getattr(env, "_apf_radius_scale", 1.0)
     quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
     away, rel_vel, mask = _pair_state(env)
     dist = away.norm(dim=-1, keepdim=True)
@@ -413,8 +413,14 @@ def _compute_radius_damping_b(env, kd: float) -> torch.Tensor:
     return quat_apply_inverse(quats.reshape(-1, 4), damp_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
 
+def _target_vel_b(env) -> torch.Tensor:
+    quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
+    vel = env._target_vel_w.unsqueeze(0).expand(env.num_drones, -1, -1)
+    return quat_apply_inverse(quats.reshape(-1, 4), vel.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
+
+
 def compute_swarm_gravity_baseline_action(
-    env, kp: float, repel_gain: float, waypoint_offset_b: torch.Tensor | None = None
+    env, kp: float, repel_gain: float, waypoint_offset_b: torch.Tensor | None = None, ff_gain: float = 0.0
 ) -> torch.Tensor:
     """Artificial-potential-field reference command for the swarm-gravity task (stage 8):
     attraction toward the shared target (same law as compute_baseline_action) plus a
@@ -438,6 +444,8 @@ def compute_swarm_gravity_baseline_action(
     if env.cfg.swarm_cfg.neighborhood_mode == "radius":
         repel_b = _compute_radius_repulsion_b(env, repel_gain)
         cmd_b = attract_b + repel_b
+        if ff_gain > 0.0:
+            cmd_b = cmd_b + ff_gain * _target_vel_b(env) / env.cfg.controller.max_lin_vel_cmd
         kd = env.cfg.swarm_cfg.apf_damping_gain
         if kd > 0.0:
             cmd_b = cmd_b + _compute_radius_damping_b(env, kd)
