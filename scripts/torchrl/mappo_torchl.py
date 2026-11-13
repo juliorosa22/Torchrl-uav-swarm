@@ -93,13 +93,15 @@ class AttentionMAPPOPolicy(nn.Module):
 
     def __init__(
         self, own_obs_dim: int, num_neighbors: int, action_dim: int,
-        hidden_dim: int = 64, num_heads: int = 4, mlp_hidden=(128, 64),
+        hidden_dim: int = 64, num_heads: int = 4, mlp_hidden=(128, 64), token_dim: int = 6, masked: bool = False,
     ):
         super().__init__()
         self.own_obs_dim = own_obs_dim
         self.num_neighbors = num_neighbors
         self.self_encoder = nn.Sequential(nn.Linear(own_obs_dim, hidden_dim), nn.ReLU())
-        self.neighbor_encoder = nn.Sequential(nn.Linear(6, hidden_dim), nn.ReLU())
+        self.token_dim = token_dim
+        self.masked = masked
+        self.neighbor_encoder = nn.Sequential(nn.Linear(token_dim, hidden_dim), nn.ReLU())
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)
 
@@ -118,13 +120,17 @@ class AttentionMAPPOPolicy(nn.Module):
         flat_obs = obs.reshape(-1, obs.shape[-1])
 
         own = flat_obs[:, :self.own_obs_dim]
-        neighbors = flat_obs[:, self.own_obs_dim:].reshape(-1, self.num_neighbors, 6)
+        neighbors = flat_obs[:, self.own_obs_dim:].reshape(-1, self.num_neighbors, self.token_dim)
+        pad = None
+        if self.masked:
+            pad = neighbors[..., -1] == 0
+            pad[:, 0] = False
 
         self_embed = self.self_encoder(own)  # (B, hidden_dim)
         neighbor_embed = self.neighbor_encoder(neighbors)  # (B, K, hidden_dim)
 
         query = self_embed.unsqueeze(1)  # (B, 1, hidden_dim)
-        attn_out, _ = self.attn(query, neighbor_embed, neighbor_embed)  # (B, 1, hidden_dim)
+        attn_out, _ = self.attn(query, neighbor_embed, neighbor_embed, key_padding_mask=pad)  # (B, 1, hidden_dim)
         pooled = self.norm(query + attn_out).squeeze(1)  # (B, hidden_dim)
 
         features = self.head(torch.cat([self_embed, pooled], dim=-1))

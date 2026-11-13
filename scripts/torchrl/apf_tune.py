@@ -32,6 +32,7 @@ parser.add_argument("--final_params", type=float, nargs=5, default=None, metavar
 parser.add_argument("--tune_speeds", type=float, nargs="+", default=[0.5, 1.0, 1.5])
 parser.add_argument("--move_curve_amp", type=float, default=0.0)
 parser.add_argument("--move_planar", action="store_true")
+parser.add_argument("--move_helix", type=float, nargs=3, default=None, metavar=("RADIUS", "CLIMB", "TURNS"), help="Helical sphere path instead of the chord.")
 parser.add_argument("--move_distance", type=float, default=6.0)
 parser.add_argument("--sense_pos", type=float, nargs=2, default=[0.0, 0.0], metavar=("A", "B"), help="Neighbour position noise sigma = A + B*distance (m).")
 parser.add_argument("--sense_vel", type=float, default=0.0, help="Neighbour relative-velocity noise sigma (m/s).")
@@ -49,6 +50,13 @@ parser.add_argument("--lidar_miss", type=float, default=0.02)
 parser.add_argument("--lidar_hz", type=float, default=10.0)
 parser.add_argument("--lidar_delay", type=int, default=1)
 parser.add_argument("--lidar_check", action="store_true", help="Ray-hit sanity check against ground truth.")
+parser.add_argument("--policy_ckpt", type=str, default=None, help="Evaluate a trained residual policy (moving-task obs) on top of the APF given by --final_params.")
+parser.add_argument("--policy_arch", type=str, default="attention", choices=["attention", "flat"])
+parser.add_argument("--obs_sense", type=str, default="oracle", choices=["oracle", "lidar"])
+parser.add_argument("--obs_k", type=int, default=8)
+parser.add_argument("--residual_scale", type=float, default=0.5)
+parser.add_argument("--zero_policy", action="store_true", help="With --policy_ckpt-style obs: apply no residual (pure APF through the moving-obs env).")
+parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
 parser.add_argument("--move_stats", action="store_true", help="Per-episode inter-agent distance statistics on the moving-sphere task.")
 parser.add_argument("--sweep", action="store_true", help="Stress-test the --init gains over sensing/time-limit conditions.")
 AppLauncher.add_app_launcher_args(parser)
@@ -87,6 +95,8 @@ class Evaluator:
         for k, v in config.get("controller", {}).items():
             setattr(cfg.controller, k, v)
         cfg.controller.type = "geometric"
+        if args_cli.max_vel is not None:
+            cfg.controller.max_lin_vel_cmd = args_cli.max_vel
         cfg.seed = args_cli.seed
         if args_cli.stage is not None:
             cfg.curriculum.active_stage = args_cli.stage
@@ -102,16 +112,56 @@ class Evaluator:
             cfg.state_space = n * cfg.single_observation_space
         if args_cli.packing_density is not None:
             cfg.curriculum.stage8_packing_density = args_cli.packing_density
+        self.net = None
+        self._obs = None
+        if args_cli.policy_ckpt or args_cli.zero_policy:
+            from UavSwarm.tasks.direct.torchrl_swarm.moving_task import configure_cfg
+
+            lidar_cfg = dict(
+                n_az=args_cli.lidar_az, elev_deg=tuple(args_cli.lidar_elev), rng_max=args_cli.lidar_range, radius=args_cli.lidar_radius,
+                sig_a=args_cli.lidar_noise[0], sig_b=args_cli.lidar_noise[1], miss=args_cli.lidar_miss,
+                period=max(1, round(1.0 / (args_cli.lidar_hz * cfg.sim.dt * cfg.decimation))), delay=args_cli.lidar_delay,
+            )
+            configure_cfg(cfg, args_cli.obs_sense, args_cli.obs_k, lidar_cfg=lidar_cfg)
         self.env = gym.make(args_cli.task, cfg=cfg)
         self.u = self.env.unwrapped
+        if args_cli.policy_ckpt:
+            self._load_policy()
         self.names = [f"robot_{i}" for i in range(self.u.num_drones)]
         self.default_len = self.u.max_episode_length
         self.step_dt = self.u.cfg.sim.dt * self.u.cfg.decimation
         print(f"[tune] radius mode={self.u.cfg.swarm_cfg.neighborhood_mode} stage={self.u.cfg.curriculum.active_stage}")
 
+    def _load_policy(self):
+        from mappo_torchl import AttentionMAPPOPolicy, MAPPOPolicy
+
+        sd = torch.load(args_cli.policy_ckpt, map_location="cpu")["policy"]
+        sd = {k[len("module.0.module."):]: v for k, v in sd.items() if k.startswith("module.0.module.")}
+        d = self.u.cfg.single_observation_space
+        if args_cli.policy_arch == "attention":
+            k = self.u.cfg.moving_obs_k
+            tdim = 5 if args_cli.obs_sense == "lidar" else 6
+            self.net = AttentionMAPPOPolicy(d - k * tdim, k, 4, token_dim=tdim, masked=tdim == 5)
+        else:
+            self.net = MAPPOPolicy(d, 4, (256, 256, 128))
+        self.net.load_state_dict(sd)
+        self.net.to(self.u.device).eval()
+
+    def _policy_action(self):
+        obs = torch.stack([self._obs[n] for n in self.names], dim=1).to(self.u.device)
+        mean, _ = self.net(obs)
+        return torch.tanh(mean)
+
     def _step(self, kp, repel, ff=0.0):
+        if self.net is not None or args_cli.zero_policy:
+            act = compute_swarm_gravity_baseline_action(self.u, kp, repel, ff_gain=ff)
+            if self.net is not None:
+                act = (act + args_cli.residual_scale * self._policy_action()).clamp(-1.0, 1.0)
+            self._obs, _, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+            return None
         if getattr(self.u, "_lidar", None) is not None:
-            lidar_update(self.u)
+            if not self.u._lidar.get("auto"):
+                lidar_update(self.u)
         elif self.u._apf_sense is not None:
             apf_sense_update(self.u)
         act = compute_swarm_gravity_baseline_action(self.u, kp, repel, ff_gain=ff)
@@ -141,14 +191,18 @@ class Evaluator:
         E, D = u.num_envs, u.num_drones
         u.cfg.swarm_cfg.apf_damping_gain = kd
         a = args_cli
+        policy_mode = self.net is not None or a.zero_policy
         period = max(1, round(1.0 / (a.sense_hz * self.step_dt))) if a.sense_hz > 0 else 1
         realistic = a.sense_pos != [0.0, 0.0] or a.sense_vel > 0 or a.sense_drop != [0.0, 0.0] or a.sense_range > 0 or period > 1 or a.sense_delay > 0
-        u._lidar = None
-        if a.lidar:
+        if policy_mode:
+            u._apf_sense = None
+        elif a.lidar:
+            u._lidar = None
             u._apf_sense = None
             u._lidar = make_lidar(a.lidar_az, a.lidar_elev, a.lidar_range, 0.1, a.lidar_radius, a.lidar_noise[0], a.lidar_noise[1],
                                   a.lidar_miss, 0.5, max(1, round(1.0 / (a.lidar_hz * self.step_dt))), a.lidar_delay)
         else:
+            u._lidar = None
             u._apf_sense = dict(
                 pos_noise=a.sense_pos[0], pos_noise_slope=a.sense_pos[1], vel_noise=a.sense_vel, dropout=a.sense_drop[0],
                 dropout_slope=a.sense_drop[1], range=a.sense_range, period=period, delay=a.sense_delay, buf=[],
@@ -171,7 +225,7 @@ class Evaluator:
                     acc[k][mask] = fill
 
         reset_acc()
-        self.env.reset()
+        self._obs, _ = self.env.reset()
         u.episode_length_buf[:] = 0
         rows, step = [], 0
         while len(rows) < episodes and step < 12000:
@@ -396,6 +450,9 @@ def main():
         ev.u.cfg.curriculum.move_target_distance = args_cli.move_distance
         ev.u.cfg.curriculum.move_planar = args_cli.move_planar
         ev.u.cfg.curriculum.move_curve_amp = args_cli.move_curve_amp
+        if args_cli.move_helix:
+            cur_ = ev.u.cfg.curriculum
+            cur_.move_helix_radius, cur_.move_helix_climb, cur_.move_helix_turns = args_cli.move_helix
 
         def run_set(kp, repel, kd, ff, rscale, speeds, episodes, tag):
             ev.u._apf_radius_scale = rscale

@@ -141,6 +141,9 @@ class CurriculumCfg:
     move_settle_s: float = 6.0
     move_planar: bool = False  # True: constant-altitude (2D) sphere path
     move_curve_amp: float = 0.0  # m; >0 adds one full left/right (random order) sine swing over the chord
+    move_helix_radius: float = 0.0  # m; >0 replaces the chord with a helix around the env origin
+    move_helix_climb: float = 1.5  # m; total altitude change (random sign), smoothstep profile
+    move_helix_turns: float = 1.0
 
     # Stage 10 parameters (swarm-gravity + reward machine: same containment sphere as
     # stage 8, but entering it doesn't terminate -- it assigns the agent a personal
@@ -175,6 +178,9 @@ class CurriculumCfg:
         return r_nh_half * (num_drones / self.stage8_packing_density) ** (1.0 / 3.0)
 
     def moving_path_length(self) -> float:
+        if self.move_helix_radius > 0:
+            n, w = 2048, 2.0 * 3.141592653589793 * self.move_helix_turns * self.move_helix_radius
+            return sum((w**2 + (self.move_helix_climb * 6.0 * u * (1.0 - u)) ** 2) ** 0.5 for u in ((i + 0.5) / n for i in range(n))) / n
         k = 2.0 * 3.141592653589793 / self.move_target_distance
         return self.move_target_distance * (1.0 + (self.move_curve_amp * k) ** 2 / 4.0)
 
@@ -348,6 +354,10 @@ class BaseSwarmEnvCfg(DirectMARLEnvCfg):
     # K = swarm_cfg.num_observed_neighbors), for an attention-based policy
     # (mappo_torchl.AttentionMAPPOPolicy) to consume -- see collision_avoidance_literature.md.
     include_k_neighbors_in_obs: bool = False
+    moving_obs: bool = False  # moving-sphere task observation/reward (moving_task.py)
+    moving_obs_sense: str = "oracle"  # "oracle" neighbour tokens or "lidar" returns
+    moving_obs_k: int = 4
+    lidar_cfg: dict = None
 
     # Episode / stepping
     episode_length_s = 30.0

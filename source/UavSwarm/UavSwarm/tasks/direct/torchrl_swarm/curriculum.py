@@ -746,26 +746,29 @@ def _set_moving_sphere(env, env_ids: torch.Tensor, env_origins: torch.Tensor) ->
         env._move_slots = compute_packing_slots(
             env.num_drones, 0.85 * radius, env.cfg.swarm_cfg.min_safe_distance, str(dev)
         )
-    theta = torch.rand(n, device=dev) * 2.0 * torch.pi
-    half = cur.move_target_distance / 2.0
-    lo, hi = cur.stage8_target_height_range
-    z = lo + (hi - lo) * torch.rand(n, 2, device=dev)
-    rim = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1) * half
-    if cur.move_planar:
-        z[:, 1:] = z[:, :1]
-    c0 = torch.cat([env_origins[:, :2] + rim, z[:, :1]], dim=1)
-    c1 = torch.cat([env_origins[:, :2] - rim, z[:, 1:]], dim=1)
-    delta = c1 - c0
-    dist = delta.norm(dim=1)
-    env._desired_pos_w[env_ids] = c0.unsqueeze(1).expand(-1, env.num_drones, -1)
-    env._target_dir_w[env_ids] = delta / dist.unsqueeze(1)
-    env._target_left[env_ids] = dist
-    env._target_len[env_ids] = dist
-    env._target_c0[env_ids] = c0
-    horiz = torch.stack([-env._target_dir_w[env_ids, 1], env._target_dir_w[env_ids, 0], torch.zeros(n, device=dev)], dim=1)
-    env._target_perp[env_ids] = horiz / horiz.norm(dim=1, keepdim=True).clamp(min=1e-6)
-    env._target_sign[env_ids] = torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
-    env._target_vel_w[env_ids] = env._target_dir_w[env_ids] * cur.move_target_speed
+    if cur.move_helix_radius > 0:
+        c0 = _set_helix(env, env_ids, env_origins, radius)
+    else:
+        theta = torch.rand(n, device=dev) * 2.0 * torch.pi
+        half = cur.move_target_distance / 2.0
+        lo, hi = cur.stage8_target_height_range
+        z = lo + (hi - lo) * torch.rand(n, 2, device=dev)
+        rim = torch.stack([torch.cos(theta), torch.sin(theta)], dim=1) * half
+        if cur.move_planar:
+            z[:, 1:] = z[:, :1]
+        c0 = torch.cat([env_origins[:, :2] + rim, z[:, :1]], dim=1)
+        c1 = torch.cat([env_origins[:, :2] - rim, z[:, 1:]], dim=1)
+        delta = c1 - c0
+        dist = delta.norm(dim=1)
+        env._desired_pos_w[env_ids] = c0.unsqueeze(1).expand(-1, env.num_drones, -1)
+        env._target_dir_w[env_ids] = delta / dist.unsqueeze(1)
+        env._target_left[env_ids] = dist
+        env._target_len[env_ids] = dist
+        env._target_c0[env_ids] = c0
+        horiz = torch.stack([-env._target_dir_w[env_ids, 1], env._target_dir_w[env_ids, 0], torch.zeros(n, device=dev)], dim=1)
+        env._target_perp[env_ids] = horiz / horiz.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        env._target_sign[env_ids] = torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
+        env._target_vel_w[env_ids] = env._target_dir_w[env_ids] * cur.move_target_speed
     rot = _sample_random_3d_rotation(n, str(dev))
     offsets = torch.einsum("nij,kj->nki", rot, env._move_slots)
     for j, rob in enumerate(env._robots):
@@ -776,10 +779,78 @@ def _set_moving_sphere(env, env_ids: torch.Tensor, env_origins: torch.Tensor) ->
         rob.write_root_velocity_to_sim(state[:, 7:], env_ids)
 
 
+def _helix_table(env):
+    """u(s) lookup for the helix (horizontal angle fraction) at uniform arc-length steps."""
+    cur = env.cfg.curriculum
+    key = (cur.move_helix_radius, cur.move_helix_climb, cur.move_helix_turns)
+    if getattr(env, "_helix_key", None) != key:
+        env._helix_key = key
+        m = 4096
+        u = torch.linspace(0.0, 1.0, m + 1, device=env.device)
+        w = 2.0 * torch.pi * cur.move_helix_turns * cur.move_helix_radius
+        ds = torch.sqrt(w**2 + (cur.move_helix_climb * 6.0 * u * (1.0 - u)) ** 2)
+        s = torch.cat([torch.zeros(1, device=env.device), torch.cumsum(0.5 * (ds[1:] + ds[:-1]) / m, dim=0)])
+        grid = torch.linspace(0.0, float(s[-1]), m + 1, device=env.device)
+        idx = torch.searchsorted(s, grid).clamp(1, m)
+        frac = (grid - s[idx - 1]) / (s[idx] - s[idx - 1]).clamp(min=1e-9)
+        env._helix_u = u[idx - 1] + frac * (u[idx] - u[idx - 1])
+        env._helix_len = float(s[-1])
+    return env._helix_u, env._helix_len
+
+
+def _helix_pos(env, s: torch.Tensor, ids: torch.Tensor | None = None) -> torch.Tensor:
+    cur = env.cfg.curriculum
+    tab, length = _helix_table(env)
+    sel = slice(None) if ids is None else ids
+    pos = (s / length).clamp(0.0, 1.0) * (tab.numel() - 1)
+    i0 = pos.floor().long().clamp(max=tab.numel() - 2)
+    u = tab[i0] + (pos - i0) * (tab[i0 + 1] - tab[i0])
+    phi = env._helix_phi0[sel] + env._target_sign[sel] * 2.0 * torch.pi * cur.move_helix_turns * u
+    smooth = u * u * (3.0 - 2.0 * u)
+    axis = env._target_perp[sel]
+    return torch.stack(
+        [axis[:, 0] + cur.move_helix_radius * torch.cos(phi), axis[:, 1] + cur.move_helix_radius * torch.sin(phi),
+         env._helix_z0[sel] + env._helix_climb[sel] * smooth], dim=1)
+
+
+def _set_helix(env, env_ids: torch.Tensor, env_origins: torch.Tensor, sphere_radius: float) -> torch.Tensor:
+    cur = env.cfg.curriculum
+    n, dev = len(env_ids), env.device
+    lo, hi = cur.stage8_target_height_range
+    lo = max(lo, sphere_radius + 0.3)
+    climb = cur.move_helix_climb * torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
+    span = max(hi - lo - cur.move_helix_climb, 0.0)
+    base = lo + span * torch.rand(n, device=dev)
+    env._helix_climb[env_ids] = climb
+    env._helix_z0[env_ids] = torch.where(climb < 0, base + cur.move_helix_climb, base)
+    env._helix_phi0[env_ids] = torch.rand(n, device=dev) * 2.0 * torch.pi
+    env._target_sign[env_ids] = torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
+    env._target_perp[env_ids] = torch.cat([env_origins[:, :2], torch.zeros(n, 1, device=dev)], dim=1)
+    _, length = _helix_table(env)
+    zero = torch.zeros(n, device=dev)
+    c0 = _helix_pos(env, zero, env_ids)
+    env._desired_pos_w[env_ids] = c0.unsqueeze(1).expand(-1, env.num_drones, -1)
+    env._target_left[env_ids] = length
+    env._target_len[env_ids] = length
+    env._target_c0[env_ids] = c0
+    step = cur.move_target_speed * env.step_dt
+    env._target_vel_w[env_ids] = (_helix_pos(env, zero + step, env_ids) - c0) / env.step_dt
+    return c0
+
+
 def advance_moving_target(env) -> None:
-    """Move the sphere centre at constant path speed along chord + A*sin(2*pi*s/len) lateral swing."""
+    """Move the sphere centre at constant path speed along chord + A*sin(2*pi*s/len) lateral swing, or the helix."""
     cur = env.cfg.curriculum
     dt = env.step_dt
+    if cur.move_helix_radius > 0:
+        s_now = env._target_len - env._target_left
+        s_new = s_now + torch.minimum(cur.move_target_speed * dt * torch.ones_like(s_now), env._target_left)
+        new_pos = _helix_pos(env, s_new)
+        env._target_vel_w = (new_pos - env._shared_target_w) / dt
+        env._shared_target_w = new_pos
+        env._target_left = env._target_len - s_new
+        env._desired_pos_w[:] = env._shared_target_w.unsqueeze(1)
+        return
     amp = cur.move_curve_amp
     k = 2.0 * torch.pi / env._target_len
     s_now = env._target_len - env._target_left
@@ -792,3 +863,23 @@ def advance_moving_target(env) -> None:
     env._shared_target_w = new_pos
     env._target_left = env._target_len - s_new
     env._desired_pos_w[:] = env._shared_target_w.unsqueeze(1)
+
+
+def moving_preview(env, taus) -> torch.Tensor:
+    """Sphere-centre positions (E, T, 3) at the given future times, clamped at the end of the path."""
+    cur = env.cfg.curriculum
+    v = cur.move_target_speed
+    s_now = env._target_len - env._target_left
+    out = []
+    for tau in taus:
+        if cur.move_helix_radius > 0:
+            s = torch.minimum(s_now + v * tau, env._target_len)
+            out.append(_helix_pos(env, s))
+        else:
+            amp = cur.move_curve_amp
+            k = 2.0 * torch.pi / env._target_len
+            slope = env._target_sign * amp * k * torch.cos(k * s_now)
+            s = torch.minimum(s_now + v * tau / torch.sqrt(1.0 + slope**2), env._target_len)
+            lateral = env._target_sign * amp * torch.sin(k * s)
+            out.append(env._target_c0 + env._target_dir_w * s.unsqueeze(1) + env._target_perp * lateral.unsqueeze(1))
+    return torch.stack(out, dim=1)

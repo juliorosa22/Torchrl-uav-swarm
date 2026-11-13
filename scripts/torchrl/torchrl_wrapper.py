@@ -61,6 +61,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         residual_kp: float = 2.0,
         residual_scale: float = 0.3,
         residual_repel_gain: float = 0.5,
+        residual_ff: float = 0.0,
         planner_range: float = 0.0,
         planner_alpha: float = 0.3,
         wp_horizon: int = 0,
@@ -88,6 +89,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         self.residual_kp = residual_kp
         self.residual_scale = residual_scale
         self.residual_repel_gain = residual_repel_gain
+        self.residual_ff = residual_ff
         self.planner_range = planner_range
         self.planner_alpha = planner_alpha
         if planner_range > 0.0 and not (residual_rl and residual_baseline == "apf"):
@@ -360,7 +362,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         elif self.residual_rl:
             if self.residual_baseline == "apf":
                 baseline = compute_swarm_gravity_baseline_action(
-                    self.unwrapped_env, self.residual_kp, self.residual_repel_gain
+                    self.unwrapped_env, self.residual_kp, self.residual_repel_gain, ff_gain=self.residual_ff
                 )
             else:
                 baseline = compute_baseline_action(self.unwrapped_env, self.residual_kp)

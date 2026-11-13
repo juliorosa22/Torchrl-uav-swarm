@@ -455,6 +455,9 @@ def _target_vel_b(env) -> torch.Tensor:
     return quat_apply_inverse(quats.reshape(-1, 4), vel.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
 
+APF_REF_VEL = 1.5  # m/s command scale the APF repulsion/damping gains were tuned at
+
+
 def compute_swarm_gravity_baseline_action(
     env, kp: float, repel_gain: float, waypoint_offset_b: torch.Tensor | None = None, ff_gain: float = 0.0
 ) -> torch.Tensor:
@@ -480,12 +483,13 @@ def compute_swarm_gravity_baseline_action(
     if env.cfg.swarm_cfg.neighborhood_mode == "radius":
         lidar = getattr(env, "_lidar", None) is not None
         repel_b = _compute_scan_repulsion_b(env, repel_gain) if lidar else _compute_radius_repulsion_b(env, repel_gain)
-        cmd_b = attract_b + repel_b
+        unit = APF_REF_VEL / env.cfg.controller.max_lin_vel_cmd
+        cmd_b = attract_b + unit * repel_b
         if ff_gain > 0.0:
             cmd_b = cmd_b + ff_gain * _target_vel_b(env) / env.cfg.controller.max_lin_vel_cmd
         kd = env.cfg.swarm_cfg.apf_damping_gain
         if kd > 0.0:
-            cmd_b = cmd_b + (_compute_self_damping_b(env, kd) if lidar else _compute_radius_damping_b(env, kd))
+            cmd_b = cmd_b + unit * (_compute_self_damping_b(env, kd) if lidar else _compute_radius_damping_b(env, kd))
         cmd_b = cmd_b.clamp(-1.0, 1.0)
         baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
         baseline[:, :, :3] = cmd_b

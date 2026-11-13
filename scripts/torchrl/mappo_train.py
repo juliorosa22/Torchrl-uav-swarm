@@ -195,6 +195,26 @@ parser.add_argument(
          "include_k_neighbors_in_obs); will error on a task that doesn't.",
 )
 
+parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
+parser.add_argument("--moving", action="store_true", help="Moving-sphere task: decentralised moving_task observation and reward (use with --task PackingMono... --stage 13).")
+parser.add_argument("--obs_sense", type=str, default="oracle", choices=["oracle", "lidar"])
+parser.add_argument("--obs_k", type=int, default=8, help="Neighbour/return tokens in the observation.")
+parser.add_argument("--move_speed", type=float, default=1.0)
+parser.add_argument("--move_distance", type=float, default=8.0)
+parser.add_argument("--move_curve_amp", type=float, default=0.0)
+parser.add_argument("--move_planar", action="store_true")
+parser.add_argument("--move_helix", type=float, nargs=3, default=None, metavar=("RADIUS", "CLIMB", "TURNS"))
+parser.add_argument("--lidar_az", type=int, default=16)
+parser.add_argument("--lidar_elev", type=float, nargs="+", default=[-90.0, -60.0, -30.0, 0.0, 30.0, 60.0, 90.0])
+parser.add_argument("--lidar_range", type=float, default=3.0)
+parser.add_argument("--lidar_radius", type=float, default=0.1)
+parser.add_argument("--lidar_noise", type=float, nargs=2, default=[0.02, 0.01])
+parser.add_argument("--lidar_miss", type=float, default=0.02)
+parser.add_argument("--lidar_hz", type=float, default=10.0)
+parser.add_argument("--lidar_delay", type=int, default=1)
+parser.add_argument("--residual_ff", type=float, default=0.0, help="residual_rl apf baseline: sphere-velocity feed-forward gain.")
+parser.add_argument("--apf_rscale", type=float, default=1.0, help="residual_rl apf baseline: repulsion-radius scale.")
+
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -224,7 +244,7 @@ def load_config(path: str) -> dict:
 
 def make_policy(
     obs_dim: int, action_dim: int, config: dict, device: torch.device,
-    policy_arch: str = "flat", num_neighbors: int | None = None,
+    policy_arch: str = "flat", num_neighbors: int | None = None, token_dim: int = 6,
 ) -> ProbabilisticActor:
     """Create shared policy: TensorDictModule → ProbabilisticActor.
 
@@ -235,8 +255,8 @@ def make_policy(
     if policy_arch == "attention":
         if num_neighbors is None:
             raise ValueError("--policy_arch attention requires num_neighbors.")
-        own_obs_dim = obs_dim - num_neighbors * 6
-        net = AttentionMAPPOPolicy(own_obs_dim, num_neighbors, action_dim).to(device)
+        own_obs_dim = obs_dim - num_neighbors * token_dim
+        net = AttentionMAPPOPolicy(own_obs_dim, num_neighbors, action_dim, token_dim=token_dim, masked=token_dim == 5).to(device)
     else:
         net = MAPPOPolicy(obs_dim, action_dim, config["models"]["policy"]["hidden_sizes"]).to(device)
     if args_cli.init_log_std is not None:
@@ -308,6 +328,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         for k, v in config["controller"].items():
             setattr(env_cfg.controller, k, v)
     env_cfg.controller.type = args_cli.controller
+    if args_cli.max_vel is not None:
+        env_cfg.controller.max_lin_vel_cmd = args_cli.max_vel
     if args_cli.stage is not None:
         env_cfg.curriculum.active_stage = args_cli.stage
     if args_cli.simple_reward:
@@ -357,6 +379,24 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
             for i in range(n)
         }
         env_cfg.state_space = n * env_cfg.single_observation_space
+
+    if args_cli.moving:
+        from UavSwarm.tasks.direct.torchrl_swarm.moving_task import configure_cfg
+
+        cur = env_cfg.curriculum
+        cur.move_target_speed, cur.move_target_distance = args_cli.move_speed, args_cli.move_distance
+        cur.move_curve_amp, cur.move_planar = args_cli.move_curve_amp, args_cli.move_planar
+        if args_cli.move_helix:
+            cur.move_helix_radius, cur.move_helix_climb, cur.move_helix_turns = args_cli.move_helix
+        env_cfg.episode_length_s = cur.moving_path_length() / args_cli.move_speed + cur.move_settle_s + 0.5
+        step_dt = env_cfg.sim.dt * env_cfg.decimation
+        lidar_cfg = dict(
+            n_az=args_cli.lidar_az, elev_deg=tuple(args_cli.lidar_elev), rng_max=args_cli.lidar_range, radius=args_cli.lidar_radius,
+            sig_a=args_cli.lidar_noise[0], sig_b=args_cli.lidar_noise[1], miss=args_cli.lidar_miss,
+            period=max(1, round(1.0 / (args_cli.lidar_hz * step_dt))), delay=args_cli.lidar_delay,
+        )
+        configure_cfg(env_cfg, args_cli.obs_sense, args_cli.obs_k, lidar_cfg=lidar_cfg)
+        env_cfg.swarm_cfg.neighborhood_mode = "radius"
 
     device = torch.device(config["env"]["device"])
 
@@ -427,11 +467,13 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         base_env, device=str(device), normalize_obs=normalize_obs,
         residual_rl=args_cli.residual_rl, residual_baseline=args_cli.residual_baseline,
         residual_kp=args_cli.residual_kp, residual_scale=args_cli.residual_scale,
-        residual_repel_gain=args_cli.residual_repel_gain,
+        residual_repel_gain=args_cli.residual_repel_gain, residual_ff=args_cli.residual_ff,
         planner_range=args_cli.planner_range, planner_alpha=args_cli.planner_alpha,
         wp_horizon=args_cli.wp_horizon, wp_dt=args_cli.wp_dt, wp_lookahead=args_cli.wp_lookahead,
         wp_safety=not args_cli.no_wp_safety, wp_goal_bias=args_cli.wp_goal_bias, wp_z_bias=args_cli.wp_z_bias,
     )
+
+    base_env.unwrapped._apf_radius_scale = args_cli.apf_rscale
 
     # --- dimensions ---
     obs_dim = env.obs_dim
@@ -444,7 +486,9 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
     # --- create networks ---
     policy = make_policy(
         obs_dim, action_dim, config, device,
-        policy_arch=args_cli.policy_arch, num_neighbors=env_cfg.swarm_cfg.num_observed_neighbors,
+        policy_arch=args_cli.policy_arch,
+        num_neighbors=env_cfg.moving_obs_k if args_cli.moving else env_cfg.swarm_cfg.num_observed_neighbors,
+        token_dim=(5 if args_cli.obs_sense == "lidar" else 6) if args_cli.moving else 6,
     )
     critic = make_critic(
         state_dim, config, device,

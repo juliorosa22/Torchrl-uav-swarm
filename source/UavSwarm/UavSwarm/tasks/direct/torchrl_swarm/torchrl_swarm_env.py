@@ -53,6 +53,8 @@ from .termination import (
 )
 from .rewards import get_rewards, get_formation_rewards, get_formation_rewards_simple, get_swarm_gravity_rewards, get_packing_rewards
 from .debug_viz import set_debug_vis_impl, debug_vis_callback
+from . import moving_task
+from .lidar import make_lidar
 
 
 class BaseSwarmEnv(DirectMARLEnv):
@@ -121,6 +123,12 @@ class BaseSwarmEnv(DirectMARLEnv):
         self._target_c0 = torch.zeros(self.num_envs, 3, device=self.device)
         self._target_perp = torch.zeros(self.num_envs, 3, device=self.device)
         self._target_sign = torch.ones(self.num_envs, device=self.device)
+        if self.cfg.moving_obs and self.cfg.moving_obs_sense == "lidar":
+            self._lidar = make_lidar(**(self.cfg.lidar_cfg or {}))
+            self._lidar["auto"] = True
+        self._helix_phi0 = torch.zeros(self.num_envs, device=self.device)
+        self._helix_climb = torch.zeros(self.num_envs, device=self.device)
+        self._helix_z0 = torch.zeros(self.num_envs, device=self.device)
         if self.curriculum_stage in (10, 11):
             # Computed once (tiny N, cheap electrostatic relaxation) -- see
             # formation.compute_packing_slots. Centered on the origin; rotated + translated
@@ -236,6 +244,7 @@ class BaseSwarmEnv(DirectMARLEnv):
 
         actions_list = [actions[f"robot_{i}"] for i in range(self.num_drones)]
         actions_tensor = torch.stack(actions_list, dim=1)
+        self._prev_actions = self._actions
         self._actions = actions_tensor.clone().clamp(-1.0, 1.0)
 
         self._thrust, self._moment = apply_controller(self, self._actions)
@@ -426,6 +435,10 @@ class BaseSwarmEnv(DirectMARLEnv):
         """
         ensure_cache_populated(self)
 
+        if self.cfg.moving_obs:
+            self._moving_obs = moving_task.build_obs(self)
+            return {f"robot_{j}": self._moving_obs[j] for j in range(self.num_drones)}
+
         all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
         all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
         all_gravities = torch.stack([rob.data.projected_gravity_b for rob in self._robots], dim=0)
@@ -468,6 +481,9 @@ class BaseSwarmEnv(DirectMARLEnv):
                 "_get_states() called before cache is populated. "
                 "This should never happen in normal workflow."
             )
+
+        if self.cfg.moving_obs:
+            return moving_task.build_state(self, self._moving_obs)
 
         all_lin_vels = torch.stack([rob.data.root_lin_vel_b for rob in self._robots], dim=0)
         all_ang_vels = torch.stack([rob.data.root_ang_vel_b for rob in self._robots], dim=0)
@@ -516,6 +532,8 @@ class BaseSwarmEnv(DirectMARLEnv):
             return get_formation_rewards(self)
         if self.curriculum_stage == 7:
             return get_formation_rewards_simple(self)
+        if self.curriculum_stage == 13 and self.cfg.moving_obs:
+            return moving_task.get_rewards(self)
         if self.curriculum_stage == 13 or (self.curriculum_stage == 10 and self.cfg.reward_cfg.shared_packing_reward):
             return get_packing_rewards(self)
         if self.curriculum_stage in (8, 9, 10, 11, 12):
