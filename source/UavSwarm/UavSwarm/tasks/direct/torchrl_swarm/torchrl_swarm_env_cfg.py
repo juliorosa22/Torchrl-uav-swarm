@@ -147,6 +147,7 @@ class CurriculumCfg:
     move_paths: tuple = ()  # path-family names (paths.py); non-empty overrides the single-path modes above
     move_profiles: tuple = ("const",)  # speed profiles drawn per episode: const | ramp | stopgo
     move_path_len: float = 10.0  # m of path per episode in family mode
+    move_z_max: float = 4.0  # m; top of the altitude band the sphere centre may use in family mode
     move_a_max: float = 3.0  # m/s^2; curvature floor is speed^2 / move_a_max
     move_pause_budget_s: float = 6.0  # extra episode time for ramps and pauses in family mode
 

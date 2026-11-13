@@ -35,6 +35,7 @@ parser.add_argument("--move_planar", action="store_true")
 parser.add_argument("--move_paths", type=str, nargs="+", default=None, help="Path families (paths.py): line curve slalom arc hairpin spline figure8 coaster helix; 'train' / 'held' / 'all' shortcuts.")
 parser.add_argument("--move_profiles", type=str, nargs="+", default=["const"], help="Speed profiles: const ramp stopgo.")
 parser.add_argument("--move_path_len", type=float, default=10.0)
+parser.add_argument("--move_z_max", type=float, default=4.0, help="Top of the sphere-centre altitude band in family mode (m).")
 parser.add_argument("--move_helix", type=float, nargs=3, default=None, metavar=("RADIUS", "CLIMB", "TURNS"), help="Helical sphere path instead of the chord.")
 parser.add_argument("--move_distance", type=float, default=6.0)
 parser.add_argument("--sense_pos", type=float, nargs=2, default=[0.0, 0.0], metavar=("A", "B"), help="Neighbour position noise sigma = A + B*distance (m).")
@@ -268,7 +269,7 @@ class Evaluator:
         self._wp_prev = None
         u.episode_length_buf[:] = 0
         rows, step = [], 0
-        while len(rows) < episodes and step < 12000:
+        while len(rows) < episodes and step < max(12000, int(6 * u.cfg.episode_length_s / self.step_dt)):
             fam_prev, prof_prev = u._path_fam.clone(), u._path_prof.clone()
             self._step(kp, repel, ff)
             step += 1
@@ -499,6 +500,7 @@ def main():
             fams = tuple(f for name in args_cli.move_paths for f in short.get(name, (name,)))
             c_ = ev.u.cfg.curriculum
             c_.move_paths, c_.move_profiles, c_.move_path_len = fams, tuple(args_cli.move_profiles), args_cli.move_path_len
+            c_.move_z_max = args_cli.move_z_max
         if args_cli.move_helix:
             cur_ = ev.u.cfg.curriculum
             cur_.move_helix_radius, cur_.move_helix_climb, cur_.move_helix_turns = args_cli.move_helix

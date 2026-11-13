@@ -12,8 +12,11 @@ HELD_OUT_FAMILIES = ("figure8", "coaster", "helix")
 ALL_FAMILIES = TRAIN_FAMILIES + HELD_OUT_FAMILIES
 PROFILES = ("const", "ramp", "stopgo")
 DS = 0.025  # uniform arc-length spacing (m)
-M = 1600  # samples at DS (40 m of path)
-M0 = 1200  # dense parametric samples
+
+
+def _sizes(L: float) -> tuple[int, int]:
+    """(uniform samples M, dense parametric samples M0) enough for a path of length L with scale-up headroom."""
+    return max(1600, int(2.0 * L / DS)), max(1200, int(60 * L))
 
 
 def _u(n, lo, hi, dev):
@@ -24,10 +27,10 @@ def _sgn(n, dev):
     return torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
 
 
-def _polyline(corners: torch.Tensor) -> torch.Tensor:
+def _polyline(corners: torch.Tensor, m0: int) -> torch.Tensor:
     seg = (corners[:, 1:] - corners[:, :-1]).norm(dim=-1)
     cum = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(dim=1)], dim=1)
-    q = torch.linspace(0.0, 1.0, M0, device=corners.device).unsqueeze(0) * cum[:, -1:]
+    q = torch.linspace(0.0, 1.0, m0, device=corners.device).unsqueeze(0) * cum[:, -1:]
     idx = torch.searchsorted(cum.contiguous(), q.contiguous(), right=True).clamp(1, corners.shape[1] - 1)
     c0, c1 = cum.gather(1, idx - 1), cum.gather(1, idx)
     w = ((q - c0) / (c1 - c0).clamp(min=1e-9)).unsqueeze(-1)
@@ -42,44 +45,50 @@ def _walk(lengths, yaw_inc, pitch):
     return torch.cat([torch.zeros_like(d[:, :1]), d.cumsum(dim=1)], dim=1)
 
 
-def _gen(family: str, n: int, dev, L: float, rho_min: float):
-    """Dense local-frame points (n, M0, 3) and a smoothing length (m) for one family."""
-    t = torch.linspace(0.0, 1.0, M0, device=dev).unsqueeze(0).expand(n, -1)
+def _gen(family: str, n: int, dev, L: float, rho_min: float, m0: int):
+    """Dense local-frame points (n, m0, 3) and a smoothing length (m) for one family. Feature counts grow with L."""
+    t = torch.linspace(0.0, 1.0, m0, device=dev).unsqueeze(0).expand(n, -1)
     Ld = 1.15 * L
-    z0 = torch.zeros(n, 1, device=dev)
     sigma = 0.0
+    z0 = torch.zeros(n, 1, device=dev)
     if family == "line":
         pitch = torch.deg2rad(_u(n, -20.0, 20.0, dev)).unsqueeze(1)
         s = t * Ld
         pts = torch.stack([s * pitch.cos(), z0 + 0 * s, s * pitch.sin()], dim=-1)
     elif family == "curve":
         x = t * Ld
-        y = _sgn(n, dev).unsqueeze(1) * _u(n, 0.6, 1.5, dev).unsqueeze(1) * torch.sin(2 * math.pi * x / L)
+        lam = _u(n, 8.0, 14.0, dev).unsqueeze(1)
+        y = _sgn(n, dev).unsqueeze(1) * _u(n, 0.6, 1.5, dev).unsqueeze(1) * torch.sin(2 * math.pi * x / lam)
         pts = torch.stack([x, y, 0 * x], dim=-1)
     elif family == "slalom":
         x = t * Ld
-        k = torch.randint(2, 4, (n, 1), device=dev).float()
-        y = _sgn(n, dev).unsqueeze(1) * _u(n, 0.5, 1.2, dev).unsqueeze(1) * torch.sin(2 * math.pi * k * x / L)
+        lam = _u(n, 4.0, 7.0, dev).unsqueeze(1)
+        y = _sgn(n, dev).unsqueeze(1) * _u(n, 0.5, 1.2, dev).unsqueeze(1) * torch.sin(2 * math.pi * x / lam)
         pts = torch.stack([x, y, 0 * x], dim=-1)
     elif family == "arc":
         r = _u(n, 1.2, 3.5, dev).unsqueeze(1)
         phi = t * (Ld / r)
-        climb = _sgn(n, dev).unsqueeze(1) * _u(n, 0.0, 1.5, dev).unsqueeze(1)
+        climb = _sgn(n, dev).unsqueeze(1) * _u(n, 0.0, 1.5, dev).unsqueeze(1) * max(1.0, L / 10.0)
         pts = torch.stack([r * phi.sin(), _sgn(n, dev).unsqueeze(1) * r * (1 - phi.cos()), climb * phi / (2 * math.pi)], dim=-1)
     elif family == "hairpin":
-        n_corner = torch.randint(1, 4, (n, 1), device=dev)
-        mask = (torch.arange(4, device=dev).unsqueeze(0) < n_corner).float()
-        turn = _sgn(n, dev).unsqueeze(1) * torch.deg2rad(_u(n, 60.0, 150.0, dev)).unsqueeze(1) * mask
-        yaw_inc = torch.cat([torch.zeros(n, 1, device=dev), turn[:, :3]], dim=1)
-        pts = _polyline(_walk(Ld / 4 * _u(n, 0.8, 1.2, dev).unsqueeze(1).expand(-1, 4), yaw_inc, torch.deg2rad(_u(n * 4, -10.0, 10.0, dev)).reshape(n, 4)))
+        segs = max(4, round(L / 3.0))
+        mask = (torch.rand(n, segs - 1, device=dev) < 0.6).float()
+        mask[:, 0] = 1.0
+        turn = _sgn(n * (segs - 1), dev).reshape(n, segs - 1) * torch.deg2rad(_u(n * (segs - 1), 60.0, 150.0, dev)).reshape(n, segs - 1) * mask
+        yaw_inc = torch.cat([torch.zeros(n, 1, device=dev), turn], dim=1)
+        lengths = (Ld / segs) * _u(n * segs, 0.8, 1.2, dev).reshape(n, segs)
+        pitch = torch.deg2rad(_u(n * segs, -10.0, 10.0, dev)).reshape(n, segs)
+        pts = _polyline(_walk(lengths, yaw_inc, pitch), m0)
         sigma = max(0.5, rho_min) * float(_u(1, 1.0, 1.5, dev))
     elif family == "spline":
-        yaw_inc = torch.cat([torch.zeros(n, 1, device=dev), torch.deg2rad((40.0 * torch.randn(n, 4, device=dev)).clamp(-80, 80))], dim=1)
-        pts = _polyline(_walk((Ld / 5) * torch.ones(n, 5, device=dev), yaw_inc, torch.deg2rad(_u(n * 5, -15.0, 15.0, dev)).reshape(n, 5)))
+        segs = max(5, round(L / 2.5))
+        yaw_inc = torch.cat([torch.zeros(n, 1, device=dev), torch.deg2rad((40.0 * torch.randn(n, segs - 1, device=dev)).clamp(-80, 80))], dim=1)
+        pitch = torch.deg2rad(_u(n * segs, -15.0, 15.0, dev)).reshape(n, segs)
+        pts = _polyline(_walk((Ld / segs) * torch.ones(n, segs, device=dev), yaw_inc, pitch), m0)
         sigma = max(0.8, rho_min) * float(_u(1, 1.0, 1.3, dev))
     elif family == "figure8":
         a = _u(n, 1.0, 1.6, dev).unsqueeze(1)
-        th = t * 4 * math.pi
+        th = t * 2 * math.pi * max(2.0, Ld / (6.0 * 1.3))
         h = _u(n, 0.3, 0.7, dev).unsqueeze(1) * (torch.rand(n, 1, device=dev) < 0.5).float()
         pts = torch.stack([a * th.sin(), a * th.sin() * th.cos(), h * torch.sin(2 * th)], dim=-1)
     elif family == "coaster":
@@ -88,19 +97,19 @@ def _gen(family: str, n: int, dev, L: float, rho_min: float):
         pts = torch.stack([x, 0 * x, _u(n, 0.4, 0.9, dev).unsqueeze(1) * torch.sin(2 * math.pi * x / lam)], dim=-1)
     elif family == "helix":
         rho = _u(n, 1.5, 2.5, dev).unsqueeze(1)
-        phi = 2 * math.pi * _u(n, 0.9, 1.4, dev).unsqueeze(1) * t
-        u = t
-        climb = _sgn(n, dev).unsqueeze(1) * _u(n, 1.0, 2.0, dev).unsqueeze(1)
-        pts = torch.stack([rho * (phi.cos() - 1), _sgn(n, dev).unsqueeze(1) * rho * phi.sin(), climb * u * u * (3 - 2 * u)], dim=-1)
+        turns = Ld / (2 * math.pi * rho) * _u(n, 0.8, 1.1, dev).unsqueeze(1)
+        phi = 2 * math.pi * turns * t
+        climb = _sgn(n, dev).unsqueeze(1) * _u(n, 1.0, 2.0, dev).unsqueeze(1) * turns
+        pts = torch.stack([rho * (phi.cos() - 1), _sgn(n, dev).unsqueeze(1) * rho * phi.sin(), climb * t], dim=-1)
     else:
         raise ValueError(f"unknown path family {family!r}")
     return pts, sigma
 
 
-def _resample(pts: torch.Tensor):
+def _resample(pts: torch.Tensor, m: int):
     seg = (pts[:, 1:] - pts[:, :-1]).norm(dim=-1)
     cum = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(dim=1)], dim=1)
-    q = (torch.arange(M, device=pts.device).float() * DS).unsqueeze(0).expand(pts.shape[0], -1)
+    q = (torch.arange(m, device=pts.device).float() * DS).unsqueeze(0).expand(pts.shape[0], -1)
     q = torch.minimum(q, cum[:, -1:]).contiguous()
     idx = torch.searchsorted(cum.contiguous(), q, right=True).clamp(1, pts.shape[1] - 1)
     c0, c1 = cum.gather(1, idx - 1), cum.gather(1, idx)
@@ -128,16 +137,16 @@ def _max_curvature(pts: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return (kappa * valid[:, h:-h]).max(dim=1).values
 
 
-def _finalise(pts, sigma, L, rho_min, z_lo, z_hi):
+def _finalise(pts, sigma, L, rho_min, z_lo, z_hi, m):
     n, dev = pts.shape[0], pts.device
-    pts, total = _resample(pts)
+    pts, total = _resample(pts, m)
     pts = _smooth(pts, sigma)
-    pts, total = _resample(pts)
-    idx = torch.arange(M, device=dev).float().unsqueeze(0) * DS
+    pts, total = _resample(pts, m)
+    idx = torch.arange(m, device=dev).float().unsqueeze(0) * DS
     kmax = _max_curvature(pts, (idx <= torch.minimum(total, torch.full_like(total, L)).unsqueeze(1)).float())
     f = (rho_min * kmax).clamp(1.0, 6.0).view(n, 1, 1)
     pts = pts[:, :1] + f * (pts - pts[:, :1])
-    pts, total = _resample(pts)
+    pts, total = _resample(pts, m)
     length = torch.minimum(total, torch.full_like(total, L))
     yaw = _u(n, 0.0, 2 * math.pi, dev)
     c, s = yaw.cos().unsqueeze(1), yaw.sin().unsqueeze(1)
@@ -182,14 +191,15 @@ def generate(fam_ids: torch.Tensor, prof_ids: torch.Tensor, speed: float, dt: fl
     """Sphere-centre trajectories (n, n_steps, 3) at control rate, moving-step count (n,), path length (n,)."""
     n, dev = fam_ids.shape[0], fam_ids.device
     rho_min = max(0.8, speed**2 / a_max)
+    M, m0 = _sizes(L)
     pts = torch.zeros(n, M, 3, device=dev)
     length = torch.zeros(n, device=dev)
     for f, name in enumerate(ALL_FAMILIES):
         sel = (fam_ids == f).nonzero().flatten()
         if sel.numel() == 0:
             continue
-        dense, sigma = _gen(name, sel.numel(), dev, L, rho_min)
-        pts[sel], length[sel] = _finalise(dense, sigma, L, rho_min, z_lo, z_hi)
+        dense, sigma = _gen(name, sel.numel(), dev, L, rho_min, m0)
+        pts[sel], length[sel] = _finalise(dense, sigma, L, rho_min, z_lo, z_hi, M)
     s = torch.cumsum(speed * speed_multiplier(prof_ids, n_steps, dt) * dt, dim=1)
     s = torch.minimum(s - speed * dt, length.unsqueeze(1)).clamp(min=0.0)
     pos = (s / DS).clamp(max=M - 1.001)

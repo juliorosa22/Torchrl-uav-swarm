@@ -853,8 +853,9 @@ def _set_path_family(env, env_ids: torch.Tensor, env_origins: torch.Tensor, sphe
     fam = fams[torch.randint(len(fams), (n,), device=dev)]
     prof = profs[torch.randint(len(profs), (n,), device=dev)]
     z_lo = max(cur.stage8_target_height_range[0], sphere_radius + 0.3)
+    env.cfg.reward_cfg.max_distance_from_origin = max(15.0, cur.move_path_len / 2.0 + sphere_radius + 5.0)
     traj, moving, _ = paths.generate(fam, prof, cur.move_target_speed, dt, n_steps, cur.move_path_len, cur.move_a_max,
-                                     z_lo, max(cur.stage8_target_height_range[1], z_lo + 1.0))
+                                     z_lo, max(cur.move_z_max, z_lo + 1.0))
     traj = traj + torch.cat([env_origins[:, :2], torch.zeros(n, 1, device=dev)], dim=1).unsqueeze(1)
     env._traj[env_ids] = traj
     env._traj_k[env_ids] = 0
