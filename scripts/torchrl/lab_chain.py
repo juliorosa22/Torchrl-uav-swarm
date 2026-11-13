@@ -18,10 +18,12 @@ p.add_argument("--speed_range", type=str, nargs=2, default=["1.0", "3.0"])
 p.add_argument("--path_lens", type=str, nargs="+", default=["20", "30"])
 p.add_argument("--eval_episodes", type=int, default=288)
 p.add_argument("--iterations", type=int, default=6)
-p.add_argument("--rl_iters", type=int, default=300)
+p.add_argument("--rl_iters", type=int, default=600)
 p.add_argument("--rl_envs", type=int, default=32)
-p.add_argument("--rl_fpb", type=int, default=16384)
-p.add_argument("--rl_batch", type=int, default=2048)
+p.add_argument("--rl_fpb", type=int, default=8192)
+p.add_argument("--rl_batch", type=int, default=4096)
+p.add_argument("--rl_timeout_h", type=float, default=5.0, help="kill a hung training stage after this many hours")
+p.add_argument("--reuse", action="store_true", help="skip tune and APF final eval for cells whose result files already exist")
 p.add_argument("--residual_scale", type=float, default=0.2)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--dry", action="store_true")
@@ -36,11 +38,14 @@ def dist(paths):
 os.makedirs(a.out, exist_ok=True)
 
 
-def run(cmd):
+def run(cmd, timeout_h=None):
     cmd = [str(c) for c in cmd]
     print("[chain]", " ".join(cmd), flush=True)
     if not a.dry:
-        subprocess.run(cmd, check=False)
+        try:
+            subprocess.run(cmd, check=False, timeout=None if timeout_h is None else timeout_h * 3600)
+        except subprocess.TimeoutExpired:
+            print(f"[chain] TIMEOUT after {timeout_h} h: {cmd[2]}", flush=True)
 
 
 def best(path):
@@ -55,17 +60,18 @@ for cell in a.cells.split(","):
     base = ["--headless", "--config", a.config, "--num_agents", n, "--max_vel", a.max_vel, "--num_envs", 64]
     init = ["0.98", "1.9", "3.4"] if sense == "lidar" else ["2.4", "1.3", "1.5"]
     tune = f"{a.out}/{cell}_tune.jsonl"
-    if os.path.exists(tune):
-        os.remove(tune)
-    run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("train"), "--tune_move", "--episodes", 96,
-         "--iterations", a.iterations, "--popsize", 8, "--init", *init, "--seed", a.seed, "--out", tune])
+    out = f"{a.out}/{cell}_apf_final.jsonl"
+    if not (a.reuse and os.path.exists(tune) and os.path.exists(out)):
+        for f_ in (tune, out):
+            if os.path.exists(f_):
+                os.remove(f_)
+        run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("train"), "--tune_move", "--episodes", 96,
+             "--iterations", a.iterations, "--popsize", 8, "--init", *init, "--seed", a.seed, "--out", tune])
+        g = best(tune) if not a.dry else [1, 1, 1, 1, 1]
+        run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("all"), "--episodes", a.eval_episodes,
+             "--final_params", *g, "--seed", a.seed, "--out", out])
     g = best(tune) if not a.dry else [1, 1, 1, 1, 1]
     print(f"[chain] {cell} best gains {g}", flush=True)
-    out = f"{a.out}/{cell}_apf_final.jsonl"
-    if os.path.exists(out):
-        os.remove(out)
-    run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("all"), "--episodes", a.eval_episodes,
-         "--final_params", *g, "--seed", a.seed, "--out", out])
     if cell not in a.rl_cells.split(","):
         continue
     exp = f"rl_{cell}"
@@ -76,7 +82,7 @@ for cell in a.cells.split(","):
          "--obs_k", k, *dist("train"), "--policy_arch", "attention", "--residual_rl",
          "--residual_baseline", "apf", "--residual_kp", g[0], "--residual_repel_gain", g[1], "--apf_damping_gain", g[2],
          "--residual_ff", g[3], "--apf_rscale", g[4], "--residual_scale", a.residual_scale, "--init_log_std", -1.5,
-         "--entropy_coef", 0.001, "--experiment_directory", exp, "--model_name", cell])
+         "--entropy_coef", 0.001, "--experiment_directory", exp, "--model_name", cell], timeout_h=a.rl_timeout_h)
     ckpts = sorted(glob.glob(f"logs/torchrl/{exp}/*/checkpoints/checkpoint_{cell}_iter_{a.rl_iters}.pt"))
     ev = [*base, *dist("all"), "--episodes", a.eval_episodes, "--final_params", *g, "--obs_sense", sense, "--obs_k", k,
           "--residual_scale", a.residual_scale, "--seed", a.seed]
