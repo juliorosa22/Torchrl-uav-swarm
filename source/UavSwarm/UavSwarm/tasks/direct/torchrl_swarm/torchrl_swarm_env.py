@@ -126,6 +126,11 @@ class BaseSwarmEnv(DirectMARLEnv):
         if self.cfg.moving_obs and self.cfg.moving_obs_sense == "lidar":
             self._lidar = make_lidar(**(self.cfg.lidar_cfg or {}))
             self._lidar["auto"] = True
+        self._traj = None
+        self._traj_k = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._traj_end = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._path_fam = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._path_prof = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._helix_phi0 = torch.zeros(self.num_envs, device=self.device)
         self._helix_climb = torch.zeros(self.num_envs, device=self.device)
         self._helix_z0 = torch.zeros(self.num_envs, device=self.device)

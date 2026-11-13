@@ -746,7 +746,9 @@ def _set_moving_sphere(env, env_ids: torch.Tensor, env_origins: torch.Tensor) ->
         env._move_slots = compute_packing_slots(
             env.num_drones, 0.85 * radius, env.cfg.swarm_cfg.min_safe_distance, str(dev)
         )
-    if cur.move_helix_radius > 0:
+    if cur.move_paths:
+        c0 = _set_path_family(env, env_ids, env_origins, radius)
+    elif cur.move_helix_radius > 0:
         c0 = _set_helix(env, env_ids, env_origins, radius)
     else:
         theta = torch.rand(n, device=dev) * 2.0 * torch.pi
@@ -838,10 +840,46 @@ def _set_helix(env, env_ids: torch.Tensor, env_origins: torch.Tensor, sphere_rad
     return c0
 
 
+def _set_path_family(env, env_ids: torch.Tensor, env_origins: torch.Tensor, sphere_radius: float) -> torch.Tensor:
+    from . import paths
+
+    cur = env.cfg.curriculum
+    n, dev, dt = len(env_ids), env.device, env.step_dt
+    n_steps = int(env.cfg.episode_length_s / dt) + 12
+    if env._traj is None or env._traj.shape[1] != n_steps:
+        env._traj = torch.zeros(env.num_envs, n_steps, 3, device=dev)
+    fams = torch.tensor([paths.ALL_FAMILIES.index(f) for f in cur.move_paths], device=dev)
+    profs = torch.tensor([paths.PROFILES.index(p) for p in cur.move_profiles], device=dev)
+    fam = fams[torch.randint(len(fams), (n,), device=dev)]
+    prof = profs[torch.randint(len(profs), (n,), device=dev)]
+    z_lo = max(cur.stage8_target_height_range[0], sphere_radius + 0.3)
+    traj, moving, _ = paths.generate(fam, prof, cur.move_target_speed, dt, n_steps, cur.move_path_len, cur.move_a_max,
+                                     z_lo, max(cur.stage8_target_height_range[1], z_lo + 1.0))
+    traj = traj + torch.cat([env_origins[:, :2], torch.zeros(n, 1, device=dev)], dim=1).unsqueeze(1)
+    env._traj[env_ids] = traj
+    env._traj_k[env_ids] = 0
+    env._traj_end[env_ids] = moving
+    env._path_fam[env_ids] = fam
+    env._path_prof[env_ids] = prof
+    c0 = traj[:, 0]
+    env._desired_pos_w[env_ids] = c0.unsqueeze(1).expand(-1, env.num_drones, -1)
+    env._target_left[env_ids] = moving.float() * dt
+    env._target_vel_w[env_ids] = (traj[:, 1] - traj[:, 0]) / dt
+    return c0
+
+
 def advance_moving_target(env) -> None:
     """Move the sphere centre at constant path speed along chord + A*sin(2*pi*s/len) lateral swing, or the helix."""
     cur = env.cfg.curriculum
     dt = env.step_dt
+    if cur.move_paths:
+        env._traj_k = (env._traj_k + 1).clamp(max=env._traj.shape[1] - 1)
+        new_pos = env._traj[torch.arange(env.num_envs, device=env.device), env._traj_k]
+        env._target_vel_w = (new_pos - env._shared_target_w) / dt
+        env._shared_target_w = new_pos
+        env._target_left = (env._traj_end - env._traj_k).clamp(min=0).float() * dt
+        env._desired_pos_w[:] = env._shared_target_w.unsqueeze(1)
+        return
     if cur.move_helix_radius > 0:
         s_now = env._target_len - env._target_left
         s_new = s_now + torch.minimum(cur.move_target_speed * dt * torch.ones_like(s_now), env._target_left)
@@ -869,6 +907,9 @@ def moving_preview(env, taus) -> torch.Tensor:
     """Sphere-centre positions (E, T, 3) at the given future times, clamped at the end of the path."""
     cur = env.cfg.curriculum
     v = cur.move_target_speed
+    if cur.move_paths:
+        idx = (env._traj_k.unsqueeze(1) + torch.tensor([round(t / env.step_dt) for t in taus], device=env.device)).clamp(max=env._traj.shape[1] - 1)
+        return env._traj.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))
     s_now = env._target_len - env._target_left
     out = []
     for tau in taus:

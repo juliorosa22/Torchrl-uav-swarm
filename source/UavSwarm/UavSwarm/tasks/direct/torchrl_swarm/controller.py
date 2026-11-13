@@ -529,10 +529,12 @@ def compute_waypoint_plan_action(
     target = (1.0 - frac) * pts[:, :, i0] + frac * pts[:, :, i0 + 1]
     cmd_b = (target / (s * dt) / env.cfg.controller.max_lin_vel_cmd).transpose(0, 1)
     if safety:
-        cmd_b = cmd_b + _compute_radius_repulsion_b(env, repel_gain)
+        unit = APF_REF_VEL / env.cfg.controller.max_lin_vel_cmd
+        lidar = getattr(env, "_lidar", None) is not None
+        cmd_b = cmd_b + unit * (_compute_scan_repulsion_b(env, repel_gain) if lidar else _compute_radius_repulsion_b(env, repel_gain))
         kd = env.cfg.swarm_cfg.apf_damping_gain
         if kd > 0.0:
-            cmd_b = cmd_b + _compute_radius_damping_b(env, kd)
+            cmd_b = cmd_b + unit * (_compute_self_damping_b(env, kd) if lidar else _compute_radius_damping_b(env, kd))
     action = torch.zeros(D, E, 4, device=plan_b.device)
     action[:, :, :3] = cmd_b.clamp(-1.0, 1.0)
     return action.transpose(0, 1)

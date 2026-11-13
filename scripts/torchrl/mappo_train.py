@@ -203,6 +203,9 @@ parser.add_argument("--move_speed", type=float, default=1.0)
 parser.add_argument("--move_distance", type=float, default=8.0)
 parser.add_argument("--move_curve_amp", type=float, default=0.0)
 parser.add_argument("--move_planar", action="store_true")
+parser.add_argument("--move_paths", type=str, nargs="+", default=None, help="Path families for per-episode switching: names from paths.py or 'train'/'held'/'all'.")
+parser.add_argument("--move_profiles", type=str, nargs="+", default=["const"])
+parser.add_argument("--move_path_len", type=float, default=10.0)
 parser.add_argument("--move_helix", type=float, nargs=3, default=None, metavar=("RADIUS", "CLIMB", "TURNS"))
 parser.add_argument("--lidar_az", type=int, default=16)
 parser.add_argument("--lidar_elev", type=float, nargs="+", default=[-90.0, -60.0, -30.0, 0.0, 30.0, 60.0, 90.0])
@@ -388,7 +391,13 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         cur.move_curve_amp, cur.move_planar = args_cli.move_curve_amp, args_cli.move_planar
         if args_cli.move_helix:
             cur.move_helix_radius, cur.move_helix_climb, cur.move_helix_turns = args_cli.move_helix
-        env_cfg.episode_length_s = cur.moving_path_length() / args_cli.move_speed + cur.move_settle_s + 0.5
+        if args_cli.move_paths:
+            from UavSwarm.tasks.direct.torchrl_swarm import paths as _paths
+
+            short = {"train": _paths.TRAIN_FAMILIES, "held": _paths.HELD_OUT_FAMILIES, "all": _paths.ALL_FAMILIES}
+            cur.move_paths = tuple(f for name in args_cli.move_paths for f in short.get(name, (name,)))
+            cur.move_profiles, cur.move_path_len = tuple(args_cli.move_profiles), args_cli.move_path_len
+        env_cfg.episode_length_s = cur.moving_episode_s()
         step_dt = env_cfg.sim.dt * env_cfg.decimation
         lidar_cfg = dict(
             n_az=args_cli.lidar_az, elev_deg=tuple(args_cli.lidar_elev), rng_max=args_cli.lidar_range, radius=args_cli.lidar_radius,

@@ -32,6 +32,9 @@ parser.add_argument("--final_params", type=float, nargs=5, default=None, metavar
 parser.add_argument("--tune_speeds", type=float, nargs="+", default=[0.5, 1.0, 1.5])
 parser.add_argument("--move_curve_amp", type=float, default=0.0)
 parser.add_argument("--move_planar", action="store_true")
+parser.add_argument("--move_paths", type=str, nargs="+", default=None, help="Path families (paths.py): line curve slalom arc hairpin spline figure8 coaster helix; 'train' / 'held' / 'all' shortcuts.")
+parser.add_argument("--move_profiles", type=str, nargs="+", default=["const"], help="Speed profiles: const ramp stopgo.")
+parser.add_argument("--move_path_len", type=float, default=10.0)
 parser.add_argument("--move_helix", type=float, nargs=3, default=None, metavar=("RADIUS", "CLIMB", "TURNS"), help="Helical sphere path instead of the chord.")
 parser.add_argument("--move_distance", type=float, default=6.0)
 parser.add_argument("--sense_pos", type=float, nargs=2, default=[0.0, 0.0], metavar=("A", "B"), help="Neighbour position noise sigma = A + B*distance (m).")
@@ -57,6 +60,11 @@ parser.add_argument("--obs_k", type=int, default=8)
 parser.add_argument("--residual_scale", type=float, default=0.5)
 parser.add_argument("--zero_policy", action="store_true", help="With --policy_ckpt-style obs: apply no residual (pure APF through the moving-obs env).")
 parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
+parser.add_argument("--wp_horizon", type=int, default=0, help="Evaluate a waypoint-plan policy (K body-frame increments per drone).")
+parser.add_argument("--wp_dt", type=float, default=0.2)
+parser.add_argument("--wp_lookahead", type=float, default=0.3)
+parser.add_argument("--wp_goal_bias", action="store_true")
+parser.add_argument("--residual_kp", type=float, default=2.0, help="Waypoint mode: goal-bias attraction gain.")
 parser.add_argument("--move_stats", action="store_true", help="Per-episode inter-agent distance statistics on the moving-sphere task.")
 parser.add_argument("--sweep", action="store_true", help="Stress-test the --init gains over sensing/time-limit conditions.")
 AppLauncher.add_app_launcher_args(parser)
@@ -79,8 +87,11 @@ from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 import UavSwarm.tasks  # noqa: F401, E402
 from UavSwarm.tasks.direct.torchrl_swarm.controller import (  # noqa: E402
     apf_sense_update,
+    compute_goal_bias,
     compute_swarm_gravity_baseline_action,
+    compute_waypoint_plan_action,
 )
+from UavSwarm.tasks.direct.torchrl_swarm import paths as _pf  # noqa: E402
 from UavSwarm.tasks.direct.torchrl_swarm.lidar import lidar_update, make_lidar  # noqa: E402
 
 LOG_LO = torch.log(torch.tensor([0.3, 0.2, 0.05]))
@@ -114,6 +125,7 @@ class Evaluator:
             cfg.curriculum.stage8_packing_density = args_cli.packing_density
         self.net = None
         self._obs = None
+        self._wp_prev = None
         if args_cli.policy_ckpt or args_cli.zero_policy:
             from UavSwarm.tasks.direct.torchrl_swarm.moving_task import configure_cfg
 
@@ -138,7 +150,13 @@ class Evaluator:
         sd = torch.load(args_cli.policy_ckpt, map_location="cpu")["policy"]
         sd = {k[len("module.0.module."):]: v for k, v in sd.items() if k.startswith("module.0.module.")}
         d = self.u.cfg.single_observation_space
-        if args_cli.policy_arch == "attention":
+        if args_cli.wp_horizon > 0:
+            from mappo_torchl import MAPPOPolicy as _Flat
+
+            with open(args_cli.config) as f:
+                hs = yaml.safe_load(f)["models"]["policy"]["hidden_sizes"]
+            self.net = _Flat(d + 3 * args_cli.wp_horizon, 3 * args_cli.wp_horizon, hs)
+        elif args_cli.policy_arch == "attention":
             k = self.u.cfg.moving_obs_k
             tdim = 5 if args_cli.obs_sense == "lidar" else 6
             self.net = AttentionMAPPOPolicy(d - k * tdim, k, 4, token_dim=tdim, masked=tdim == 5)
@@ -152,7 +170,28 @@ class Evaluator:
         mean, _ = self.net(obs)
         return torch.tanh(mean)
 
+    def _wp_step(self, kp, repel):
+        a, u = args_cli, self.u
+        K = a.wp_horizon
+        if self._wp_prev is None:
+            self._wp_prev = torch.zeros(u.num_envs, u.num_drones, 3 * K, device=u.device)
+        if self.net is not None:
+            obs = torch.cat([torch.stack([self._obs[n] for n in self.names], dim=1).to(u.device), self._wp_prev], dim=-1)
+            raw = torch.tanh(self.net(obs)[0])
+        else:
+            raw = torch.zeros_like(self._wp_prev)
+        step_max = u.cfg.controller.max_lin_vel_cmd * a.wp_dt
+        incr = raw.reshape(u.num_envs, u.num_drones, K, 3)
+        if a.wp_goal_bias:
+            incr = (incr + compute_goal_bias(u, a.residual_kp).unsqueeze(2)).clamp(-1.0, 1.0)
+        act = compute_waypoint_plan_action(u, (step_max * incr).cumsum(dim=2), a.wp_dt, a.wp_lookahead, True, repel)
+        self._obs, _, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+        self._wp_prev = raw.detach().clone()
+        self._wp_prev[(u._last_terminated | u._last_timed_out)] = 0.0
+
     def _step(self, kp, repel, ff=0.0):
+        if args_cli.wp_horizon > 0:
+            return self._wp_step(kp, repel)
         if self.net is not None or args_cli.zero_policy:
             act = compute_swarm_gravity_baseline_action(self.u, kp, repel, ff_gain=ff)
             if self.net is not None:
@@ -191,7 +230,7 @@ class Evaluator:
         E, D = u.num_envs, u.num_drones
         u.cfg.swarm_cfg.apf_damping_gain = kd
         a = args_cli
-        policy_mode = self.net is not None or a.zero_policy
+        policy_mode = self.net is not None or a.zero_policy or a.wp_horizon > 0
         period = max(1, round(1.0 / (a.sense_hz * self.step_dt))) if a.sense_hz > 0 else 1
         realistic = a.sense_pos != [0.0, 0.0] or a.sense_vel > 0 or a.sense_drop != [0.0, 0.0] or a.sense_range > 0 or period > 1 or a.sense_delay > 0
         if policy_mode:
@@ -209,7 +248,7 @@ class Evaluator:
             ) if realistic else None
         cur = u.cfg.curriculum
         cur.move_target_speed = move_speed
-        u.cfg.episode_length_s = cur.moving_path_length() / move_speed + cur.move_settle_s + 0.5
+        u.cfg.episode_length_s = cur.moving_episode_s() if not cur.move_paths else (cur.move_path_len / move_speed + cur.move_pause_budget_s + cur.move_settle_s + 0.5)
         radius = cur.get_containment_radius(D, u.cfg.swarm_cfg.min_safe_distance)
         sep = args_cli.sep
         names = ["n_mv", "n_st", "pk_mv", "pk_st", "ins_mv", "ins_st", "sum_nn_mv", "sum_nn_st", "near03", "below_sep",
@@ -226,9 +265,11 @@ class Evaluator:
 
         reset_acc()
         self._obs, _ = self.env.reset()
+        self._wp_prev = None
         u.episode_length_buf[:] = 0
         rows, step = [], 0
         while len(rows) < episodes and step < 12000:
+            fam_prev, prof_prev = u._path_fam.clone(), u._path_prof.clone()
             self._step(kp, repel, ff)
             step += 1
             done = u._last_terminated | u._last_timed_out
@@ -270,7 +311,8 @@ class Evaluator:
                     coll = bool(reasons["inter_agent_collision"][e] | reasons["collision"][e] | reasons["out_of_bounds"][e])
                     packed_all = (g("pk_mv") + g("pk_st")) / n_all
                     rows.append(dict(
-                        tag=tag, v=move_speed, ff=ff, n_agents=D, sep=sep, coll=coll, timeout=bool(u._last_timed_out[e]),
+                        tag=tag, v=move_speed, ff=ff, fam=(_pf.ALL_FAMILIES[int(fam_prev[e])] if u.cfg.curriculum.move_paths else "legacy"),
+                        prof=(_pf.PROFILES[int(prof_prev[e])] if u.cfg.curriculum.move_paths else "const"), n_agents=D, sep=sep, coll=coll, timeout=bool(u._last_timed_out[e]),
                         steps=n_all, packed_all=packed_all, packed_mv=g("pk_mv") / n_mv, packed_st=g("pk_st") / n_st,
                         inside_mv=g("ins_mv") / n_mv, inside_st=g("ins_st") / n_st,
                         min_nn=g("min_nn"), mean_nn_mv=g("sum_nn_mv") / n_mv, mean_nn_st=g("sum_nn_st") / n_st,
@@ -450,6 +492,13 @@ def main():
         ev.u.cfg.curriculum.move_target_distance = args_cli.move_distance
         ev.u.cfg.curriculum.move_planar = args_cli.move_planar
         ev.u.cfg.curriculum.move_curve_amp = args_cli.move_curve_amp
+        if args_cli.move_paths:
+            from UavSwarm.tasks.direct.torchrl_swarm import paths as _paths
+
+            short = {"train": _paths.TRAIN_FAMILIES, "held": _paths.HELD_OUT_FAMILIES, "all": _paths.ALL_FAMILIES}
+            fams = tuple(f for name in args_cli.move_paths for f in short.get(name, (name,)))
+            c_ = ev.u.cfg.curriculum
+            c_.move_paths, c_.move_profiles, c_.move_path_len = fams, tuple(args_cli.move_profiles), args_cli.move_path_len
         if args_cli.move_helix:
             cur_ = ev.u.cfg.curriculum
             cur_.move_helix_radius, cur_.move_helix_climb, cur_.move_helix_turns = args_cli.move_helix
