@@ -329,6 +329,10 @@ def _compute_attraction_b(env, kp: float, offset_b: torch.Tensor | None = None) 
 
         desired = moving_preview(env, [pv[0]])[:, 0].unsqueeze(0).expand(env.num_drones, -1, -1)
     error_w = desired - all_positions
+    dead = getattr(env, "_apf_dead", 0.0)
+    if dead > 0.0:
+        r0 = dead * env.cfg.curriculum.get_containment_radius(env.num_drones, env.cfg.swarm_cfg.min_safe_distance)
+        error_w = error_w * (1.0 - r0 / error_w.norm(dim=-1, keepdim=True).clamp(min=1e-6)).clamp(min=0.0)
     error_b = quat_apply_inverse(
         all_quats.reshape(-1, 4), error_w.reshape(-1, 3)
     ).reshape(env.num_drones, env.num_envs, 3)

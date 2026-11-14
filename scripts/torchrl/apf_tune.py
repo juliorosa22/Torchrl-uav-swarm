@@ -66,6 +66,9 @@ parser.add_argument("--zero_policy", action="store_true", help="With --policy_ck
 parser.add_argument("--kv", type=float, default=None, help="Overrides controller.Kv (outer-loop velocity P gain).")
 parser.add_argument("--preview", action="store_true", help="Tune a preview APF: attraction toward the sphere centre tau_p ahead and feed-forward from its mean velocity over tau_f (adds 2 ES parameters).")
 parser.add_argument("--preview_params", type=float, nargs=2, default=None, metavar=("TAU_P", "TAU_F"), help="With --final_params: evaluate the preview APF with these look-ahead times (s).")
+parser.add_argument("--deadband", action="store_true", help="Also tune a deadband: no attraction while a drone is within this fraction of the containment radius from the (preview) centre.")
+parser.add_argument("--dead", type=float, default=0.0, help="With --final_params: deadband fraction of the containment radius.")
+parser.add_argument("--warm", type=float, nargs="+", default=None, help="Start the ES mean at kp repel kd ff rscale [tau_p tau_f].")
 parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
 parser.add_argument("--gain_mod", type=float, default=0.0, help="Evaluate a gain-modulation policy (5 log-multipliers in [-1,1]*this on the final APF gains).")
 parser.add_argument("--wp_horizon", type=int, default=0, help="Evaluate a waypoint-plan policy (K body-frame increments per drone).")
@@ -531,20 +534,21 @@ def main():
             cur_ = ev.u.cfg.curriculum
             cur_.move_helix_radius, cur_.move_helix_climb, cur_.move_helix_turns = args_cli.move_helix
 
-        def run_set(kp, repel, kd, ff, rscale, speeds, episodes, tag, preview=None):
+        def run_set(kp, repel, kd, ff, rscale, speeds, episodes, tag, preview=None, dead=0.0):
             ev.u._apf_radius_scale = rscale
             ev.u._apf_preview = preview
+            ev.u._apf_dead = dead
             out = []
             for v in speeds:
                 out += ev.evaluate_stats(kp, repel, kd, v, ff, episodes, f"{tag},v={v}")
             for r in out:
-                r.update(kp=kp, repel=repel, kd=kd, ff_gain=ff, rscale=rscale, preview=preview)
+                r.update(kp=kp, repel=repel, kd=kd, ff_gain=ff, rscale=rscale, preview=preview, dead=dead)
             return out
 
         if args_cli.final_params:
             kp, repel, kd, ff, rscale = args_cli.final_params
             rows = run_set(kp, repel, kd, ff, rscale, args_cli.move_speeds, args_cli.episodes, "tuned",
-                           tuple(args_cli.preview_params) if args_cli.preview_params else None)
+                           tuple(args_cli.preview_params) if args_cli.preview_params else None, args_cli.dead)
             with open(args_cli.out, "a") as f:
                 for r in rows:
                     f.write(json.dumps(r) + "\n")
@@ -560,21 +564,31 @@ def main():
             lo, hi = torch.cat([lo, torch.tensor([0.0, 0.05])]), torch.cat([hi, torch.tensor([1.5, 1.5])])
             mean, sigma = torch.cat([mean, torch.tensor([0.4, 0.4])]), torch.cat([sigma, torch.tensor([0.25, 0.25])])
             floor = torch.cat([floor, torch.tensor([0.03, 0.03])])
+        if args_cli.deadband:
+            lo, hi = torch.cat([lo, torch.tensor([0.0])]), torch.cat([hi, torch.tensor([0.9])])
+            mean, sigma = torch.cat([mean, torch.tensor([0.3])]), torch.cat([sigma, torch.tensor([0.2])])
+            floor = torch.cat([floor, torch.tensor([0.03])])
+        if args_cli.warm:
+            w = args_cli.warm
+            mean[:5] = torch.tensor([math.log(w[0]), math.log(w[1]), math.log(w[2]), w[3], math.log(w[4])])
+            if args_cli.preview and len(w) >= 7:
+                mean[5:7] = torch.tensor(w[5:7])
         npar = len(mean)
+        n_pv = 2 if args_cli.preview else 0
 
         def decode(p):
             base = (float(p[0].exp()), float(p[1].exp()), float(p[2].exp()), float(p[3]), float(p[4].exp()))
-            return base + ((float(p[5]), float(p[6])) if npar == 7 else ())
+            return base + tuple(float(x) for x in p[5 : 5 + n_pv]), (float(p[5 + n_pv]) if args_cli.deadband else 0.0)
 
         def score(p, tag):
-            kp, repel, kd, ff, rscale, *pv = decode(p)
-            rows = run_set(kp, repel, kd, ff, rscale, args_cli.tune_speeds, args_cli.episodes, tag, tuple(pv) if pv else None)
+            (kp, repel, kd, ff, rscale, *pv), dead = decode(p)
+            rows = run_set(kp, repel, kd, ff, rscale, args_cli.tune_speeds, args_cli.episodes, tag, tuple(pv) if pv else None, dead)
             per_v = {}
             for r in rows:
                 per_v.setdefault(r["v"], []).append(r)
             fit = sum(sum(x["packed_all"] - 2.0 * x["coll"] for x in g) / len(g) for g in per_v.values()) / len(per_v)
             summ = dict(
-                tag=tag, kp=kp, repel=repel, kd=kd, ff=ff, rscale=rscale, tp=(pv[0] if pv else None), tf=(pv[1] if pv else None), fit=fit,
+                tag=tag, kp=kp, repel=repel, kd=kd, ff=ff, rscale=rscale, tp=(pv[0] if pv else None), tf=(pv[1] if pv else None), dead=dead, fit=fit,
                 packed={v: sum(x["packed_all"] for x in g) / len(g) for v, g in per_v.items()},
                 coll=sum(x["coll"] for x in rows) / len(rows), jit_mv=sum(x["jit_mv"] for x in rows) / len(rows),
                 inside_mv=sum(x["inside_mv"] for x in rows) / len(rows), min_nn=sum(x["min_nn"] for x in rows) / len(rows),
@@ -595,7 +609,7 @@ def main():
             sigma = torch.max(0.5 * sigma + 0.5 * elite.std(0), floor)
             if fits.max() > best_fit:
                 best_fit, best = float(fits.max()), pop[order[0]].clone()
-            print(f"[tune] iter {it} best_fit={best_fit:.3f} best={[round(x, 3) for x in decode(best)]}", flush=True)
+            print(f"[tune] iter {it} best_fit={best_fit:.3f} best={decode(best)}", flush=True)
         return
 
     if args_cli.move_stats:
