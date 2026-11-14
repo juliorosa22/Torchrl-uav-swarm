@@ -251,7 +251,7 @@ def load_config(path: str) -> dict:
 
 def make_policy(
     obs_dim: int, action_dim: int, config: dict, device: torch.device,
-    policy_arch: str = "flat", num_neighbors: int | None = None, token_dim: int = 6,
+    policy_arch: str = "flat", num_neighbors: int | None = None, token_dim: int = 6, extra_dim: int = 0,
 ) -> ProbabilisticActor:
     """Create shared policy: TensorDictModule → ProbabilisticActor.
 
@@ -262,8 +262,9 @@ def make_policy(
     if policy_arch == "attention":
         if num_neighbors is None:
             raise ValueError("--policy_arch attention requires num_neighbors.")
-        own_obs_dim = obs_dim - num_neighbors * token_dim
-        net = AttentionMAPPOPolicy(own_obs_dim, num_neighbors, action_dim, token_dim=token_dim, masked=token_dim == 5).to(device)
+        own_obs_dim = obs_dim - num_neighbors * token_dim - extra_dim
+        net = AttentionMAPPOPolicy(own_obs_dim, num_neighbors, action_dim, token_dim=token_dim, masked=token_dim == 5,
+                                   extra_dim=extra_dim).to(device)
     else:
         net = MAPPOPolicy(obs_dim, action_dim, config["models"]["policy"]["hidden_sizes"]).to(device)
     if args_cli.init_log_std is not None:
@@ -507,6 +508,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         policy_arch=args_cli.policy_arch,
         num_neighbors=env_cfg.moving_obs_k if args_cli.moving else env_cfg.swarm_cfg.num_observed_neighbors,
         token_dim=(5 if args_cli.obs_sense == "lidar" else 6) if args_cli.moving else 6,
+        extra_dim=3 * args_cli.wp_horizon,
     )
     critic = make_critic(
         state_dim, config, device,

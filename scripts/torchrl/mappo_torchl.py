@@ -94,11 +94,13 @@ class AttentionMAPPOPolicy(nn.Module):
     def __init__(
         self, own_obs_dim: int, num_neighbors: int, action_dim: int,
         hidden_dim: int = 64, num_heads: int = 4, mlp_hidden=(128, 64), token_dim: int = 6, masked: bool = False,
+        extra_dim: int = 0,
     ):
         super().__init__()
         self.own_obs_dim = own_obs_dim
         self.num_neighbors = num_neighbors
-        self.self_encoder = nn.Sequential(nn.Linear(own_obs_dim, hidden_dim), nn.ReLU())
+        self.extra_dim = extra_dim
+        self.self_encoder = nn.Sequential(nn.Linear(own_obs_dim + extra_dim, hidden_dim), nn.ReLU())
         self.token_dim = token_dim
         self.masked = masked
         self.neighbor_encoder = nn.Sequential(nn.Linear(token_dim, hidden_dim), nn.ReLU())
@@ -120,7 +122,10 @@ class AttentionMAPPOPolicy(nn.Module):
         flat_obs = obs.reshape(-1, obs.shape[-1])
 
         own = flat_obs[:, :self.own_obs_dim]
-        neighbors = flat_obs[:, self.own_obs_dim:].reshape(-1, self.num_neighbors, self.token_dim)
+        tok_end = self.own_obs_dim + self.num_neighbors * self.token_dim
+        if self.extra_dim:
+            own = torch.cat([own, flat_obs[:, tok_end:]], dim=-1)
+        neighbors = flat_obs[:, self.own_obs_dim:tok_end].reshape(-1, self.num_neighbors, self.token_dim)
         pad = None
         if self.masked:
             pad = neighbors[..., -1] == 0

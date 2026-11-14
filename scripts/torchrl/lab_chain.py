@@ -23,6 +23,7 @@ p.add_argument("--rl_envs", type=int, default=32)
 p.add_argument("--rl_fpb", type=int, default=8192)
 p.add_argument("--rl_batch", type=int, default=4096)
 p.add_argument("--rl_timeout_h", type=float, default=5.0, help="kill a hung training stage after this many hours")
+p.add_argument("--preview", action="store_true", help="tune/evaluate the preview APF (look-ahead attraction and feed-forward); skips RL")
 p.add_argument("--reuse", action="store_true", help="skip tune and APF final eval for cells whose result files already exist")
 p.add_argument("--residual_scale", type=float, default=0.2)
 p.add_argument("--seed", type=int, default=0)
@@ -51,7 +52,7 @@ def run(cmd, timeout_h=None):
 def best(path):
     rows = [json.loads(line) for line in open(path)]
     b = max((r for r in rows if "fit" in r), key=lambda r: r["fit"])
-    return [b["kp"], b["repel"], b["kd"], b["ff"], b["rscale"]]
+    return [b["kp"], b["repel"], b["kd"], b["ff"], b["rscale"]] + ([b["tp"], b["tf"]] if b.get("tp") is not None else [])
 
 
 for cell in a.cells.split(","):
@@ -59,18 +60,22 @@ for cell in a.cells.split(","):
     lid = ["--lidar"] if sense == "lidar" else []
     base = ["--headless", "--config", a.config, "--num_agents", n, "--max_vel", a.max_vel, "--num_envs", 64]
     init = ["0.98", "1.9", "3.4"] if sense == "lidar" else ["2.4", "1.3", "1.5"]
-    tune = f"{a.out}/{cell}_tune.jsonl"
-    out = f"{a.out}/{cell}_apf_final.jsonl"
+    sfx = "_pv" if a.preview else ""
+    tune = f"{a.out}/{cell}{sfx}_tune.jsonl"
+    out = f"{a.out}/{cell}{sfx}_apf_final.jsonl"
     if not (a.reuse and os.path.exists(tune) and os.path.exists(out)):
         for f_ in (tune, out):
             if os.path.exists(f_):
                 os.remove(f_)
-        run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("train"), "--tune_move", "--episodes", 96,
+        run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("train"), "--tune_move", "--episodes", 96, *(["--preview"] if a.preview else []),
              "--iterations", a.iterations, "--popsize", 8, "--init", *init, "--seed", a.seed, "--out", tune])
-        g = best(tune) if not a.dry else [1, 1, 1, 1, 1]
+        g = best(tune) if not a.dry else [1, 1, 1, 1, 1] + ([0.4, 0.4] if a.preview else [])
         run([PY, "-u", "scripts/torchrl/apf_tune.py", *base, *lid, *dist("all"), "--episodes", a.eval_episodes,
-             "--final_params", *g, "--seed", a.seed, "--out", out])
-    g = best(tune) if not a.dry else [1, 1, 1, 1, 1]
+             "--final_params", *g[:5], *(["--preview_params", *g[5:]] if a.preview else []), "--seed", a.seed, "--out", out])
+    g = best(tune) if not a.dry else [1, 1, 1, 1, 1] + ([0.4, 0.4] if a.preview else [])
+    if a.preview:
+        print(f"[chain] {cell} preview best {g}", flush=True)
+        continue
     print(f"[chain] {cell} best gains {g}", flush=True)
     if cell not in a.rl_cells.split(","):
         continue

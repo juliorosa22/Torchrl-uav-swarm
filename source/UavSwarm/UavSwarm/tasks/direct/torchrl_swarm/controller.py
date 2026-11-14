@@ -323,6 +323,11 @@ def _compute_attraction_b(env, kp: float, offset_b: torch.Tensor | None = None) 
     all_positions = torch.stack([rob.data.root_pos_w for rob in env._robots], dim=0)  # (D, E, 3)
     all_quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)      # (D, E, 4)
     desired = env._desired_pos_w.transpose(0, 1)  # (D, E, 3)
+    pv = getattr(env, "_apf_preview", None)
+    if pv is not None:
+        from .curriculum import moving_preview
+
+        desired = moving_preview(env, [pv[0]])[:, 0].unsqueeze(0).expand(env.num_drones, -1, -1)
     error_w = desired - all_positions
     error_b = quat_apply_inverse(
         all_quats.reshape(-1, 4), error_w.reshape(-1, 3)
@@ -451,7 +456,15 @@ def _compute_self_damping_b(env, kd: float) -> torch.Tensor:
 
 def _target_vel_b(env) -> torch.Tensor:
     quats = torch.stack([rob.data.root_quat_w for rob in env._robots], dim=0)
-    vel = env._target_vel_w.unsqueeze(0).expand(env.num_drones, -1, -1)
+    pv = getattr(env, "_apf_preview", None)
+    if pv is not None:
+        from .curriculum import moving_preview
+
+        tau = max(pv[1], env.step_dt)
+        target_vel = (moving_preview(env, [tau])[:, 0] - env._shared_target_w) / tau
+    else:
+        target_vel = env._target_vel_w
+    vel = target_vel.unsqueeze(0).expand(env.num_drones, -1, -1)
     return quat_apply_inverse(quats.reshape(-1, 4), vel.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
 

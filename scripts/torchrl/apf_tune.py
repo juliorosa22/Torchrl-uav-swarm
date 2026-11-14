@@ -64,6 +64,8 @@ parser.add_argument("--obs_k", type=int, default=8)
 parser.add_argument("--residual_scale", type=float, default=0.5)
 parser.add_argument("--zero_policy", action="store_true", help="With --policy_ckpt-style obs: apply no residual (pure APF through the moving-obs env).")
 parser.add_argument("--kv", type=float, default=None, help="Overrides controller.Kv (outer-loop velocity P gain).")
+parser.add_argument("--preview", action="store_true", help="Tune a preview APF: attraction toward the sphere centre tau_p ahead and feed-forward from its mean velocity over tau_f (adds 2 ES parameters).")
+parser.add_argument("--preview_params", type=float, nargs=2, default=None, metavar=("TAU_P", "TAU_F"), help="With --final_params: evaluate the preview APF with these look-ahead times (s).")
 parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
 parser.add_argument("--wp_horizon", type=int, default=0, help="Evaluate a waypoint-plan policy (K body-frame increments per drone).")
 parser.add_argument("--wp_dt", type=float, default=0.2)
@@ -157,12 +159,17 @@ class Evaluator:
         sd = torch.load(args_cli.policy_ckpt, map_location="cpu")["policy"]
         sd = {k[len("module.0.module."):]: v for k, v in sd.items() if k.startswith("module.0.module.")}
         d = self.u.cfg.single_observation_space
-        if args_cli.wp_horizon > 0:
+        if args_cli.wp_horizon > 0 and args_cli.policy_arch == "flat":
             from mappo_torchl import MAPPOPolicy as _Flat
 
             with open(args_cli.config) as f:
                 hs = yaml.safe_load(f)["models"]["policy"]["hidden_sizes"]
             self.net = _Flat(d + 3 * args_cli.wp_horizon, 3 * args_cli.wp_horizon, hs)
+        elif args_cli.wp_horizon > 0:
+            k = self.u.cfg.moving_obs_k
+            tdim = 5 if args_cli.obs_sense == "lidar" else 6
+            self.net = AttentionMAPPOPolicy(d - k * tdim, k, 3 * args_cli.wp_horizon, token_dim=tdim, masked=tdim == 5,
+                                            extra_dim=3 * args_cli.wp_horizon)
         elif args_cli.policy_arch == "attention":
             k = self.u.cfg.moving_obs_k
             tdim = 5 if args_cli.obs_sense == "lidar" else 6
@@ -516,18 +523,20 @@ def main():
             cur_ = ev.u.cfg.curriculum
             cur_.move_helix_radius, cur_.move_helix_climb, cur_.move_helix_turns = args_cli.move_helix
 
-        def run_set(kp, repel, kd, ff, rscale, speeds, episodes, tag):
+        def run_set(kp, repel, kd, ff, rscale, speeds, episodes, tag, preview=None):
             ev.u._apf_radius_scale = rscale
+            ev.u._apf_preview = preview
             out = []
             for v in speeds:
                 out += ev.evaluate_stats(kp, repel, kd, v, ff, episodes, f"{tag},v={v}")
             for r in out:
-                r.update(kp=kp, repel=repel, kd=kd, ff_gain=ff, rscale=rscale)
+                r.update(kp=kp, repel=repel, kd=kd, ff_gain=ff, rscale=rscale, preview=preview)
             return out
 
         if args_cli.final_params:
             kp, repel, kd, ff, rscale = args_cli.final_params
-            rows = run_set(kp, repel, kd, ff, rscale, args_cli.move_speeds, args_cli.episodes, "tuned")
+            rows = run_set(kp, repel, kd, ff, rscale, args_cli.move_speeds, args_cli.episodes, "tuned",
+                           tuple(args_cli.preview_params) if args_cli.preview_params else None)
             with open(args_cli.out, "a") as f:
                 for r in rows:
                     f.write(json.dumps(r) + "\n")
@@ -538,19 +547,26 @@ def main():
         hi = torch.tensor([math.log(8.0), math.log(16.0), math.log(8.0), 1.5, math.log(2.0)])
         mean = torch.tensor([math.log(args_cli.init[0]), math.log(args_cli.init[1]), math.log(args_cli.init[2]), 1.0, 0.0])
         sigma = torch.tensor([0.4, 0.4, 0.5, 0.25, 0.2])
+        floor = torch.tensor([0.05, 0.05, 0.05, 0.05, 0.03])
+        if args_cli.preview:
+            lo, hi = torch.cat([lo, torch.tensor([0.0, 0.05])]), torch.cat([hi, torch.tensor([1.5, 1.5])])
+            mean, sigma = torch.cat([mean, torch.tensor([0.4, 0.4])]), torch.cat([sigma, torch.tensor([0.25, 0.25])])
+            floor = torch.cat([floor, torch.tensor([0.03, 0.03])])
+        npar = len(mean)
 
         def decode(p):
-            return float(p[0].exp()), float(p[1].exp()), float(p[2].exp()), float(p[3]), float(p[4].exp())
+            base = (float(p[0].exp()), float(p[1].exp()), float(p[2].exp()), float(p[3]), float(p[4].exp()))
+            return base + ((float(p[5]), float(p[6])) if npar == 7 else ())
 
         def score(p, tag):
-            kp, repel, kd, ff, rscale = decode(p)
-            rows = run_set(kp, repel, kd, ff, rscale, args_cli.tune_speeds, args_cli.episodes, tag)
+            kp, repel, kd, ff, rscale, *pv = decode(p)
+            rows = run_set(kp, repel, kd, ff, rscale, args_cli.tune_speeds, args_cli.episodes, tag, tuple(pv) if pv else None)
             per_v = {}
             for r in rows:
                 per_v.setdefault(r["v"], []).append(r)
             fit = sum(sum(x["packed_all"] - 2.0 * x["coll"] for x in g) / len(g) for g in per_v.values()) / len(per_v)
             summ = dict(
-                tag=tag, kp=kp, repel=repel, kd=kd, ff=ff, rscale=rscale, fit=fit,
+                tag=tag, kp=kp, repel=repel, kd=kd, ff=ff, rscale=rscale, tp=(pv[0] if pv else None), tf=(pv[1] if pv else None), fit=fit,
                 packed={v: sum(x["packed_all"] for x in g) / len(g) for v, g in per_v.items()},
                 coll=sum(x["coll"] for x in rows) / len(rows), jit_mv=sum(x["jit_mv"] for x in rows) / len(rows),
                 inside_mv=sum(x["inside_mv"] for x in rows) / len(rows), min_nn=sum(x["min_nn"] for x in rows) / len(rows),
@@ -563,12 +579,12 @@ def main():
         score(mean, "init")
         best_fit, best = -1e9, mean.clone()
         for it in range(args_cli.iterations):
-            pop = torch.max(torch.min(mean + sigma * torch.randn(args_cli.popsize, 5), hi), lo)
+            pop = torch.max(torch.min(mean + sigma * torch.randn(args_cli.popsize, npar), hi), lo)
             fits = torch.tensor([score(p, f"it{it}") for p in pop])
             order = fits.argsort(descending=True)
             elite = pop[order[: max(args_cli.popsize // 3, 2)]]
             mean = elite.mean(0)
-            sigma = torch.max(0.5 * sigma + 0.5 * elite.std(0), torch.tensor([0.05, 0.05, 0.05, 0.05, 0.03]))
+            sigma = torch.max(0.5 * sigma + 0.5 * elite.std(0), floor)
             if fits.max() > best_fit:
                 best_fit, best = float(fits.max()), pop[order[0]].clone()
             print(f"[tune] iter {it} best_fit={best_fit:.3f} best={[round(x, 3) for x in decode(best)]}", flush=True)
