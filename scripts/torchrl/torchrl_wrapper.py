@@ -19,6 +19,7 @@ import gymnasium as gym
 
 from isaaclab.envs import DirectMARLEnv
 from UavSwarm.tasks.direct.torchrl_swarm.controller import (
+    compute_apf_gain_mod_action,
     compute_baseline_action,
     compute_goal_bias,
     compute_swarm_gravity_baseline_action,
@@ -70,6 +71,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         wp_safety: bool = True,
         wp_goal_bias: bool = False,
         wp_z_bias: bool = False,
+        gain_mod: float = 0.0,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
@@ -103,6 +105,9 @@ class IsaacLabTorchRLWrapper(EnvBase):
         self.wp_safety = wp_safety
         self.wp_goal_bias = wp_goal_bias
         self.wp_z_bias = wp_z_bias
+        self.gain_mod = gain_mod
+        if gain_mod > 0.0 and (wp_horizon > 0 or planner_range > 0.0 or not residual_rl):
+            raise ValueError("gain_mod needs residual_rl and excludes wp_horizon/planner_range")
         self._wp_prev = None
 
         if not isinstance(self.unwrapped_env, DirectMARLEnv):
@@ -155,6 +160,9 @@ class IsaacLabTorchRLWrapper(EnvBase):
             self.state_dim += self.num_agents * 3 * self.wp_horizon
             self.action_dim = 3 * self.wp_horizon
             self._wp_prev = torch.zeros(num_envs, self.num_agents, self.action_dim, device=self.device)
+
+        if self.gain_mod > 0.0:
+            self.action_dim = 5
 
         self._make_specs()
         self._print_info(device, num_envs)
@@ -350,6 +358,11 @@ class IsaacLabTorchRLWrapper(EnvBase):
                 self.unwrapped_env, plan_b, self.wp_dt, self.wp_lookahead, self.wp_safety, self.residual_repel_gain
             )
             self._wp_prev = raw_plan.detach().clone()
+        elif self.gain_mod > 0.0:
+            u = self.unwrapped_env
+            base = (self.residual_kp, self.residual_repel_gain, u.cfg.swarm_cfg.apf_damping_gain, self.residual_ff,
+                    getattr(u, "_apf_radius_scale", 1.0))
+            env_actions = compute_apf_gain_mod_action(u, torch.exp(self.gain_mod * actions_stacked.clamp(-1.0, 1.0)), base)
         elif self.residual_rl and self.planner_range > 0.0:
             raw = actions_stacked[..., :3].clamp(-1.0, 1.0)
             if self._planner_wp is None:

@@ -435,10 +435,12 @@ def _compute_radius_damping_b(env, kd: float) -> torch.Tensor:
     return quat_apply_inverse(quats.reshape(-1, 4), damp_w.reshape(-1, 3)).reshape(env.num_drones, env.num_envs, 3)
 
 
-def _compute_scan_repulsion_b(env, repel_gain: float) -> torch.Tensor:
-    """Body-frame repulsion from lidar returns only: each hit at range r pushes along the beam, weight (R - r)/R."""
+def _compute_scan_repulsion_b(env, repel_gain, radius_scale=None) -> torch.Tensor:
+    """Body-frame repulsion from lidar returns only: each hit at range r pushes along the beam, weight (R - r)/R.
+    repel_gain and radius_scale may be per-agent tensors of shape (D, E, 1)."""
     sc = env.cfg.swarm_cfg
-    radius = min(sc.min_safe_distance, sc.max_neighbor_distance) * getattr(env, "_apf_radius_scale", 1.0)
+    scale = getattr(env, "_apf_radius_scale", 1.0) if radius_scale is None else radius_scale
+    radius = min(sc.min_safe_distance, sc.max_neighbor_distance) * scale
     rng, dirs = env._lidar["scan"]
     w = ((radius - rng) / radius).clamp(min=0.0).nan_to_num(nan=0.0)
     repel_w = -(dirs * w.unsqueeze(-1)).sum(dim=2) * repel_gain
@@ -519,6 +521,21 @@ def compute_swarm_gravity_baseline_action(
     baseline = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
     baseline[:, :, :3] = cmd_b
     return baseline.transpose(0, 1)  # (E, D, 4)
+
+
+def compute_apf_gain_mod_action(env, mult: torch.Tensor, base: tuple) -> torch.Tensor:
+    """Scan-APF with per-agent gains base * mult. mult (E, D, 5) scales (kp, repel, kd, ff, rscale); lidar sensing only."""
+    from .sensing import ensure_cache_populated
+
+    ensure_cache_populated(env)
+    kp, repel, kd, ff, rs = (b * mult.transpose(0, 1)[..., i : i + 1] for i, b in enumerate(base))
+    max_v = env.cfg.controller.max_lin_vel_cmd
+    unit = APF_REF_VEL / max_v
+    cmd_b = _compute_attraction_b(env, kp) + unit * _compute_scan_repulsion_b(env, repel, rs)
+    cmd_b = cmd_b + ff * _target_vel_b(env) / max_v + unit * _compute_self_damping_b(env, kd)
+    action = torch.zeros(env.num_drones, env.num_envs, 4, device=env.device)
+    action[:, :, :3] = cmd_b.clamp(-1.0, 1.0)
+    return action.transpose(0, 1)
 
 
 def compute_goal_bias(env, kp: float) -> torch.Tensor:

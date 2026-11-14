@@ -140,6 +140,8 @@ parser.add_argument(
 parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline attraction gain.")
 parser.add_argument("--residual_scale", type=float, default=0.3, help="residual_rl: policy correction weight.")
 parser.add_argument("--planner_range", type=float, default=0.0, help="Waypoint-planner mode (needs --residual_rl --residual_baseline apf): policy output (first 3 dims) is a body-frame offset in [-1,1]*planner_range metres added to the target error before APF attraction. 0 = off.")
+parser.add_argument("--gain_mod", type=float, default=0.0, help="Gain-modulation mode (needs --residual_rl --residual_baseline apf, lidar): policy outputs 5 log-multipliers in [-1,1]*this on the APF (kp, repel, kd, ff, rscale). 0 = off.")
+parser.add_argument("--apf_preview", type=float, nargs=2, default=None, metavar=("TAU_P", "TAU_F"), help="Preview APF look-ahead times (s) for the baseline controller.")
 parser.add_argument("--wp_horizon", type=int, default=0, help="Waypoint-plan mode: policy outputs K body-frame position increments per drone (3K dims), tracked by pure pursuit; no APF attraction. 0 = off.")
 parser.add_argument("--wp_dt", type=float, default=0.2, help="wp mode: time spacing between plan waypoints (s).")
 parser.add_argument("--wp_lookahead", type=float, default=0.3, help="wp mode: lookahead time on the plan used for the velocity command (s).")
@@ -489,10 +491,12 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         residual_repel_gain=args_cli.residual_repel_gain, residual_ff=args_cli.residual_ff,
         planner_range=args_cli.planner_range, planner_alpha=args_cli.planner_alpha,
         wp_horizon=args_cli.wp_horizon, wp_dt=args_cli.wp_dt, wp_lookahead=args_cli.wp_lookahead,
-        wp_safety=not args_cli.no_wp_safety, wp_goal_bias=args_cli.wp_goal_bias, wp_z_bias=args_cli.wp_z_bias,
+        wp_safety=not args_cli.no_wp_safety, wp_goal_bias=args_cli.wp_goal_bias, wp_z_bias=args_cli.wp_z_bias, gain_mod=args_cli.gain_mod,
     )
 
     base_env.unwrapped._apf_radius_scale = args_cli.apf_rscale
+    if args_cli.apf_preview:
+        base_env.unwrapped._apf_preview = tuple(args_cli.apf_preview)
 
     # --- dimensions ---
     obs_dim = env.obs_dim
@@ -555,7 +559,10 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         print(f"[INFO] Loading checkpoint: {args_cli.checkpoint}")
         ckpt = torch.load(args_cli.checkpoint, map_location=device)
         policy.load_state_dict(ckpt["policy"])
-        critic.load_state_dict(ckpt["critic"])
+        try:
+            critic.load_state_dict(ckpt["critic"])
+        except RuntimeError:
+            print("[WARN] critic shape differs from the checkpoint (different N); critic re-initialised")
         if normalize_obs and "obs_rms" in ckpt:
             assert env.obs_rms is not None
             env.obs_rms.load_state_dict(ckpt["obs_rms"])
