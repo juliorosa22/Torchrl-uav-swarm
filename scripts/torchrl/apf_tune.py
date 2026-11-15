@@ -72,6 +72,7 @@ parser.add_argument("--warm", type=float, nargs="+", default=None, help="Start t
 parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
 parser.add_argument("--pure_policy", action="store_true", help="With --policy_ckpt: the policy output is the velocity command (no APF).")
 parser.add_argument("--yaw_hold", action="store_true", help="Pure policy has 3 outputs; yaw rate is commanded 0.")
+parser.add_argument("--gain_dims", type=int, default=5, choices=[2, 5])
 parser.add_argument("--gain_mod", type=float, default=0.0, help="Evaluate a gain-modulation policy (5 log-multipliers in [-1,1]*this on the final APF gains).")
 parser.add_argument("--wp_horizon", type=int, default=0, help="Evaluate a waypoint-plan policy (K body-frame increments per drone).")
 parser.add_argument("--wp_dt", type=float, default=0.2)
@@ -101,6 +102,7 @@ import UavSwarm.tasks  # noqa: F401, E402
 from UavSwarm.tasks.direct.torchrl_swarm.controller import (  # noqa: E402
     apf_sense_update,
     compute_apf_gain_mod_action,
+    expand_gain_dims,
     compute_goal_bias,
     compute_swarm_gravity_baseline_action,
     compute_waypoint_plan_action,
@@ -180,7 +182,7 @@ class Evaluator:
         elif args_cli.policy_arch == "attention":
             k = self.u.cfg.moving_obs_k
             tdim = 5 if args_cli.obs_sense == "lidar" else 6
-            self.net = AttentionMAPPOPolicy(d - k * tdim, k, 5 if args_cli.gain_mod > 0 else (3 if args_cli.yaw_hold else 4), token_dim=tdim, masked=tdim == 5)
+            self.net = AttentionMAPPOPolicy(d - k * tdim, k, args_cli.gain_dims if args_cli.gain_mod > 0 else (3 if args_cli.yaw_hold else 4), token_dim=tdim, masked=tdim == 5)
         else:
             self.net = MAPPOPolicy(d, 3 if args_cli.yaw_hold else 4, (256, 256, 128))
         self.net.load_state_dict(sd)
@@ -189,7 +191,7 @@ class Evaluator:
     def _policy_action(self):
         obs = torch.stack([self._obs[n] for n in self.names], dim=1).to(self.u.device)
         mean, _ = self.net(obs)
-        return mean.clamp(-1.0, 1.0) if args_cli.gain_mod > 0 else torch.tanh(mean)
+        return torch.tanh(mean)
 
     def _wp_step(self, kp, repel):
         a, u = args_cli, self.u
@@ -217,7 +219,7 @@ class Evaluator:
             if self.net is not None and args_cli.gain_mod > 0:
                 u = self.u
                 base = (kp, repel, u.cfg.swarm_cfg.apf_damping_gain, ff, getattr(u, "_apf_radius_scale", 1.0))
-                act = compute_apf_gain_mod_action(u, torch.exp(args_cli.gain_mod * self._policy_action()), base)
+                act = compute_apf_gain_mod_action(u, torch.exp(args_cli.gain_mod * expand_gain_dims(self._policy_action(), args_cli.gain_dims)), base)
                 self._obs, self._rew, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
                 return None
             if self.net is not None and args_cli.pure_policy:

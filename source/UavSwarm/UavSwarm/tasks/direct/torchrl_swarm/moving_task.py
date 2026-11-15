@@ -11,7 +11,7 @@ from .lidar import lidar_update
 
 PREVIEW_TAUS = (0.5, 1.0, 1.5)
 N_FIXED = 9 + 8 + 3 * len(PREVIEW_TAUS) + 4
-RW = dict(contain=1.0, centre=0.1, space=1.0, d_sep=0.55, sep_eval=0.5, packed=0.5, smooth=0.05, fail=10.0)
+RW = dict(contain=1.0, centre=0.1, space=1.0, d_sep=0.55, sep_eval=0.5, packed=0.5, smooth=0.05, fail=10.0, space_pow=2.0)
 
 
 def token_dim(sense: str) -> int:
@@ -118,7 +118,7 @@ def get_rewards(env) -> dict[str, torch.Tensor]:
     terms = dict(
         contain=-RW["contain"] * (dist - radius).clamp(min=0.0) / radius,
         centre=-RW["centre"] * dist / radius,
-        space=-RW["space"] * viol.pow(2).sum(dim=1),
+        space=-RW["space"] * viol.pow(RW["space_pow"]).sum(dim=1),
         smooth=-RW["smooth"] * smooth,
         packed=RW["packed"] * packed.unsqueeze(0).expand(D, -1),
         fail=-RW["fail"] * failed.unsqueeze(0).expand(D, -1),

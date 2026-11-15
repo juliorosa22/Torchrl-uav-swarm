@@ -527,6 +527,14 @@ def compute_swarm_gravity_baseline_action(
     return baseline.transpose(0, 1)  # (E, D, 4)
 
 
+def expand_gain_dims(a: torch.Tensor, dims: int) -> torch.Tensor:
+    """Policy output -> 5 channels (kp, repel, kd, ff, rscale); dims=2 modulates attraction (kp and ff together) and repulsion only."""
+    if dims == 5:
+        return a
+    z = torch.zeros_like(a[..., :1])
+    return torch.cat([a[..., 0:1], a[..., 1:2], z, a[..., 0:1], z], dim=-1)
+
+
 def compute_apf_gain_mod_action(env, mult: torch.Tensor, base: tuple) -> torch.Tensor:
     """Scan-APF with per-agent gains base * mult. mult (E, D, 5) scales (kp, repel, kd, ff, rscale); lidar sensing only."""
     from .sensing import ensure_cache_populated
