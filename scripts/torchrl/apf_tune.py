@@ -72,6 +72,15 @@ parser.add_argument("--warm", type=float, nargs="+", default=None, help="Start t
 parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
 parser.add_argument("--pure_policy", action="store_true", help="With --policy_ckpt: the policy output is the velocity command (no APF).")
 parser.add_argument("--yaw_hold", action="store_true", help="Pure policy has 3 outputs; yaw rate is commanded 0.")
+parser.add_argument("--dagger", type=int, default=0, metavar="ROUNDS", help="DAgger imitation of the APF given by --final_params/--preview_params: rollouts per round with expert-policy mixing, then supervised fit; writes --il_out checkpoints.")
+parser.add_argument("--il_steps", type=int, default=1500, help="dagger: env steps per round.")
+parser.add_argument("--il_fit", type=int, default=400, help="dagger: minibatch updates per round.")
+parser.add_argument("--il_cap", type=int, default=2_000_000, help="dagger: aggregated dataset capacity (samples).")
+parser.add_argument("--critic_steps", type=int, default=0, help="dagger: after the rounds, roll out the final policy with exploration noise for this many steps and fit a centralised critic on Monte-Carlo returns; saved with the policy and reward_rms in <il_out>_final.pt.")
+parser.add_argument("--critic_noise", type=float, default=-2.0, help="dagger critic phase: policy log-std used when sampling actions.")
+parser.add_argument("--critic_fit", type=int, default=3000, help="dagger critic phase: minibatch updates.")
+parser.add_argument("--space_hinge", type=float, nargs=2, default=None, metavar=("DSEP", "POW"), help="Moving-task reward: spacing penalty starts at DSEP (m) with exponent POW.")
+parser.add_argument("--il_out", type=str, default="il_ckpt")
 parser.add_argument("--gain_dims", type=int, default=5, choices=[2, 5])
 parser.add_argument("--gain_mod", type=float, default=0.0, help="Evaluate a gain-modulation policy (5 log-multipliers in [-1,1]*this on the final APF gains).")
 parser.add_argument("--wp_horizon", type=int, default=0, help="Evaluate a waypoint-plan policy (K body-frame increments per drone).")
@@ -257,6 +266,133 @@ class Evaluator:
         acc["inside"] += int(((dist <= radius).all(0) & moving).sum())
         acc["spaced"] += int((spaced & moving).sum())
         acc["maxd"] = max(acc["maxd"], float(dist.max(0).values[moving].max()))
+
+    def _critic_phase(self, net, out_prefix):
+        from mappo_torchl import CentralizedCritic, RunningMeanStd
+
+        u, dev, a = self.u, self.u.device, args_cli
+        E, D = u.num_envs, u.num_drones
+        gamma = 0.99
+        std_a = math.exp(a.critic_noise)
+        with open(a.config) as f:
+            hs = yaml.safe_load(f)["models"]["critic"]["hidden_sizes"]
+        critic = CentralizedCritic(u.cfg.state_space, hs).to(dev)
+        rms, run_ret = RunningMeanStd(device=dev), torch.zeros(E, D, device=dev)
+        S, R, Dn = [], [], []
+        self._obs, _ = self.env.reset()
+        u.episode_length_buf[:] = 0
+        for _ in range(a.critic_steps):
+            obs = torch.stack([self._obs[n] for n in self.names], dim=1).to(dev)
+            S.append(u._get_states().detach().cpu())
+            with torch.no_grad():
+                act3 = torch.tanh(net(obs)[0] + std_a * torch.randn(E, D, 3, device=dev))
+            act = torch.cat([act3, torch.zeros_like(act3[..., :1])], dim=-1)
+            self._obs, rew, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+            r = torch.stack([rew[n] for n in self.names], dim=1).to(dev)
+            done = (u._last_terminated | u._last_timed_out).float().view(E, 1)
+            run_ret = torch.nan_to_num(run_ret * gamma * (1.0 - done) + r)
+            rms.update(run_ret.reshape(-1))
+            R.append(r.mean(1).cpu())
+            Dn.append(done.view(E).cpu())
+        R, Dn, S = torch.stack(R), torch.stack(Dn), torch.stack(S)  # (T, E), (T, E), (T, E, sd)
+        G = torch.zeros_like(R)
+        nxt = torch.zeros(E)
+        for t in range(R.shape[0] - 1, -1, -1):
+            nxt = R[t] + gamma * (1.0 - Dn[t]) * nxt
+            G[t] = nxt
+        keep = R.shape[0] - 300
+        std = float(torch.sqrt(rms.var + 1e-8))
+        n_hold = max(1, E // 8)
+        Xtr, Ytr = S[:keep, : E - n_hold].reshape(-1, S.shape[-1]), (G[:keep, : E - n_hold] / std).reshape(-1)
+        Xte, Yte = S[:keep, E - n_hold:].reshape(-1, S.shape[-1]).to(dev), (G[:keep, E - n_hold:] / std).reshape(-1).to(dev)
+        opt = torch.optim.Adam(critic.parameters(), lr=1e-3, weight_decay=1e-4)
+        ev = lambda X, Y: 1.0 - float((critic(X).squeeze(-1) - Y).var() / Y.var())
+        best_ev, best_sd = -1e9, None
+        for it in range(a.critic_fit):
+            b = torch.randint(0, Xtr.shape[0], (4096,))
+            loss = torch.nn.functional.smooth_l1_loss(critic(Xtr[b].to(dev)).squeeze(-1), Ytr[b].to(dev))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if (it + 1) % 250 == 0 or it + 1 == a.critic_fit:
+                with torch.no_grad():
+                    ev_te = ev(Xte, Yte)
+                    sub = torch.randint(0, Xtr.shape[0], (20000,))
+                    ev_tr = ev(Xtr[sub].to(dev), Ytr[sub].to(dev))
+                if ev_te > best_ev:
+                    best_ev, best_sd = ev_te, {k_: v_.detach().clone() for k_, v_ in critic.state_dict().items()}
+                print(f"[critic] it {it + 1} loss {float(loss):.4f} ev_train {ev_tr:.3f} ev_heldout {ev_te:.3f} best {best_ev:.3f} "
+                      f"target_std {float(Ytr.std()):.3f} ret_std {std:.3f}", flush=True)
+        critic.load_state_dict(best_sd)
+        pol = {"module.0.module." + kk: v.cpu() for kk, v in net.state_dict().items()}
+        crit = {"module." + kk: v.cpu() for kk, v in critic.state_dict().items()}
+        torch.save({"policy": pol, "critic": crit, "reward_rms": {"mean": float(rms.mean), "var": float(rms.var), "count": float(rms.count)}},
+                   f"{out_prefix}_final.pt")
+
+    def dagger(self, kp, repel, kd, ff, rounds, steps, fit_iters, out_prefix):
+        from mappo_torchl import AttentionMAPPOPolicy
+
+        if args_cli.space_hinge:
+            from UavSwarm.tasks.direct.torchrl_swarm import moving_task as _mt
+
+            _mt.RW["d_sep"], _mt.RW["space_pow"] = args_cli.space_hinge
+
+        u, dev, a = self.u, self.u.device, args_cli
+        E, D = u.num_envs, u.num_drones
+        u.cfg.swarm_cfg.apf_damping_gain = kd
+        cur = u.cfg.curriculum
+        speed = a.move_speed_range[1] if a.move_speed_range else a.move_speeds[0]
+        cur.move_target_speed = speed
+        u.cfg.episode_length_s = cur.moving_episode_s() if not cur.move_paths else (cur.move_path_len / speed + cur.move_pause_budget_s + cur.move_settle_s + 0.5)
+        k = u.cfg.moving_obs_k
+        d = u.cfg.single_observation_space
+        net = AttentionMAPPOPolicy(d - k * 5, k, 3, token_dim=5, masked=True).to(dev)
+        opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+        radius = cur.get_containment_radius(D, u.cfg.swarm_cfg.min_safe_distance)
+        cap = args_cli.il_cap
+        X = torch.zeros(cap, d, device=dev)
+        Y = torch.zeros(cap, 3, device=dev)
+        n_data = ptr = 0
+        self._obs, _ = self.env.reset()
+        u.episode_length_buf[:] = 0
+        for r in range(rounds):
+            beta = 0.5 ** r if r < 4 else 0.0
+            packed = steps_done = collisions = 0
+            err = 0.0
+            for _ in range(steps):
+                obs = torch.stack([self._obs[n] for n in self.names], dim=1).to(dev)  # (E, D, d)
+                with torch.no_grad():
+                    exp_a = compute_swarm_gravity_baseline_action(u, kp, repel, ff_gain=ff).clamp(-1.0, 1.0)
+                    pol_a = torch.tanh(net(obs)[0])
+                    err += float((pol_a - exp_a[..., :3]).pow(2).mean())
+                use_exp = (torch.rand(E, 1, 1, device=dev) < beta).float()
+                act3 = use_exp * exp_a[..., :3] + (1 - use_exp) * pol_a
+                m = E * D
+                idx = (ptr + torch.arange(m, device=dev)) % cap
+                X[idx], Y[idx] = obs.reshape(m, d), exp_a[..., :3].reshape(m, 3)
+                ptr, n_data = (ptr + m) % cap, min(cap, n_data + m)
+                act = torch.cat([act3, torch.zeros_like(act3[..., :1])], dim=-1)
+                self._obs, _, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+                pos = torch.stack([rb.data.root_pos_w for rb in u._robots], dim=0)
+                dist = (u._shared_target_w.unsqueeze(0) - pos).norm(dim=2)
+                pair = (pos.unsqueeze(1) - pos.unsqueeze(0)).norm(dim=-1) + 10 * torch.eye(D, device=dev).unsqueeze(-1)
+                nn = pair.min(dim=1).values.min(dim=0).values
+                packed += float(((dist <= radius).all(0) & (nn >= 0.5)).float().mean())
+                collisions += int((u._last_terminated).sum())
+                steps_done += 1
+            loss_sum = 0.0
+            for _ in range(fit_iters):
+                b = torch.randint(0, n_data, (4096,), device=dev)
+                loss = (torch.tanh(net(X[b])[0]) - Y[b]).pow(2).mean()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                loss_sum += float(loss)
+            print(f"[dagger] round {r} beta {beta:.2f} packed {packed / steps_done:.3f} terminated {collisions} act_mse {err / steps_done:.4f} "
+                  f"fit_loss {loss_sum / fit_iters:.4f} data {n_data}", flush=True)
+            torch.save({"policy": {"module.0.module." + kk: v.cpu() for kk, v in net.state_dict().items()}}, f"{out_prefix}_r{r}.pt")
+        if args_cli.critic_steps > 0:
+            self._critic_phase(net, out_prefix)
 
     @torch.no_grad()
     def evaluate_stats(self, kp, repel, kd, move_speed, ff, episodes, tag):
@@ -563,6 +699,13 @@ def main():
             for r in out:
                 r.update(kp=kp, repel=repel, kd=kd, ff_gain=ff, rscale=rscale, preview=preview, dead=dead)
             return out
+
+        if args_cli.dagger:
+            kp, repel, kd, ff, rscale = args_cli.final_params
+            ev.u._apf_radius_scale, ev.u._apf_dead = rscale, 0.0
+            ev.u._apf_preview = tuple(args_cli.preview_params) if args_cli.preview_params else None
+            ev.dagger(kp, repel, kd, ff, args_cli.dagger, args_cli.il_steps, args_cli.il_fit, args_cli.il_out)
+            return
 
         if args_cli.final_params:
             kp, repel, kd, ff, rscale = args_cli.final_params

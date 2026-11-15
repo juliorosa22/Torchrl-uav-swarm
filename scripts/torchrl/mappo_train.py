@@ -140,6 +140,10 @@ parser.add_argument(
 parser.add_argument("--residual_kp", type=float, default=2.0, help="residual_rl: baseline attraction gain.")
 parser.add_argument("--residual_scale", type=float, default=0.3, help="residual_rl: policy correction weight.")
 parser.add_argument("--planner_range", type=float, default=0.0, help="Waypoint-planner mode (needs --residual_rl --residual_baseline apf): policy output (first 3 dims) is a body-frame offset in [-1,1]*planner_range metres added to the target error before APF attraction. 0 = off.")
+parser.add_argument("--reset_log_std", type=float, default=None, help="Set the policy log-std after loading --checkpoint (imitation checkpoints carry log-std 0).")
+parser.add_argument("--policy_lr_scale", type=float, default=1.0, help="Policy learning rate = config lr x this.")
+parser.add_argument("--critic_warmup_iters", type=int, default=0, help="Train only the critic (policy frozen) for this many iterations.")
+parser.add_argument("--lr", type=float, default=None, help="Overrides algorithm.learning_rate.")
 parser.add_argument("--yaw_hold", action="store_true", help="Policy outputs only [vx_b, vy_b, vz_b]; yaw rate is commanded 0 (heading held).")
 parser.add_argument("--gain_mod", type=float, default=0.0, help="Gain-modulation mode (needs --residual_rl --residual_baseline apf, lidar): policy outputs 5 log-multipliers in [-1,1]*this on the APF (kp, repel, kd, ff, rscale). 0 = off.")
 parser.add_argument("--gain_dims", type=int, default=5, choices=[2, 5], help="Gain-mod outputs: 5 = all gains, 2 = attraction scale (kp and ff) and repulsion scale.")
@@ -541,7 +545,8 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         policy=policy,
         critic=critic,
         device=device,
-        lr=config["algorithm"]["learning_rate"],
+        lr=args_cli.lr if args_cli.lr is not None else config["algorithm"]["learning_rate"],
+        policy_lr_scale=args_cli.policy_lr_scale, policy_freeze_iters=args_cli.critic_warmup_iters,
         gamma=config["algorithm"]["gamma"],
         gae_lambda=config["algorithm"]["gae_lambda"],
         clip_epsilon=config["algorithm"]["clip_epsilon"],
@@ -567,7 +572,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         policy.load_state_dict(ckpt["policy"])
         try:
             critic.load_state_dict(ckpt["critic"])
-        except RuntimeError:
+        except (RuntimeError, KeyError):
             print("[WARN] critic shape differs from the checkpoint (different N); critic re-initialised")
         if normalize_obs and "obs_rms" in ckpt:
             assert env.obs_rms is not None
@@ -577,6 +582,13 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
                   "(it was likely trained without normalization) -- resuming with fresh "
                   "(mean=0, var=1) statistics, which will not match what the loaded policy "
                   "was trained on until they reconverge.")
+        if "reward_rms" in ckpt:
+            rr = ckpt["reward_rms"]
+            trainer.reward_rms.mean, trainer.reward_rms.var, trainer.reward_rms.count = (
+                torch.tensor(rr["mean"], device=device), torch.tensor(rr["var"], device=device), rr["count"])
+            print("[INFO] reward_rms loaded from checkpoint")
+        if args_cli.reset_log_std is not None:
+            policy.module[0].module.log_std.data.fill_(args_cli.reset_log_std)
         # Sync collector with loaded weights
         trainer.collector.update_policy_weights_()
 

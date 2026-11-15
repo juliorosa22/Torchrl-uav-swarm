@@ -244,6 +244,8 @@ class MAPPO:
         normalize_rewards: bool = True,
         max_grad_norm: float = 1.0,
         target_kl: Optional[float] = None,
+        policy_lr_scale: float = 1.0,
+        policy_freeze_iters: int = 0,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.env = env
@@ -372,7 +374,19 @@ class MAPPO:
         )
         self.loss_module.make_value_estimator(ValueEstimators.GAE, gamma=gamma, lmbda=gae_lambda)
         self.gae = self.loss_module.value_estimator
-        self.optimizer = torch.optim.Adam(self.loss_module.parameters(), lr=lr)
+        actor_ids = {id(p) for p in policy.parameters()}
+        all_params = list(self.loss_module.parameters())
+        actor_p = [p for p in all_params if id(p) in actor_ids]
+        other_p = [p for p in all_params if id(p) not in actor_ids]
+        if actor_p and other_p and (policy_lr_scale != 1.0 or policy_freeze_iters > 0):
+            self.optimizer = torch.optim.Adam([{"params": actor_p, "lr": lr * policy_lr_scale}, {"params": other_p, "lr": lr}])
+            self._actor_group_lr = lr * policy_lr_scale
+            self._freeze_iters = policy_freeze_iters
+        else:
+            if policy_lr_scale != 1.0 or policy_freeze_iters > 0:
+                raise RuntimeError("could not separate actor and critic parameters for policy_lr_scale / policy_freeze_iters")
+            self.optimizer = torch.optim.Adam(all_params, lr=lr)
+            self._freeze_iters = 0
 
         # --- logging ---
         self.writer = SummaryWriter(log_dir=os.path.join(self.run_dir, "logs"))
@@ -391,6 +405,9 @@ class MAPPO:
 
             # Remove collector metadata
             rollout.pop("collector", None)
+
+            if self._freeze_iters:
+                self.optimizer.param_groups[0]["lr"] = 0.0 if i < self._freeze_iters else self._actor_group_lr
 
             # --- Step 0: reward normalization (stabilizes the critic target scale; see
             # _normalize_rewards_inplace) -- must run before GAE so bootstrapping and the
