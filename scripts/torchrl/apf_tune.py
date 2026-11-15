@@ -70,6 +70,8 @@ parser.add_argument("--deadband", action="store_true", help="Also tune a deadban
 parser.add_argument("--dead", type=float, default=0.0, help="With --final_params: deadband fraction of the containment radius.")
 parser.add_argument("--warm", type=float, nargs="+", default=None, help="Start the ES mean at kp repel kd ff rscale [tau_p tau_f].")
 parser.add_argument("--max_vel", type=float, default=None, help="Overrides controller.max_lin_vel_cmd (m/s per axis).")
+parser.add_argument("--pure_policy", action="store_true", help="With --policy_ckpt: the policy output is the velocity command (no APF).")
+parser.add_argument("--yaw_hold", action="store_true", help="Pure policy has 3 outputs; yaw rate is commanded 0.")
 parser.add_argument("--gain_mod", type=float, default=0.0, help="Evaluate a gain-modulation policy (5 log-multipliers in [-1,1]*this on the final APF gains).")
 parser.add_argument("--wp_horizon", type=int, default=0, help="Evaluate a waypoint-plan policy (K body-frame increments per drone).")
 parser.add_argument("--wp_dt", type=float, default=0.2)
@@ -178,9 +180,9 @@ class Evaluator:
         elif args_cli.policy_arch == "attention":
             k = self.u.cfg.moving_obs_k
             tdim = 5 if args_cli.obs_sense == "lidar" else 6
-            self.net = AttentionMAPPOPolicy(d - k * tdim, k, 5 if args_cli.gain_mod > 0 else 4, token_dim=tdim, masked=tdim == 5)
+            self.net = AttentionMAPPOPolicy(d - k * tdim, k, 5 if args_cli.gain_mod > 0 else (3 if args_cli.yaw_hold else 4), token_dim=tdim, masked=tdim == 5)
         else:
-            self.net = MAPPOPolicy(d, 4, (256, 256, 128))
+            self.net = MAPPOPolicy(d, 3 if args_cli.yaw_hold else 4, (256, 256, 128))
         self.net.load_state_dict(sd)
         self.net.to(self.u.device).eval()
 
@@ -216,12 +218,18 @@ class Evaluator:
                 u = self.u
                 base = (kp, repel, u.cfg.swarm_cfg.apf_damping_gain, ff, getattr(u, "_apf_radius_scale", 1.0))
                 act = compute_apf_gain_mod_action(u, torch.exp(args_cli.gain_mod * self._policy_action()), base)
-                self._obs, _, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+                self._obs, self._rew, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+                return None
+            if self.net is not None and args_cli.pure_policy:
+                act = self._policy_action()
+                if args_cli.yaw_hold:
+                    act = torch.cat([act, torch.zeros_like(act[..., :1])], dim=-1)
+                self._obs, self._rew, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
                 return None
             act = compute_swarm_gravity_baseline_action(self.u, kp, repel, ff_gain=ff)
             if self.net is not None:
                 act = (act + args_cli.residual_scale * self._policy_action()).clamp(-1.0, 1.0)
-            self._obs, _, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+            self._obs, self._rew, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
             return None
         if getattr(self.u, "_lidar", None) is not None:
             if not self.u._lidar.get("auto"):
@@ -229,7 +237,9 @@ class Evaluator:
         elif self.u._apf_sense is not None:
             apf_sense_update(self.u)
         act = compute_swarm_gravity_baseline_action(self.u, kp, repel, ff_gain=ff)
-        return self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+        res = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
+        self._rew = res[1]
+        return res
 
     def _track(self, acc):
         u = self.u
@@ -277,7 +287,7 @@ class Evaluator:
         radius = cur.get_containment_radius(D, u.cfg.swarm_cfg.min_safe_distance)
         sep = args_cli.sep
         names = ["n_mv", "n_st", "pk_mv", "pk_st", "ins_mv", "ins_st", "sum_nn_mv", "sum_nn_st", "near03", "below_sep",
-                 "jit_mv", "jit_st", "spd_mv", "spd_st", "cerr_mv", "cerr_st", "clag_mv", "clag_max", "maxd_mv"]
+                 "jit_mv", "jit_st", "spd_mv", "spd_st", "cerr_mv", "cerr_st", "clag_mv", "clag_max", "maxd_mv", "rew_sum", "n_rew", "rt_contain", "rt_centre", "rt_space", "rt_smooth", "rt_packed", "rt_fail"]
         acc = {}
 
         def reset_acc(mask=None):
@@ -327,6 +337,11 @@ class Evaluator:
                 acc["spd_" + sfx] += spd * m
                 acc["cerr_" + sfx] += cerr * m
             acc["clag_mv"] += clag * mv
+            if getattr(self, "_rew", None) is not None:
+                acc["rew_sum"] += torch.stack([self._rew[n] for n in self.names]).mean(0).to(dev)
+                acc["n_rew"] += 1.0
+                for k_, v_ in getattr(u, "_rew_terms", {}).items():
+                    acc["rt_" + k_] += v_
             if bool(done.any()):
                 reasons = u._termination_reasons
                 for e in done.nonzero().flatten().tolist():
@@ -345,6 +360,8 @@ class Evaluator:
                         jit_mv=g("jit_mv") / n_mv, jit_st=g("jit_st") / n_st, spd_mv=g("spd_mv") / n_mv, spd_st=g("spd_st") / n_st,
                         cerr_mv=g("cerr_mv") / n_mv, cerr_st=g("cerr_st") / n_st,
                         clag_mean_mv=g("clag_mv") / n_mv, clag_max=g("clag_max"), maxd_mv=g("maxd_mv"),
+                        reward=g("rew_sum") / max(g("n_rew"), 1.0),
+                        rew_terms={k_: g("rt_" + k_) / max(g("n_rew"), 1.0) for k_ in ("contain", "centre", "space", "smooth", "packed", "fail")},
                         success=bool(packed_all >= 0.9 and not coll),
                     ))
                 reset_acc(done)

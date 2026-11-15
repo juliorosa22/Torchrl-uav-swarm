@@ -72,6 +72,7 @@ class IsaacLabTorchRLWrapper(EnvBase):
         wp_goal_bias: bool = False,
         wp_z_bias: bool = False,
         gain_mod: float = 0.0,
+        yaw_hold: bool = False,
     ):
         self.env = env
         self.unwrapped_env = env.unwrapped
@@ -108,6 +109,9 @@ class IsaacLabTorchRLWrapper(EnvBase):
         self.gain_mod = gain_mod
         if gain_mod > 0.0 and (wp_horizon > 0 or planner_range > 0.0 or not residual_rl):
             raise ValueError("gain_mod needs residual_rl and excludes wp_horizon/planner_range")
+        self.yaw_hold = yaw_hold
+        if yaw_hold and (wp_horizon > 0 or gain_mod > 0.0 or planner_range > 0.0):
+            raise ValueError("yaw_hold excludes wp_horizon/gain_mod/planner_range")
         self._wp_prev = None
 
         if not isinstance(self.unwrapped_env, DirectMARLEnv):
@@ -163,6 +167,8 @@ class IsaacLabTorchRLWrapper(EnvBase):
 
         if self.gain_mod > 0.0:
             self.action_dim = 5
+        if self.yaw_hold:
+            self.action_dim -= 1
 
         self._make_specs()
         self._print_info(device, num_envs)
@@ -342,6 +348,8 @@ class IsaacLabTorchRLWrapper(EnvBase):
         # reassigned to that combined value -- the tensordict's own ("agents","action")
         # entry is untouched, so ClipPPOLoss's log-prob ratio still reads the policy's
         # actual sampled residual, not the env-facing combined action.
+        if self.yaw_hold:
+            actions_stacked = torch.cat([actions_stacked, torch.zeros_like(actions_stacked[..., :1])], dim=-1)
         env_actions = actions_stacked
         if self.wp_horizon > 0:
             K = self.wp_horizon

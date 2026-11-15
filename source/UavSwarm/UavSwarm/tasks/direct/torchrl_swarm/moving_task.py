@@ -115,14 +115,16 @@ def get_rewards(env) -> dict[str, torch.Tensor]:
     smooth = (env._actions - env._prev_actions).pow(2).sum(dim=-1).transpose(0, 1)
     reasons = env._termination_reasons
     failed = (reasons["collision"] | reasons["out_of_bounds"] | reasons["inter_agent_collision"]).float()
-    r = (
-        -RW["contain"] * (dist - radius).clamp(min=0.0) / radius
-        - RW["centre"] * dist / radius
-        - RW["space"] * viol.pow(2).sum(dim=1)
-        - RW["smooth"] * smooth
-        + RW["packed"] * packed.unsqueeze(0)
-        - RW["fail"] * failed.unsqueeze(0)
+    terms = dict(
+        contain=-RW["contain"] * (dist - radius).clamp(min=0.0) / radius,
+        centre=-RW["centre"] * dist / radius,
+        space=-RW["space"] * viol.pow(2).sum(dim=1),
+        smooth=-RW["smooth"] * smooth,
+        packed=RW["packed"] * packed.unsqueeze(0).expand(D, -1),
+        fail=-RW["fail"] * failed.unsqueeze(0).expand(D, -1),
     )
+    env._rew_terms = {k: v.mean(dim=0) for k, v in terms.items()}
+    r = sum(terms.values())
     r = torch.nan_to_num(r, nan=0.0, posinf=0.0, neginf=-RW["fail"])
     dt = env.step_dt
     env._metrics.update(
