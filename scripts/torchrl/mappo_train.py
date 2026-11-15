@@ -144,6 +144,7 @@ parser.add_argument("--reset_log_std", type=float, default=None, help="Set the p
 parser.add_argument("--policy_lr_scale", type=float, default=1.0, help="Policy learning rate = config lr x this.")
 parser.add_argument("--critic_warmup_iters", type=int, default=0, help="Train only the critic (policy frozen) for this many iterations.")
 parser.add_argument("--lr", type=float, default=None, help="Overrides algorithm.learning_rate.")
+parser.add_argument("--critic_input", type=str, default="state", choices=["state", "obs"], help="state: one centralised critic on the joint state; obs: one critic with parameters shared across drones, applied to each drone's own observation.")
 parser.add_argument("--yaw_hold", action="store_true", help="Policy outputs only [vx_b, vy_b, vz_b]; yaw rate is commanded 0 (heading held).")
 parser.add_argument("--gain_mod", type=float, default=0.0, help="Gain-modulation mode (needs --residual_rl --residual_baseline apf, lidar): policy outputs 5 log-multipliers in [-1,1]*this on the APF (kp, repel, kd, ff, rscale). 0 = off.")
 parser.add_argument("--gain_dims", type=int, default=5, choices=[2, 5], help="Gain-mod outputs: 5 = all gains, 2 = attraction scale (kp and ff) and repulsion scale.")
@@ -306,6 +307,9 @@ def make_critic(
     per-agent node features vs. the trailing pairwise-distance matrix) -- only tasks that
     set include_distance_matrix_in_state (e.g. SwarmGravityV2) provide that trailing part.
     """
+    if args_cli.critic_input == "obs":
+        net = CentralizedCritic(obs_dim, config["models"]["critic"]["hidden_sizes"]).to(device)
+        return TensorDictModule(module=net, in_keys=[("agents", "observation")], out_keys=[("state_value",)])
     if critic_arch == "attention":
         if num_agents is None or obs_dim is None:
             raise ValueError("--critic_arch attention requires num_agents and obs_dim.")
@@ -546,7 +550,7 @@ def main(env_cfg: DirectMARLEnvCfg, agent_cfg: dict):
         critic=critic,
         device=device,
         lr=args_cli.lr if args_cli.lr is not None else config["algorithm"]["learning_rate"],
-        policy_lr_scale=args_cli.policy_lr_scale, policy_freeze_iters=args_cli.critic_warmup_iters,
+        critic_key="observation" if args_cli.critic_input == "obs" else "state", policy_lr_scale=args_cli.policy_lr_scale, policy_freeze_iters=args_cli.critic_warmup_iters,
         gamma=config["algorithm"]["gamma"],
         gae_lambda=config["algorithm"]["gae_lambda"],
         clip_epsilon=config["algorithm"]["clip_epsilon"],

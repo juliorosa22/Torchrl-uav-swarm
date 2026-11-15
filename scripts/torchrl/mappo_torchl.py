@@ -245,6 +245,7 @@ class MAPPO:
         max_grad_norm: float = 1.0,
         target_kl: Optional[float] = None,
         policy_lr_scale: float = 1.0,
+        critic_key: str = "state",
         policy_freeze_iters: int = 0,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -328,7 +329,7 @@ class MAPPO:
         # --- Flat-key critic for flattened TD (reads "state" at root) ---
         self.critic_flat = TensorDictModule(
             module=self.critic.module,
-            in_keys=["state"],
+            in_keys=[critic_key],
             out_keys=["state_value"],
         )
 
