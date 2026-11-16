@@ -90,8 +90,13 @@ parser.add_argument("--wp_goal_bias", action="store_true")
 parser.add_argument("--residual_kp", type=float, default=2.0, help="Waypoint mode: goal-bias attraction gain.")
 parser.add_argument("--move_stats", action="store_true", help="Per-episode inter-agent distance statistics on the moving-sphere task.")
 parser.add_argument("--sweep", action="store_true", help="Stress-test the --init gains over sensing/time-limit conditions.")
+parser.add_argument("--gm_noise", action="store_true", help="Sample the policy action with its learned std (training-time exploration noise) instead of using the mean.")
+parser.add_argument("--record", type=str, default=None, help="Record the first evaluated episode (env 0) to this video directory; use --num_envs 1 --episodes 1.")
+parser.add_argument("--record_name", type=str, default="rec")
+parser.add_argument("--record_steps", type=int, default=4000)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+args_cli.enable_cameras = args_cli.enable_cameras or args_cli.record is not None
 
 import sys  # noqa: E402
 
@@ -119,6 +124,7 @@ from UavSwarm.tasks.direct.torchrl_swarm.controller import (  # noqa: E402
 from UavSwarm.tasks.direct.torchrl_swarm import paths as _pf  # noqa: E402
 from UavSwarm.tasks.direct.torchrl_swarm.lidar import lidar_update, make_lidar  # noqa: E402
 
+_EV = None
 LOG_LO = torch.log(torch.tensor([0.3, 0.2, 0.05]))
 LOG_HI = torch.log(torch.tensor([8.0, 16.0, 8.0]))
 
@@ -162,8 +168,17 @@ class Evaluator:
                 period=max(1, round(1.0 / (args_cli.lidar_hz * cfg.sim.dt * cfg.decimation))), delay=args_cli.lidar_delay,
             )
             configure_cfg(cfg, args_cli.obs_sense, args_cli.obs_k, lidar_cfg=lidar_cfg)
-        self.env = gym.make(args_cli.task, cfg=cfg)
+        if args_cli.record:
+            cfg.sim.render.enable_translucency = True
+            self.env = gym.make(args_cli.task, cfg=cfg, render_mode="rgb_array")
+            self.env = gym.wrappers.RecordVideo(self.env, args_cli.record, step_trigger=lambda s: s == 0, video_length=args_cli.record_steps,
+                                                name_prefix=args_cli.record_name, disable_logger=True)
+        else:
+            self.env = gym.make(args_cli.task, cfg=cfg)
+        global _EV
+        _EV = self
         self.u = self.env.unwrapped
+        self._gm = None
         if args_cli.policy_ckpt:
             self._load_policy()
         self.names = [f"robot_{i}" for i in range(self.u.num_drones)]
@@ -199,7 +214,9 @@ class Evaluator:
 
     def _policy_action(self):
         obs = torch.stack([self._obs[n] for n in self.names], dim=1).to(self.u.device)
-        mean, _ = self.net(obs)
+        mean, std = self.net(obs)
+        if args_cli.gm_noise:
+            mean = mean + std * torch.randn_like(mean)
         return torch.tanh(mean)
 
     def _wp_step(self, kp, repel):
@@ -228,7 +245,8 @@ class Evaluator:
             if self.net is not None and args_cli.gain_mod > 0:
                 u = self.u
                 base = (kp, repel, u.cfg.swarm_cfg.apf_damping_gain, ff, getattr(u, "_apf_radius_scale", 1.0))
-                act = compute_apf_gain_mod_action(u, torch.exp(args_cli.gain_mod * expand_gain_dims(self._policy_action(), args_cli.gain_dims)), base)
+                self._gm = args_cli.gain_mod * expand_gain_dims(self._policy_action(), args_cli.gain_dims)
+                act = compute_apf_gain_mod_action(u, torch.exp(self._gm), base)
                 self._obs, self._rew, _, _, _ = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
                 return None
             if self.net is not None and args_cli.pure_policy:
@@ -251,6 +269,16 @@ class Evaluator:
         res = self.env.step({n: act[:, i] for i, n in enumerate(self.names)})
         self._rew = res[1]
         return res
+
+    def _aim(self):
+        u = self.u
+        c = torch.stack([r.data.root_pos_w for r in u._robots], dim=1)[0].mean(0)
+        d = u._target_vel_w[0, :2] if float(u._target_vel_w[0, :2].norm()) > 0.05 else u._target_dir_w[0, :2]
+        d = d / d.norm().clamp(min=1e-6)
+        eye = c.clone()
+        eye[:2] += torch.stack([-d[1], d[0]]) * 5.0
+        eye[2] += 2.5
+        u.sim.set_camera_view(eye.tolist(), c.tolist())
 
     def _track(self, acc):
         u = self.u
@@ -436,6 +464,7 @@ class Evaluator:
                 else:
                     acc[k][mask] = fill
 
+        gm_sum, gm_sd = torch.zeros(E, 5, device=dev), torch.zeros(E, 5, device=dev)
         reset_acc()
         self._obs, _ = self.env.reset()
         self._wp_prev = None
@@ -445,8 +474,13 @@ class Evaluator:
             fam_prev, prof_prev, spd_prev = u._path_fam.clone(), u._path_prof.clone(), u._path_speed.clone()
             self._step(kp, repel, ff)
             step += 1
+            if a.record and step % 10 == 1:
+                self._aim()
             done = u._last_terminated | u._last_timed_out
             alive = ~done
+            if self._gm is not None:
+                gm_sum += self._gm.mean(1) * alive.unsqueeze(-1)
+                gm_sd += self._gm.std(1) * alive.unsqueeze(-1)
             pos = torch.stack([r.data.root_pos_w for r in u._robots], dim=0)
             vel = torch.stack([r.data.root_lin_vel_w for r in u._robots], dim=0)
             dist = (u._shared_target_w.unsqueeze(0) - pos).norm(dim=2)
@@ -501,8 +535,11 @@ class Evaluator:
                         reward=g("rew_sum") / max(g("n_rew"), 1.0),
                         rew_terms={k_: g("rt_" + k_) / max(g("n_rew"), 1.0) for k_ in ("contain", "centre", "space", "smooth", "packed", "fail")},
                         success=bool(packed_all >= 0.9 and not coll),
+                        **({"gm": (gm_sum[e] / n_all).tolist(), "gm_sd": (gm_sd[e] / n_all).tolist()} if self._gm is not None else {}),
                     ))
                 reset_acc(done)
+                gm_sum[done] = 0.0
+                gm_sd[done] = 0.0
         return rows
 
     @torch.no_grad()
@@ -843,4 +880,6 @@ if __name__ == "__main__":
     main()
     import os
 
+    if args_cli.record and _EV is not None:
+        _EV.env.close()
     os._exit(0)

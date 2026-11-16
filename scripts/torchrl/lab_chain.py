@@ -25,6 +25,7 @@ p.add_argument("--rl_batch", type=int, default=4096)
 p.add_argument("--rl_timeout_h", type=float, default=5.0, help="kill a hung training stage after this many hours")
 p.add_argument("--preview", action="store_true", help="tune/evaluate the preview APF (look-ahead attraction and feed-forward); skips RL")
 p.add_argument("--deadband", action="store_true", help="with --preview: also tune the attraction deadband, warm-started from the existing preview tune")
+p.add_argument("--mr", action="store_true", help="Multi-ranger sensing tier: 4 horizontal beams plus one up beam, 4 m range (lidar cells only)")
 p.add_argument("--reuse", action="store_true", help="skip tune and APF final eval for cells whose result files already exist")
 p.add_argument("--residual_scale", type=float, default=0.2)
 p.add_argument("--seed", type=int, default=0)
@@ -58,7 +59,7 @@ def best(path):
 
 for cell in a.cells.split(","):
     sense, n = ("lidar", int(cell[5:])) if cell.startswith("lidar") else ("oracle", int(cell[6:]))
-    lid = ["--lidar"] if sense == "lidar" else []
+    lid = (["--lidar"] + (["--lidar_az", "4", "--lidar_elev", "0", "90", "--lidar_range", "4"] if a.mr else [])) if sense == "lidar" else []
     base = ["--headless", "--config", a.config, "--num_agents", n, "--max_vel", a.max_vel, "--num_envs", 64]
     init = ["0.98", "1.9", "3.4"] if sense == "lidar" else ["2.4", "1.3", "1.5"]
     sfx = ("_pvd" if a.deadband else "_pv") if a.preview else ""
